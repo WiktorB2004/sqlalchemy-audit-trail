@@ -14,6 +14,7 @@
 - Async sessions: `AuditTrail.install()` accepts an `async_sessionmaker` or `AsyncSession` subclass with a `sync_session_class`, and `AuditTrail.alog()` records explicit events from async code
 - Durable and `fail_closed` events are written on a separate small pool and committed before `log()`/`alog()` returns, surviving the caller's rollback; a missing partition is created and the write retried once; `fail_closed` failures raise `AuditWriteError`
 - `AuditTrail.dispose()` / `adispose()` close the durable pool the library created
+- `audit_trail.testing`: `assert_audited()` / `assert_not_audited()` (and async variants) that show the closest entries and their differences on failure, table setup helpers, and an opt-in pytest plugin (`pytest_plugins = ["audit_trail.pytest_plugin"]`)
 
 ## 0.1.0a1 - 2026-09-25
 
