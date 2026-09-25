@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Collection
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 from sqlalchemy import event
 from sqlalchemy.orm.attributes import instance_state
@@ -23,7 +23,7 @@ from audit_trail.config import AuditOptions
 from audit_trail.diff import SNAPSHOT_INFO_KEY, _audited_columns, options_of
 
 if TYPE_CHECKING:
-    from sqlalchemy.orm import InstanceState, Mapper, QueryContext
+    from sqlalchemy.orm import AttributeEventToken, InstanceState, Mapper, QueryContext
 
 
 class Audited:
@@ -44,6 +44,9 @@ class Audited:
     """
 
     __audit__: ClassVar[AuditOptions] = AuditOptions()
+
+
+_A = TypeVar("_A", bound=Audited)
 
 
 def refresh_snapshot(obj: object) -> None:
@@ -90,12 +93,12 @@ def _on_refresh(
 
 
 def _keep_old_value(
-    target: object, value: object, oldvalue: object, initiator: Any
+    target: object, value: object, oldvalue: object, initiator: AttributeEventToken
 ) -> None:
     """No-op ``set`` listener; registering it enables ``active_history``."""
 
 
-def _on_mapper_configured(mapper: Mapper[Any], cls: type[Any]) -> None:
+def _on_mapper_configured(mapper: Mapper[_A], cls: type[_A]) -> None:
     columns = _audited_columns(mapper)
     column_keys = {prop.key for prop in mapper.column_attrs}
     unknown = sorted(set(options_of(cls).snapshot_on_load) - column_keys)
