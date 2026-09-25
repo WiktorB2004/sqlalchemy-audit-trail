@@ -151,7 +151,7 @@ class SessionFactory(Protocol):
 
     class_: type[Session]
 
-    def __call__(self) -> Session: ...
+    def __call__(self, **options: Any) -> Session: ...
 
 
 class _AsyncSessions:
@@ -161,8 +161,8 @@ class _AsyncSessions:
         self.factory = factory
         self.class_: type[Session] = factory.kw["sync_session_class"]
 
-    def __call__(self) -> Session:
-        return self.factory().sync_session
+    def __call__(self, **options: Any) -> Session:
+        return self.factory(**options).sync_session
 
 
 @dataclass
