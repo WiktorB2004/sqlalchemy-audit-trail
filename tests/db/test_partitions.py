@@ -281,19 +281,21 @@ def test_lock_timeout_fails_fast_then_retry_succeeds(
                     time.sleep(0.01)
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            watcher = pool.submit(watch_locks)
-            started = time.monotonic()
-            attempt = pool.submit(
-                ensure, engine, tables, months_ahead=1, lock_timeout="500ms"
-            )
-            # A regression hangs visibly here instead of forever.
-            with pytest.raises(PartitionLockTimeoutError, match="not created"):
-                attempt.result(timeout=30)
-            elapsed = time.monotonic() - started
-            stop.set()
-            watcher.result(timeout=30)
-
-        blocker.commit()
+            try:
+                watcher = pool.submit(watch_locks)
+                started = time.monotonic()
+                attempt = pool.submit(
+                    ensure, engine, tables, months_ahead=1, lock_timeout="500ms"
+                )
+                # A regression fails here after 15 s instead of hanging.
+                with pytest.raises(PartitionLockTimeoutError, match="not created"):
+                    attempt.result(timeout=15)
+                elapsed = time.monotonic() - started
+            finally:
+                stop.set()
+                # Releases a hung attempt too, so the pool can shut down.
+                blocker.commit()
+            watcher.result(timeout=15)
 
     assert elapsed < 10
     assert observed == ["AccessExclusiveLock"]
