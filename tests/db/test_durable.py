@@ -155,6 +155,30 @@ def test_fail_closed_raises_even_with_on_error_log(make: EnvMaker) -> None:
     assert env.transactions() == []
 
 
+def test_durable_entry_through_the_provider_survives_rollback(
+    make: EnvMaker, models: Models
+) -> None:
+    env = make()
+    with env.factory() as session:
+        env.trail.session_provider = lambda: session
+        session.add(models.Account(name="a"))
+        session.flush()
+        env.trail.log(DurableEvent.DENIED)
+        session.rollback()
+    assert verbs(env) == ["durable_test.denied"]
+
+
+def test_fail_closed_through_the_provider_raises_with_on_error_log(
+    make: EnvMaker,
+) -> None:
+    env = make(partitions=[], on_error="log")  # every write fails with 23514
+    with env.factory() as session:
+        env.trail.session_provider = lambda: session
+        with pytest.raises(AuditWriteError, match="fail_closed"):
+            env.trail.log(DurableEvent.LOCKED)
+    assert env.transactions() == []
+
+
 def test_durable_failure_is_logged_with_on_error_log(
     make: EnvMaker, models: Models, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -21,7 +21,7 @@ from sqlalchemy import Engine, MetaData, RowMapping, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from audit_trail import Actor, Audited, AuditTrail
+from audit_trail import Actor, Audited, AuditEvent, AuditTrail, Severity, event
 from audit_trail.integrations.fastapi import (
     AuditMiddleware,
     context_provider,
@@ -37,6 +37,10 @@ CAP = 15
 PROXY = "10.0.0.5"
 CLIENT = "198.51.100.4"
 REQUEST_ID = uuid.UUID("5d0c4c8e-5f55-4a55-a1bb-1f3c2b6e7a90")
+
+
+class ItemEvent(AuditEvent):
+    VIEWED = event("fastapi_test.viewed", Severity.INFO)
 
 
 @pytest.fixture
@@ -173,6 +177,89 @@ async def test_async_session_entry_has_the_request_context_and_actor(
 
     assert response.json() == {"provided": True}
     assert_request_context(Rows(engine, trail))
+
+
+async def test_sync_endpoint_logs_without_a_session(
+    engine: Engine, schema: str
+) -> None:
+    trail = create_trail(
+        engine,
+        schema,
+        severities=Severity,
+        events=[ItemEvent],
+        session_provider=session_provider,
+    )
+    factory = sessionmaker(engine)
+    trail.install(factory)
+    session_dep = Depends(session_dependency(factory))
+
+    def auth(session: Session = session_dep) -> None:
+        authenticate()
+
+    def record_view() -> None:
+        # Code that has no session at hand.
+        trail.log(ItemEvent.VIEWED)
+
+    app = FastAPI()
+    app.add_middleware(AuditMiddleware, trusted_proxies=[PROXY])
+
+    @app.post("/items", dependencies=[Depends(auth)])
+    def view(session: Session = session_dep) -> None:
+        record_view()
+        session.commit()
+
+    try:
+        async with client_for(app) as client:
+            response = await client.post("/items", headers=proxied_headers())
+    finally:
+        trail.dispose()
+
+    assert response.status_code == 200
+    rows = Rows(engine, trail)
+    assert [row["verb"] for row in rows.activities()] == ["fastapi_test.viewed"]
+    assert_request_context(rows)
+
+
+async def test_async_endpoint_logs_without_a_session(
+    engine: Engine, schema: str, async_engine: AsyncEngine
+) -> None:
+    trail = create_trail(
+        engine,
+        schema,
+        trail_engine=async_engine,
+        severities=Severity,
+        events=[ItemEvent],
+        session_provider=session_provider,
+    )
+    sync_class = type("FastAPISession", (Session,), {})
+    factory = async_sessionmaker(async_engine, sync_session_class=sync_class)
+    trail.install(factory)
+    session_dep = Depends(session_dependency(factory))
+
+    def auth(session: AsyncSession = session_dep) -> None:
+        authenticate()
+
+    async def record_view() -> None:
+        await trail.alog(ItemEvent.VIEWED)
+
+    app = FastAPI()
+    app.add_middleware(AuditMiddleware, trusted_proxies=[PROXY])
+
+    @app.post("/items", dependencies=[Depends(auth)])
+    async def view(session: AsyncSession = session_dep) -> None:
+        await record_view()
+        await session.commit()
+
+    try:
+        async with client_for(app) as client:
+            response = await client.post("/items", headers=proxied_headers())
+    finally:
+        await trail.adispose()
+
+    assert response.status_code == 200
+    rows = Rows(engine, trail)
+    assert [row["verb"] for row in rows.activities()] == ["fastapi_test.viewed"]
+    assert_request_context(rows)
 
 
 async def test_the_dependency_does_not_commit(
