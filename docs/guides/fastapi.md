@@ -48,7 +48,20 @@ def create_note(
 
 With a `sessionmaker` the dependency is synchronous; with an `async_sessionmaker` it is asynchronous. It raises `TypeError` when the factory has no `AuditTrail` installed.
 
-`session_provider()` returns the session such a dependency opened for the current request, or `None`, for code that needs the request's session without having it passed in.
+`session_provider()` returns the session such a dependency opened for the current request, or `None`, for code that needs the request's session without having it passed in. Pass it to `AuditTrail` and `audit.log()` finds the request's session by itself:
+
+```python
+from audit_trail.integrations.fastapi import session_provider
+
+audit = AuditTrail(engine, session_provider=session_provider)
+
+
+def record_export(report: Report) -> None:
+    # Called from an endpoint that depends on get_session.
+    audit.log(ReportEvent.EXPORTED, obj=report)
+```
+
+The entry is written in the request's session and committed with it, as if the session had been passed. Use `alog()` with an `async_sessionmaker`. Outside a request, or in a request without a `session_dependency`, there is no session and the call raises `RuntimeError`.
 
 ## The actor
 

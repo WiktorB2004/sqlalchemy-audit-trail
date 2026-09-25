@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import gc
 import subprocess
 import sys
-from collections.abc import Iterator
 from enum import Enum, IntEnum
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
+from audit_trail import events as events_module
 from audit_trail.config import AuditOptions
 from audit_trail.events import (
     AuditEvent,
@@ -24,6 +23,7 @@ from audit_trail.events import (
     resolve_write_flags,
     validate_payload,
 )
+from tests.unit.discovery_support import isolate_discovery
 
 BUILTIN_VERBS = {"entity.created", "entity.updated", "entity.deleted", "audit.scrubbed"}
 
@@ -42,15 +42,6 @@ class OrderPlaced(BaseModel):
 
 class Other(BaseModel):
     note: str
-
-
-@pytest.fixture(autouse=True)
-def _collect_event_classes() -> Iterator[None]:
-    # Registry discovery sees every live AuditEvent subclass; drop the ones
-    # earlier tests defined so they cannot leak into other registries.
-    gc.collect()
-    yield
-    gc.collect()
 
 
 def test_member_carries_metadata() -> None:
@@ -107,13 +98,16 @@ def test_builtin_events() -> None:
     )
 
 
-def test_registry_discovers_subclasses() -> None:
+def test_registry_discovers_subclasses(monkeypatch: pytest.MonkeyPatch) -> None:
+    isolate_discovery(monkeypatch)
+
     class ShopBase(AuditEvent):
         pass
 
     class Shop(ShopBase):
         PLACED = "shop.order_placed", Severity.INFO
 
+    assert events_module._discover() == [Shop]
     registry = EventRegistry(Severity)
 
     assert registry.get("shop.order_placed") is Shop.PLACED

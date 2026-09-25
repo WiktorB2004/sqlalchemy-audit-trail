@@ -92,7 +92,7 @@ await audit.alog(session, AuthEvent.LOGIN, actor=Actor(type="user", id=str(user.
 
 `log(session, event, *, obj=None, target=None, payload=None, actor=None, durable=None)` (and `alog` for an `AsyncSession`):
 
-- `session` must be a session of a factory this `AuditTrail` is installed on.
+- `session` must be a session of a factory this `AuditTrail` is installed on: a `Session` for `log()`, an `AsyncSession` for `alog()` (the other kind raises `TypeError`). It can be left out, as in `log(event, ...)`, or be `None`, when the `AuditTrail` has a `session_provider` (see [below](#without-a-session-at-hand)).
 - `obj` is the object the event is about. It sets `object_type`, `object_id` and `object_label`, and through its model's options `scope_id` and the default target. It needs a primary key, so flush a new object first.
 - `target` is the parent object: an instance, a `Target(type, id)` or a `(type, id)` tuple. It defaults to the `target` option of `obj`'s model.
 - `payload` is a mapping or an instance of the event's schema, validated against the schema (`PayloadError` when it does not match).
@@ -100,6 +100,18 @@ await audit.alog(session, AuthEvent.LOGIN, actor=Actor(type="user", id=str(user.
 - `durable` overrides the event's `durable` flag for this call. It cannot weaken a `fail_closed` event.
 
 A non-durable entry is inserted right away on the session's connection, in the session's transaction: it is committed or rolled back with your changes. It is written even when `session.info["audit_enabled"]` is `False`.
+
+### Without a session at hand
+
+When the session lives in a context variable rather than in your function's arguments, give `AuditTrail` a `session_provider`: a callable that returns the current `Session` or `AsyncSession`, or `None` when there is none. `log()` and `alog()` call it when no session is passed:
+
+```python
+audit = AuditTrail(engine, session_provider=lambda: current_session.get())
+
+audit.log(AuthEvent.LOGIN, actor=Actor(type="user", id=str(user.id)))
+```
+
+A session passed explicitly always wins. Without a session, a call raises `RuntimeError` when there is no `session_provider` or it returns `None`, whatever `on_error` says: an entry is never dropped silently. The [FastAPI integration](fastapi.md#sessions) provides a ready-made `session_provider`.
 
 ## Durable and fail-closed events
 

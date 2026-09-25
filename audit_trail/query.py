@@ -31,7 +31,8 @@ import binascii
 import heapq
 from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, TypedDict
 from uuid import UUID
 
@@ -54,6 +55,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import NoReferenceError
 
 from audit_trail._compaction import ActivityRow, FieldChange, compact_rows
+from audit_trail._typing import assert_never
 from audit_trail.checks import _registry_of
 from audit_trail.diff import REDACTED, UNKNOWN, field_policy, options_of
 from audit_trail.serialization import JSONValue
@@ -65,9 +67,11 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Mapper, Session, registry
 
 __all__ = [
+    "ALL_HISTORY",
     "AccessCount",
     "ActivityDetail",
     "ActivityRow",
+    "AllHistory",
     "AuditQuery",
     "Cursor",
     "FieldLabels",
@@ -82,28 +86,63 @@ __all__ = [
 
 _CUSTOM_PLAN = text("SET LOCAL plan_cache_mode = 'force_custom_plan'")
 
+_ALL_HISTORY_TOKEN = "*"
+
+
+class AllHistory(Enum):
+    """Type of ``ALL_HISTORY``: a listing without a lower time bound."""
+
+    ALL_HISTORY = "all_history"
+
+
+ALL_HISTORY = AllHistory.ALL_HISTORY
+"""Pass as ``since`` to list the whole log, even with a default query window.
+
+``since=None`` means "not given", which applies the configured window.
+"""
+
 
 class Cursor(NamedTuple):
     """Position in the listing: ``(created_at, id)`` of an activity row.
 
     ``list_groups`` continues with the rows after it in
-    ``(created_at DESC, id DESC)`` order.
+    ``(created_at DESC, id DESC)`` order. The cursor also carries the lower
+    time bound of the listing, so that every page uses the bound of the
+    first one.
 
     Attributes:
         created_at: ``created_at`` of the row; must be timezone-aware.
         id: ``id`` of the row.
+        since: The listing's lower bound: a timezone-aware datetime, or
+            ``ALL_HISTORY`` for none. A ``next_cursor`` always records it;
+            ``None`` means not recorded (a cursor built by hand or a token
+            from an older version), and the next page then resolves the
+            bound as a first page would.
     """
 
     created_at: datetime
     id: int
+    since: datetime | AllHistory | None = None
 
     def encode(self) -> str:
         """Return the cursor as an opaque, URL-safe token.
 
         Returns:
-            Unpadded URL-safe base64 of ``<ISO created_at>|<id>``.
+            Unpadded URL-safe base64 of ``<ISO created_at>|<id>``, followed
+            by ``|<ISO since>`` or ``|*`` (``ALL_HISTORY``) when ``since`` is
+            recorded.
         """
-        raw = f"{self.created_at.isoformat()}|{self.id}".encode()
+        parts = [self.created_at.isoformat(), str(self.id)]
+        match self.since:
+            case None:
+                pass
+            case AllHistory.ALL_HISTORY:
+                parts.append(_ALL_HISTORY_TOKEN)
+            case datetime():
+                parts.append(self.since.isoformat())
+            case _:
+                assert_never(self.since)
+        raw = "|".join(parts).encode()
         return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
     @classmethod
@@ -117,15 +156,26 @@ class Cursor(NamedTuple):
             The cursor.
 
         Raises:
-            ValueError: The token is malformed or its datetime has no offset.
+            ValueError: The token is malformed or one of its datetimes has no
+                offset.
         """
         try:
             raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
-            created_at, row_id = raw.decode().split("|")
-            cursor = cls(datetime.fromisoformat(created_at), int(row_id))
+            created_at, row_id, *rest = raw.decode().split("|")
+            since: datetime | AllHistory | None
+            match rest:
+                case []:
+                    since = None
+                case [str() as bound] if bound == _ALL_HISTORY_TOKEN:
+                    since = ALL_HISTORY
+                case [str() as bound]:
+                    since = datetime.fromisoformat(bound)
+                case _:
+                    raise ValueError("too many fields")
+            cursor = cls(datetime.fromisoformat(created_at), int(row_id), since)
         except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
             raise ValueError(f"malformed cursor: {token!r}") from exc
-        _check_aware(cursor.created_at, "cursor created_at")
+        _check_cursor(cursor)
         return cursor
 
 
@@ -262,10 +312,15 @@ class Page:
     Attributes:
         groups: Groups, newest first.
         next_cursor: Cursor of the next page, or ``None`` after the last one.
+        since: The lower time bound the listing used (``created_at >=
+            since``), or ``None`` when it had none. With a default query
+            window this is where the window starts: pass it as ``until`` to
+            load the older entries.
     """
 
     groups: list[Group]
     next_cursor: Cursor | None
+    since: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -347,18 +402,31 @@ class AuditQuery:
         tables: The audit tables.
         severities: Every severity in use; ``list_groups`` queries these when
             it is not given ``severities``.
+        default_window: How far back ``list_groups`` reads when it is not
+            given ``since``; ``None`` reads the whole log.
+
+    Raises:
+        TypeError: ``default_window`` is not a ``timedelta``.
+        ValueError: ``default_window`` is not positive.
     """
 
-    def __init__(self, tables: AuditTables, severities: Iterable[int]) -> None:
+    def __init__(
+        self,
+        tables: AuditTables,
+        severities: Iterable[int],
+        *,
+        default_window: timedelta | None = None,
+    ) -> None:
         self.tables = tables
         self.severities = tuple(sorted({int(severity) for severity in severities}))
+        self.default_window = _check_window(default_window)
 
     def list_groups(
         self,
         session: Session,
         *,
         severities: Collection[int] | None = None,
-        since: datetime | None = None,
+        since: datetime | AllHistory | None = None,
         until: datetime | None = None,
         actor_id: str | None = None,
         object_type: str | None = None,
@@ -391,6 +459,12 @@ class AuditQuery:
         ``next_cursor`` returns every matching transaction exactly once, also
         when several transactions share a ``created_at``.
 
+        With a default query window (``AuditTrail(default_query_window=...)``)
+        and no ``since``, the listing starts at ``until`` (or now) minus the
+        window. The first page fixes that bound and its ``next_cursor``
+        carries it, so later pages neither move nor drop it. ``Page.since``
+        reports the bound: pass it as ``until`` to read the window before.
+
         Statements run in the session's current transaction (one is begun if
         needed) after ``SET LOCAL plan_cache_mode = 'force_custom_plan'``,
         which stays in effect until that transaction ends. On an
@@ -400,8 +474,12 @@ class AuditQuery:
         Args:
             session: The session to query with.
             severities: Severities to list; ``None`` lists all configured.
-            since: Only entries with ``created_at >= since``.
-            until: Only entries with ``created_at < until``.
+            since: Only entries with ``created_at >= since``. ``ALL_HISTORY``
+                sets no lower bound, even with a default window. ``None``
+                takes the bound recorded in ``cursor``, else applies the
+                default window, else sets no bound.
+            until: Only entries with ``created_at < until``; also the end of
+                the default window.
             actor_id: Only entries of this actor.
             object_type: Only entries on objects of this type.
             object_id: Only entries on the object with this id.
@@ -424,11 +502,13 @@ class AuditQuery:
             The page.
 
         Raises:
-            ValueError: ``limit`` is below 1, or ``since``, ``until`` or the
-                cursor's ``created_at`` is not timezone-aware.
-            TypeError: A collection filter is a ``str``.
+            ValueError: ``limit`` is below 1, or ``since``, ``until`` or a
+                datetime of the cursor is not timezone-aware.
+            TypeError: A collection filter is a ``str``, or ``since`` is
+                neither a datetime, ``ALL_HISTORY`` nor ``None``.
         """
         _check_page(since, until, cursor, limit)
+        bound = self._bound(since, until, cursor, self.default_window)
         _check_collection(severities, "severities")
         _check_collection(verbs, "verbs")
         _check_collection(scope_ids, "scope_ids")
@@ -448,7 +528,7 @@ class AuditQuery:
             condition = _member_of(field, allowed)
             if condition is not None:
                 common.append(condition)
-        common.extend(self._window(since, until, visibility))
+        common.extend(self._window(_lower(bound), until, visibility))
         if extra_predicate is not None:
             common.append(extra_predicate)
 
@@ -461,12 +541,12 @@ class AuditQuery:
         else:
             wanted = self.severities if severities is None else sorted(set(severities))
             if not wanted:
-                return Page(groups=[], next_cursor=None)
+                return Page(groups=[], next_cursor=None, since=_lower(bound))
             streams = [[a.c.severity == severity, *common] for severity in wanted]
             boundary = [a.c.severity.in_(wanted), *common]
 
         return self._page(
-            session, streams, boundary, cursor, limit, visibility, compact
+            session, streams, boundary, cursor, limit, visibility, compact, bound
         )
 
     async def alist_groups(
@@ -474,7 +554,7 @@ class AuditQuery:
         session: AsyncSession,
         *,
         severities: Collection[int] | None = None,
-        since: datetime | None = None,
+        since: datetime | AllHistory | None = None,
         until: datetime | None = None,
         actor_id: str | None = None,
         object_type: str | None = None,
@@ -658,7 +738,9 @@ class AuditQuery:
         parent's history only.
 
         Pagination works as in ``list_groups``: it counts transactions,
-        newest first, and ``next_cursor`` returns each transaction once.
+        newest first, and ``next_cursor`` returns each transaction once. The
+        default query window does not apply: without ``since`` (given or
+        recorded in ``cursor``) the whole history is listed.
 
         Args:
             session: The session to query with.
@@ -684,8 +766,9 @@ class AuditQuery:
                 cursor's ``created_at`` is not timezone-aware.
         """
         _check_page(since, until, cursor, limit)
+        bound = self._bound(since, until, cursor, None)
         a = self.tables.activity
-        common = self._window(since, until, visibility)
+        common = self._window(_lower(bound), until, visibility)
         own = and_(a.c.object_type == object_type, a.c.object_id == object_id)
         # Two streams, one per index, merged in Python: an OR of both
         # conditions could not read either index in order.
@@ -703,6 +786,7 @@ class AuditQuery:
             limit,
             visibility,
             compact,
+            bound,
             scope=scope,
         )
 
@@ -770,7 +854,8 @@ class AuditQuery:
         """List the transactions sharing a correlation id, newest first.
 
         Groups and pagination are those of ``list_groups``; the transactions
-        are selected with one query over the correlation index.
+        are selected with one query over the correlation index. The default
+        query window does not apply, as for ``object_history``.
 
         Args:
             session: The session to query with.
@@ -792,13 +877,14 @@ class AuditQuery:
                 cursor's ``created_at`` is not timezone-aware.
         """
         _check_page(since, until, cursor, limit)
+        bound = self._bound(since, until, cursor, None)
         a = self.tables.activity
         conditions = [
             a.c.correlation_id == correlation_id,
-            *self._window(since, until, visibility),
+            *self._window(_lower(bound), until, visibility),
         ]
         return self._page(
-            session, [conditions], conditions, cursor, limit, visibility, compact
+            session, [conditions], conditions, cursor, limit, visibility, compact, bound
         )
 
     async def arelated(
@@ -858,7 +944,8 @@ class AuditQuery:
         """Count one verb's entries on a record per actor.
 
         For example who read a person's sensitive data, and how often.
-        Entries are counted raw, without compaction.
+        Entries are counted raw, without compaction. The default query window
+        does not apply: without ``since`` every entry is counted.
 
         Args:
             session: The session to query with.
@@ -933,6 +1020,27 @@ class AuditQuery:
             )
         )
 
+    def _bound(
+        self,
+        since: datetime | AllHistory | None,
+        until: datetime | None,
+        cursor: Cursor | None,
+        window: timedelta | None,
+    ) -> datetime | AllHistory:
+        # The listing's lower bound, fixed at the first page: the argument,
+        # else the one the cursor recorded, else the window, else none.
+        if since is None and cursor is not None:
+            since = cursor.since
+        match since:
+            case datetime() | AllHistory.ALL_HISTORY:
+                return since
+            case None:
+                if window is None:
+                    return ALL_HISTORY
+                return (datetime.now(timezone.utc) if until is None else until) - window
+            case _:
+                assert_never(since)
+
     def _window(
         self,
         since: datetime | None,
@@ -958,19 +1066,24 @@ class AuditQuery:
         limit: int,
         visibility: Visibility | None,
         compact: bool,
+        bound: datetime | AllHistory,
         *,
         scope: ColumnElement[bool] | None = None,
     ) -> Page:
         # Stage 1 reads each stream in (created_at, id) order; `boundary`
         # matches the rows of all streams together; `scope` narrows the rows
-        # a group shows (None: every visible row of the transaction).
+        # a group shows (None: every visible row of the transaction); `bound`
+        # is recorded in the next cursor.
         session.execute(_CUSTOM_PLAN)
         shown = self._shown(session, boundary, cursor)
         selection = self._select(session, streams, cursor, shown, limit)
         groups = self._groups(
             session, selection.transactions, visibility, compact, scope
         )
-        return Page(groups=groups, next_cursor=selection.next_cursor)
+        next_cursor = selection.next_cursor
+        if next_cursor is not None:
+            next_cursor = next_cursor._replace(since=bound)
+        return Page(groups=groups, next_cursor=next_cursor, since=_lower(bound))
 
     def _shown(
         self,
@@ -1443,15 +1556,49 @@ def _check_collection(values: Collection[object] | None, name: str) -> None:
         raise TypeError(f"{name} must be a collection of values, not a str")
 
 
+def _lower(bound: datetime | AllHistory) -> datetime | None:
+    # The `created_at >=` bound of a resolved lower bound.
+    match bound:
+        case datetime():
+            return bound
+        case AllHistory.ALL_HISTORY:
+            return None
+        case _:
+            assert_never(bound)
+
+
+def _check_window(window: object) -> timedelta | None:
+    if window is None:
+        return None
+    if not isinstance(window, timedelta):
+        raise TypeError("the default query window must be a timedelta or None")
+    if window <= timedelta(0):
+        raise ValueError("the default query window must be positive")
+    return window
+
+
+def _check_since(since: object, name: str) -> None:
+    if since is None or isinstance(since, AllHistory):
+        return
+    if not isinstance(since, datetime):
+        raise TypeError(f"{name} must be a datetime, ALL_HISTORY or None")
+    _check_aware(since, name)
+
+
+def _check_cursor(cursor: Cursor) -> None:
+    _check_aware(cursor.created_at, "cursor created_at")
+    _check_since(cursor.since, "cursor since")
+
+
 def _check_page(
-    since: datetime | None, until: datetime | None, cursor: Cursor | None, limit: int
+    since: object, until: datetime | None, cursor: Cursor | None, limit: int
 ) -> None:
     if limit < 1:
         raise ValueError("limit must be at least 1")
-    _check_aware(since, "since")
+    _check_since(since, "since")
     _check_aware(until, "until")
     if cursor is not None:
-        _check_aware(cursor.created_at, "cursor created_at")
+        _check_cursor(cursor)
 
 
 def _check_aware(value: datetime | None, name: str) -> None:

@@ -10,8 +10,10 @@ from audit_trail.events import AuditEvent, Severity, event
 from audit_trail.mixin import Audited
 from audit_trail.privacy import ScrubNotAllowedError, ScrubResult
 from audit_trail.query import (
+    ALL_HISTORY,
     AccessCount,
     ActivityDetail,
+    AllHistory,
     Cursor,
     FieldLabels,
     Group,
@@ -30,9 +32,11 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
     __version__ = "0.0.0"
 
 __all__ = [
+    "ALL_HISTORY",
     "AccessCount",
     "ActivityDetail",
     "Actor",
+    "AllHistory",
     "AuditContext",
     "AuditEvent",
     "AuditOptionError",

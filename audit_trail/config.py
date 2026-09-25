@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, overload
 
 from sqlalchemy import Engine, create_engine
 
@@ -30,7 +30,7 @@ from audit_trail.serialization import pseudonymize as _pseudonymize
 from audit_trail.tables import build_tables
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     from pydantic import BaseModel
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -137,8 +137,9 @@ class AuditTrail:
             raise.
         pseudonymize_key: HMAC key as ``bytes`` (version 1) or
             ``{version: key}``.
-        session_provider: Returns the current session, for hosts that keep it
-            in a context variable.
+        session_provider: Returns the current session, or ``None`` when there
+            is none, for hosts that keep it in a context variable. ``log`` and
+            ``alog`` call it when no session is passed.
         context_provider: Returns the current audit context.
         json_encoder: Extra encoder for types the built-in one does not handle.
         indexes: Names of the indexes to create. ``None`` uses the defaults.
@@ -151,6 +152,10 @@ class AuditTrail:
             and retry once. Needs DDL privileges.
         allow_scrub: Enable ``scrub``/``scrub_actor``. They run on ``engine``,
             whose role then needs ``UPDATE`` on the audit tables.
+        default_query_window: How far back ``query.list_groups`` reads when
+            it is not given ``since``, for example ``timedelta(days=30)``;
+            ``since=ALL_HISTORY`` still lists the whole log. ``None`` reads
+            the whole log, which gets slower as it grows.
 
     Attributes:
         severities: The severity enum in use.
@@ -164,9 +169,11 @@ class AuditTrail:
 
     Raises:
         EventRegistryError: An event or a severity setting is invalid.
-        ValueError: A table name or an index key is invalid, or
-            ``pseudonymize_key`` is too short.
-        TypeError: ``pseudonymize_key`` has the wrong type.
+        ValueError: A table name or an index key is invalid,
+            ``pseudonymize_key`` is too short, or ``default_query_window`` is
+            not positive.
+        TypeError: ``pseudonymize_key`` or ``default_query_window`` has the
+            wrong type.
     """
 
     context = staticmethod(_context)
@@ -185,7 +192,7 @@ class AuditTrail:
         durable_engine: Engine | AsyncEngine | None = None,
         on_error: OnError = "log",
         pseudonymize_key: bytes | dict[int, bytes] | None = None,
-        session_provider: Callable[[], Any] | None = None,
+        session_provider: Callable[[], Session | AsyncSession | None] | None = None,
         context_provider: Callable[[], Any] | None = None,
         json_encoder: type[json.JSONEncoder] | None = None,
         indexes: Collection[str] | None = None,
@@ -193,6 +200,7 @@ class AuditTrail:
         warn_on_bulk: bool = True,
         auto_create_partitions: bool = False,
         allow_scrub: bool = False,
+        default_query_window: timedelta | None = None,
     ) -> None:
         self.engine = engine
         self.schema = schema
@@ -224,7 +232,9 @@ class AuditTrail:
         self.maintenance = PartitionManager(engine, self.tables, self.severities)
         from audit_trail.query import AuditQuery
 
-        self.query = AuditQuery(self.tables, self.severities)
+        self.query = AuditQuery(
+            self.tables, self.severities, default_window=default_query_window
+        )
 
     def install(
         self,
@@ -311,10 +321,38 @@ class AuditTrail:
             raise TypeError("the durable engine is sync; use dispose")
         await self.durable_engine.dispose()
 
+    @overload
     def log(
         self,
-        session: Session,
+        session: Session | None,
         event: AuditEvent,
+        /,
+        *,
+        obj: object | None = None,
+        target: Target | object | None = None,
+        payload: Mapping[str, object] | BaseModel | None = None,
+        actor: Actor | None = None,
+        durable: bool | None = None,
+    ) -> None: ...
+
+    @overload
+    def log(
+        self,
+        event: AuditEvent,
+        /,
+        *,
+        obj: object | None = None,
+        target: Target | object | None = None,
+        payload: Mapping[str, object] | BaseModel | None = None,
+        actor: Actor | None = None,
+        durable: bool | None = None,
+    ) -> None: ...
+
+    def log(
+        self,
+        session_or_event: Session | AuditEvent | None,
+        event: AuditEvent | None = None,
+        /,
         *,
         obj: object | None = None,
         target: Target | object | None = None,
@@ -323,6 +361,11 @@ class AuditTrail:
         durable: bool | None = None,
     ) -> None:
         """Record an explicit event.
+
+        Called as ``log(session, event, ...)`` or, with a ``session_provider``
+        configured, as ``log(event, ...)``: without a session (or with
+        ``None``), the entry goes to the session ``session_provider()``
+        returns.
 
         A non-durable entry is inserted immediately on
         ``session.connection()``, in the same database transaction as the
@@ -349,7 +392,9 @@ class AuditTrail:
         ``False``, which only switches off the automatic ``entity.*`` entries.
 
         Args:
-            session: A session of a class this ``AuditTrail`` is installed on.
+            session_or_event: A session of a class this ``AuditTrail`` is
+                installed on, followed by the event; or the event alone, or
+                after ``None``, to use ``session_provider``.
             event: A registered host event.
             obj: The object the event is about; sets ``object_type``,
                 ``object_id``, ``object_label`` and, through its options,
@@ -369,9 +414,13 @@ class AuditTrail:
                 cannot weaken a ``fail_closed`` event.
 
         Raises:
-            TypeError: The session's class is not installed by this
-                ``AuditTrail``, or the write is durable and
-                ``durable_engine`` is async.
+            RuntimeError: No session is passed and there is no
+                ``session_provider``, or it returns ``None``.
+            TypeError: The arguments are not ``(session, event)`` or
+                ``(event)``, the session is not a ``Session`` (use ``alog``
+                for an ``AsyncSession``), its class is not installed by this
+                ``AuditTrail``, or the write is durable and ``durable_engine``
+                is async.
             ValueError: The event uses a reserved prefix, ``durable=False``
                 is given for a ``fail_closed`` event, ``obj`` or an instance
                 ``target`` has no primary key, or a ``Pseudonymized`` field
@@ -382,6 +431,8 @@ class AuditTrail:
             AuditWriteError: A durable write failed and the policy says to
                 raise.
         """
+        from sqlalchemy.orm import Session
+
         from audit_trail.listener import write_entries
         from audit_trail.writer import (
             DURABLE_WRITE_ERRORS,
@@ -389,7 +440,14 @@ class AuditTrail:
             write_durable,
         )
 
-        entry = self._prepare(session, event, obj, target, payload, actor, durable)
+        call = _split_call("log", session_or_event, event)
+        session = self._session_for("log", call.session)
+        if not isinstance(session, Session):
+            raise TypeError(
+                f"log() needs a Session, not {type(session).__qualname__}; "
+                "use alog() for an AsyncSession"
+            )
+        entry = self._prepare(session, call.event, obj, target, payload, actor, durable)
         if not entry.flags.durable:
             write_entries(session, self, [entry.entry], entry.ctx)
             return
@@ -413,10 +471,38 @@ class AuditTrail:
         except DURABLE_WRITE_ERRORS as exc:
             handle_durable_failure(exc, self.on_error, entry.flags.fail_closed)
 
+    @overload
     async def alog(
         self,
-        session: AsyncSession,
+        session: AsyncSession | None,
         event: AuditEvent,
+        /,
+        *,
+        obj: object | None = None,
+        target: Target | object | None = None,
+        payload: Mapping[str, object] | BaseModel | None = None,
+        actor: Actor | None = None,
+        durable: bool | None = None,
+    ) -> None: ...
+
+    @overload
+    async def alog(
+        self,
+        event: AuditEvent,
+        /,
+        *,
+        obj: object | None = None,
+        target: Target | object | None = None,
+        payload: Mapping[str, object] | BaseModel | None = None,
+        actor: Actor | None = None,
+        durable: bool | None = None,
+    ) -> None: ...
+
+    async def alog(
+        self,
+        session_or_event: AsyncSession | AuditEvent | None,
+        event: AuditEvent | None = None,
+        /,
         *,
         obj: object | None = None,
         target: Target | object | None = None,
@@ -426,12 +512,17 @@ class AuditTrail:
     ) -> None:
         """Async ``log``, for an ``AsyncSession`` of an installed factory.
 
+        Called as ``alog(session, event, ...)`` or, with a
+        ``session_provider`` configured, as ``alog(event, ...)``; see ``log``.
+
         A non-durable entry is written in the session's transaction, a
         durable one on the async ``durable_engine``; see ``log``.
 
         Args:
-            session: An ``AsyncSession`` whose ``sync_session_class`` this
-                ``AuditTrail`` is installed on.
+            session_or_event: An ``AsyncSession`` whose ``sync_session_class``
+                this ``AuditTrail`` is installed on, followed by the event; or
+                the event alone, or after ``None``, to use
+                ``session_provider``.
             event: A registered host event.
             obj: The object the event is about; see ``log``.
             target: The parent object; see ``log``.
@@ -440,15 +531,21 @@ class AuditTrail:
             durable: Overrides the event's ``durable`` setting.
 
         Raises:
-            TypeError: The session's class is not installed by this
-                ``AuditTrail``, or the write is durable and
-                ``durable_engine`` is sync.
+            RuntimeError: No session is passed and there is no
+                ``session_provider``, or it returns ``None``.
+            TypeError: The arguments are not ``(session, event)`` or
+                ``(event)``, the session is not an ``AsyncSession`` (use
+                ``log`` for a ``Session``), its class is not installed by this
+                ``AuditTrail``, or the write is durable and ``durable_engine``
+                is sync.
             ValueError: As for ``log``.
             UnknownEventError: The event is not registered.
             PayloadError: The payload does not match the event's schema.
             AuditWriteError: A durable write failed and the policy says to
                 raise.
         """
+        from sqlalchemy.ext.asyncio import AsyncSession
+
         from audit_trail.listener import write_entries
         from audit_trail.writer import (
             DURABLE_WRITE_ERRORS,
@@ -456,8 +553,15 @@ class AuditTrail:
             write_durable,
         )
 
+        call = _split_call("alog", session_or_event, event)
+        session = self._session_for("alog", call.session)
+        if not isinstance(session, AsyncSession):
+            raise TypeError(
+                f"alog() needs an AsyncSession, not {type(session).__qualname__}; "
+                "use log() for a Session"
+            )
         entry = self._prepare(
-            session.sync_session, event, obj, target, payload, actor, durable
+            session.sync_session, call.event, obj, target, payload, actor, durable
         )
         if not entry.flags.durable:
             await session.run_sync(
@@ -678,6 +782,25 @@ class AuditTrail:
     def _severity_values(self) -> list[int]:
         return [int(member) for member in self.severities]
 
+    def _session_for(
+        self, method: str, session: Session | AsyncSession | None
+    ) -> Session | AsyncSession:
+        # The explicit session, else the provider's; never silently nothing.
+        if session is not None:
+            return session
+        if self.session_provider is None:
+            raise RuntimeError(
+                f"{method}() needs a session: pass one or configure "
+                "AuditTrail(session_provider=...)"
+            )
+        provided = self.session_provider()
+        if provided is None:
+            raise RuntimeError(
+                f"{method}() got no session from session_provider "
+                "(is it called outside a request?): pass one"
+            )
+        return provided
+
     def _prepare(
         self,
         session: Session,
@@ -760,6 +883,26 @@ class AuditTrail:
             ctx,
             flags,
         )
+
+
+class _Call(NamedTuple):
+    session: Session | AsyncSession | None
+    event: AuditEvent
+
+
+def _split_call(
+    method: str,
+    first: Session | AsyncSession | AuditEvent | None,
+    second: AuditEvent | None,
+) -> _Call:
+    # log(event) or log(session, event); a session is never an AuditEvent.
+    match first, second:
+        case AuditEvent(), None:
+            return _Call(None, first)
+        case _, AuditEvent() if not isinstance(first, AuditEvent):
+            return _Call(first, second)
+        case _:
+            raise TypeError(f"{method}() takes (session, event) or (event)")
 
 
 class _PreparedEntry(NamedTuple):
