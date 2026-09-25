@@ -11,9 +11,17 @@ transaction, newest first, with keyset pagination. It runs in two stages:
    explicit ``created_at`` bounds, so only the partitions of the page's time
    range are read, and their ``audit_transaction`` rows likewise.
 
-Both stages run after ``SET LOCAL plan_cache_mode = 'force_custom_plan'``: a
-generic plan of a prepared statement (asyncpg, psycopg after a few executions)
-cannot prune partitions by the query's parameters at plan time.
+``object_history`` and ``related`` page through transactions the same way,
+with their own stage 1 streams: the object and target indexes for a record's
+history, the correlation index for related transactions. ``get`` reads one
+entry by ``(id, created_at)``, which prunes to one monthly partition per
+severity (one partition when the severity is given), and ``access_summary``
+counts an object's accesses per actor. ``LabelResolver`` labels the objects
+that foreign-key and relationship changes refer to.
+
+Every query runs after ``SET LOCAL plan_cache_mode = 'force_custom_plan'``:
+a generic plan of a prepared statement (asyncpg, psycopg after a few
+executions) cannot prune partitions by the query's parameters at plan time.
 """
 
 from __future__ import annotations
@@ -21,38 +29,52 @@ from __future__ import annotations
 import base64
 import binascii
 import heapq
-from collections.abc import Collection, Iterable, Iterator
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, TypedDict
 from uuid import UUID
 
 from sqlalchemy import (
+    Column,
     ColumnElement,
     RowMapping,
+    String,
     and_,
+    column,
     false,
+    func,
+    or_,
     select,
     text,
     true,
     tuple_,
+    values,
 )
+from sqlalchemy.exc import NoReferenceError
 
-from audit_trail._compaction import ActivityRow, compact_rows
+from audit_trail._compaction import ActivityRow, FieldChange, compact_rows
+from audit_trail.checks import _registry_of
+from audit_trail.diff import REDACTED, UNKNOWN, field_policy, options_of
 from audit_trail.serialization import JSONValue
 from audit_trail.tables import AuditTables
 
 if TYPE_CHECKING:
     from sqlalchemy import ColumnClause, Table
     from sqlalchemy.ext.asyncio import AsyncSession
-    from sqlalchemy.orm import Session
+    from sqlalchemy.orm import Mapper, Session, registry
 
 __all__ = [
+    "AccessCount",
+    "ActivityDetail",
     "ActivityRow",
     "AuditQuery",
     "Cursor",
+    "FieldLabels",
     "Group",
+    "LabelResolver",
     "Page",
+    "RelationshipLabels",
     "TransactionHeader",
     "Visibility",
     "changed_fields",
@@ -246,6 +268,53 @@ class Page:
     next_cursor: Cursor | None
 
 
+@dataclass(frozen=True)
+class ActivityDetail:
+    """One entry with the header of its transaction.
+
+    Attributes:
+        activity: The entry, as stored (not compacted).
+        transaction: The header of its transaction, rebuilt from the entry's
+            snapshot when the ``audit_transaction`` row no longer exists.
+    """
+
+    activity: ActivityRow
+    transaction: TransactionHeader
+
+
+class AccessCount(NamedTuple):
+    """How often one actor accessed an object.
+
+    Attributes:
+        actor_id: The actor; ``None`` for entries without an actor.
+        entries: Number of matching entries.
+        first_at: ``created_at`` of the actor's oldest matching entry.
+        last_at: ``created_at`` of the actor's newest matching entry.
+    """
+
+    actor_id: str | None
+    entries: int
+    first_at: datetime
+    last_at: datetime
+
+
+class RelationshipLabels(TypedDict):
+    """Labels of the members a relationship change added and removed.
+
+    Attributes:
+        added: Labels of the added members, in the order of their ids.
+        removed: Labels of the removed members, in the order of their ids.
+    """
+
+    added: list[str]
+    removed: list[str]
+
+
+FieldLabels: TypeAlias = list[str | None] | RelationshipLabels
+"""Labels of one change: ``[old, new]`` for a column (``None`` where the value
+is ``None``) or ``RelationshipLabels`` for a relationship."""
+
+
 def changed_fields(activity: ActivityRow) -> list[str]:
     """Return the names of the fields an entry changed.
 
@@ -359,12 +428,7 @@ class AuditQuery:
                 cursor's ``created_at`` is not timezone-aware.
             TypeError: A collection filter is a ``str``.
         """
-        if limit < 1:
-            raise ValueError("limit must be at least 1")
-        _check_aware(since, "since")
-        _check_aware(until, "until")
-        if cursor is not None:
-            _check_aware(cursor.created_at, "cursor created_at")
+        _check_page(since, until, cursor, limit)
         _check_collection(severities, "severities")
         _check_collection(verbs, "verbs")
         _check_collection(scope_ids, "scope_ids")
@@ -379,17 +443,12 @@ class AuditQuery:
             (a.c.target_id, target_id),
             (a.c.correlation_id, correlation_id),
         ]
-        common.extend(column == value for column, value in equal if value is not None)
-        for column, values in ((a.c.verb, verbs), (a.c.scope_id, scope_ids)):
-            condition = _member_of(column, values)
+        common.extend(field == value for field, value in equal if value is not None)
+        for field, allowed in ((a.c.verb, verbs), (a.c.scope_id, scope_ids)):
+            condition = _member_of(field, allowed)
             if condition is not None:
                 common.append(condition)
-        if since is not None:
-            common.append(a.c.created_at >= since)
-        if until is not None:
-            common.append(a.c.created_at < until)
-        if visibility is not None:
-            common.append(visibility.predicate(a))
+        common.extend(self._window(since, until, visibility))
         if extra_predicate is not None:
             common.append(extra_predicate)
 
@@ -406,11 +465,9 @@ class AuditQuery:
             streams = [[a.c.severity == severity, *common] for severity in wanted]
             boundary = [a.c.severity.in_(wanted), *common]
 
-        session.execute(_CUSTOM_PLAN)
-        shown = self._shown(session, boundary, cursor)
-        selection = self._select(session, streams, cursor, shown, limit)
-        groups = self._groups(session, selection.transactions, visibility, compact)
-        return Page(groups=groups, next_cursor=selection.next_cursor)
+        return self._page(
+            session, streams, boundary, cursor, limit, visibility, compact
+        )
 
     async def alist_groups(
         self,
@@ -482,6 +539,438 @@ class AuditQuery:
                 compact=compact,
             )
         )
+
+    def get(
+        self,
+        session: Session,
+        id: int,
+        created_at: datetime,
+        *,
+        severity: int | None = None,
+        visibility: Visibility | None = None,
+    ) -> ActivityDetail | None:
+        """Return one entry with its transaction header.
+
+        An entry is found by ``id`` and ``created_at`` together: ``id`` alone
+        would read every partition, while ``created_at`` limits the read to
+        one monthly partition of each severity, and ``severity`` (the entry's
+        own, as a listing row carries it) to exactly one partition.
+
+        Args:
+            session: The session to query with.
+            id: The entry's ``id``.
+            created_at: The entry's ``created_at``.
+            severity: The entry's severity, if known.
+            visibility: What the caller may see; ``None`` shows everything.
+
+        Returns:
+            The entry and its header, or ``None`` when there is no such entry
+            or ``visibility`` hides it; the two cases are indistinguishable.
+
+        Raises:
+            ValueError: ``created_at`` is not timezone-aware.
+        """
+        _check_aware(created_at, "created_at")
+        a = self.tables.activity
+        t = self.tables.transaction
+        conditions = [a.c.id == id, a.c.created_at == created_at]
+        if severity is not None:
+            conditions.append(a.c.severity == severity)
+        if visibility is not None:
+            conditions.append(visibility.predicate(a))
+        session.execute(_CUSTOM_PLAN)
+        row = session.execute(select(a).where(*conditions)).mappings().first()
+        if row is None:
+            return None
+        activity = _activity(row)
+        header = (
+            session.execute(
+                select(t).where(
+                    t.c.id == activity["transaction_id"],
+                    t.c.issued_at == activity["created_at"],
+                )
+            )
+            .mappings()
+            .first()
+        )
+        return ActivityDetail(activity=activity, transaction=_header(header, activity))
+
+    async def aget(
+        self,
+        session: AsyncSession,
+        id: int,
+        created_at: datetime,
+        *,
+        severity: int | None = None,
+        visibility: Visibility | None = None,
+    ) -> ActivityDetail | None:
+        """Async variant of ``get``, with the same arguments.
+
+        Args:
+            session: The async session to query with.
+            id: See ``get``.
+            created_at: See ``get``.
+            severity: See ``get``.
+            visibility: See ``get``.
+
+        Returns:
+            See ``get``.
+
+        Raises:
+            ValueError: See ``get``.
+        """
+        return await session.run_sync(
+            lambda sync_session: self.get(
+                sync_session,
+                id,
+                created_at,
+                severity=severity,
+                visibility=visibility,
+            )
+        )
+
+    def object_history(
+        self,
+        session: Session,
+        object_type: str,
+        object_id: str,
+        *,
+        include_children: bool = True,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        visibility: Visibility | None = None,
+        cursor: Cursor | None = None,
+        limit: int = 50,
+        compact: bool = True,
+    ) -> Page:
+        """List the history of one record, grouped by database transaction.
+
+        The history holds the entries on the record and, with
+        ``include_children``, the entries whose target is the record (the
+        changes of its children). Each group shows only those entries of its
+        transaction, not the transaction's other entries. ``visibility``
+        applies to every entry on its own: children of types the caller may
+        not see are left out, and a visible child's entries are listed even
+        when the record's own type is hidden.
+
+        A child's entries follow the target it had when they were written: a
+        child moved to another parent appears, from the move on, in the new
+        parent's history only.
+
+        Pagination works as in ``list_groups``: it counts transactions,
+        newest first, and ``next_cursor`` returns each transaction once.
+
+        Args:
+            session: The session to query with.
+            object_type: The record's ``object_type``.
+            object_id: The record's ``object_id``, formatted as
+                ``object_id_for()`` formats it; any other string matches
+                nothing.
+            include_children: Also list the entries targeting the record.
+            since: Only entries with ``created_at >= since``.
+            until: Only entries with ``created_at < until``.
+            visibility: What the caller may see; ``None`` shows everything.
+            cursor: ``next_cursor`` of the previous page; ``None`` starts at
+                the newest entry.
+            limit: Maximum number of groups on the page.
+            compact: Merge each object's rows within a transaction;
+                ``False`` returns the raw rows.
+
+        Returns:
+            The page.
+
+        Raises:
+            ValueError: ``limit`` is below 1, or ``since``, ``until`` or the
+                cursor's ``created_at`` is not timezone-aware.
+        """
+        _check_page(since, until, cursor, limit)
+        a = self.tables.activity
+        common = self._window(since, until, visibility)
+        own = and_(a.c.object_type == object_type, a.c.object_id == object_id)
+        # Two streams, one per index, merged in Python: an OR of both
+        # conditions could not read either index in order.
+        streams = [[own, *common]]
+        scope: ColumnElement[bool] = own
+        if include_children:
+            children = and_(a.c.target_type == object_type, a.c.target_id == object_id)
+            streams.append([children, *common])
+            scope = or_(own, children)
+        return self._page(
+            session,
+            streams,
+            [scope, *common],
+            cursor,
+            limit,
+            visibility,
+            compact,
+            scope=scope,
+        )
+
+    async def aobject_history(
+        self,
+        session: AsyncSession,
+        object_type: str,
+        object_id: str,
+        *,
+        include_children: bool = True,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        visibility: Visibility | None = None,
+        cursor: Cursor | None = None,
+        limit: int = 50,
+        compact: bool = True,
+    ) -> Page:
+        """Async variant of ``object_history``, with the same arguments.
+
+        Args:
+            session: The async session to query with.
+            object_type: See ``object_history``.
+            object_id: See ``object_history``.
+            include_children: See ``object_history``.
+            since: See ``object_history``.
+            until: See ``object_history``.
+            visibility: See ``object_history``.
+            cursor: See ``object_history``.
+            limit: See ``object_history``.
+            compact: See ``object_history``.
+
+        Returns:
+            The page.
+
+        Raises:
+            ValueError: See ``object_history``.
+        """
+        return await session.run_sync(
+            lambda sync_session: self.object_history(
+                sync_session,
+                object_type,
+                object_id,
+                include_children=include_children,
+                since=since,
+                until=until,
+                visibility=visibility,
+                cursor=cursor,
+                limit=limit,
+                compact=compact,
+            )
+        )
+
+    def related(
+        self,
+        session: Session,
+        correlation_id: UUID,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        visibility: Visibility | None = None,
+        cursor: Cursor | None = None,
+        limit: int = 50,
+        compact: bool = True,
+    ) -> Page:
+        """List the transactions sharing a correlation id, newest first.
+
+        Groups and pagination are those of ``list_groups``; the transactions
+        are selected with one query over the correlation index.
+
+        Args:
+            session: The session to query with.
+            correlation_id: The correlation id.
+            since: Only entries with ``created_at >= since``.
+            until: Only entries with ``created_at < until``.
+            visibility: What the caller may see; ``None`` shows everything.
+            cursor: ``next_cursor`` of the previous page; ``None`` starts at
+                the newest entry.
+            limit: Maximum number of groups on the page.
+            compact: Merge each object's rows within a transaction;
+                ``False`` returns the raw rows.
+
+        Returns:
+            The page.
+
+        Raises:
+            ValueError: ``limit`` is below 1, or ``since``, ``until`` or the
+                cursor's ``created_at`` is not timezone-aware.
+        """
+        _check_page(since, until, cursor, limit)
+        a = self.tables.activity
+        conditions = [
+            a.c.correlation_id == correlation_id,
+            *self._window(since, until, visibility),
+        ]
+        return self._page(
+            session, [conditions], conditions, cursor, limit, visibility, compact
+        )
+
+    async def arelated(
+        self,
+        session: AsyncSession,
+        correlation_id: UUID,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        visibility: Visibility | None = None,
+        cursor: Cursor | None = None,
+        limit: int = 50,
+        compact: bool = True,
+    ) -> Page:
+        """Async variant of ``related``, with the same arguments.
+
+        Args:
+            session: The async session to query with.
+            correlation_id: See ``related``.
+            since: See ``related``.
+            until: See ``related``.
+            visibility: See ``related``.
+            cursor: See ``related``.
+            limit: See ``related``.
+            compact: See ``related``.
+
+        Returns:
+            The page.
+
+        Raises:
+            ValueError: See ``related``.
+        """
+        return await session.run_sync(
+            lambda sync_session: self.related(
+                sync_session,
+                correlation_id,
+                since=since,
+                until=until,
+                visibility=visibility,
+                cursor=cursor,
+                limit=limit,
+                compact=compact,
+            )
+        )
+
+    def access_summary(
+        self,
+        session: Session,
+        object_type: str,
+        object_id: str,
+        verb: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        visibility: Visibility | None = None,
+    ) -> list[AccessCount]:
+        """Count one verb's entries on a record per actor.
+
+        For example who read a person's sensitive data, and how often.
+        Entries are counted raw, without compaction.
+
+        Args:
+            session: The session to query with.
+            object_type: The record's ``object_type``.
+            object_id: The record's ``object_id`` (see ``object_id_for``).
+            verb: The verb to count, e.g. ``person.viewed``.
+            since: Only entries with ``created_at >= since``.
+            until: Only entries with ``created_at < until``.
+            visibility: What the caller may see; ``None`` counts everything.
+
+        Returns:
+            One count per actor, the most recent access first.
+
+        Raises:
+            ValueError: ``since`` or ``until`` is not timezone-aware.
+        """
+        _check_aware(since, "since")
+        _check_aware(until, "until")
+        a = self.tables.activity
+        last_at = func.max(a.c.created_at)
+        statement = (
+            select(a.c.actor_id, func.count(), func.min(a.c.created_at), last_at)
+            .where(
+                a.c.object_type == object_type,
+                a.c.object_id == object_id,
+                a.c.verb == verb,
+                *self._window(since, until, visibility),
+            )
+            .group_by(a.c.actor_id)
+            .order_by(last_at.desc(), a.c.actor_id)
+        )
+        session.execute(_CUSTOM_PLAN)
+        return [AccessCount(*row) for row in session.execute(statement)]
+
+    async def aaccess_summary(
+        self,
+        session: AsyncSession,
+        object_type: str,
+        object_id: str,
+        verb: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        visibility: Visibility | None = None,
+    ) -> list[AccessCount]:
+        """Async variant of ``access_summary``, with the same arguments.
+
+        Args:
+            session: The async session to query with.
+            object_type: See ``access_summary``.
+            object_id: See ``access_summary``.
+            verb: See ``access_summary``.
+            since: See ``access_summary``.
+            until: See ``access_summary``.
+            visibility: See ``access_summary``.
+
+        Returns:
+            See ``access_summary``.
+
+        Raises:
+            ValueError: See ``access_summary``.
+        """
+        return await session.run_sync(
+            lambda sync_session: self.access_summary(
+                sync_session,
+                object_type,
+                object_id,
+                verb,
+                since=since,
+                until=until,
+                visibility=visibility,
+            )
+        )
+
+    def _window(
+        self,
+        since: datetime | None,
+        until: datetime | None,
+        visibility: Visibility | None,
+    ) -> list[ColumnElement[bool]]:
+        a = self.tables.activity
+        conditions: list[ColumnElement[bool]] = []
+        if since is not None:
+            conditions.append(a.c.created_at >= since)
+        if until is not None:
+            conditions.append(a.c.created_at < until)
+        if visibility is not None:
+            conditions.append(visibility.predicate(a))
+        return conditions
+
+    def _page(
+        self,
+        session: Session,
+        streams: list[list[ColumnElement[bool]]],
+        boundary: list[ColumnElement[bool]],
+        cursor: Cursor | None,
+        limit: int,
+        visibility: Visibility | None,
+        compact: bool,
+        *,
+        scope: ColumnElement[bool] | None = None,
+    ) -> Page:
+        # Stage 1 reads each stream in (created_at, id) order; `boundary`
+        # matches the rows of all streams together; `scope` narrows the rows
+        # a group shows (None: every visible row of the transaction).
+        session.execute(_CUSTOM_PLAN)
+        shown = self._shown(session, boundary, cursor)
+        selection = self._select(session, streams, cursor, shown, limit)
+        groups = self._groups(
+            session, selection.transactions, visibility, compact, scope
+        )
+        return Page(groups=groups, next_cursor=selection.next_cursor)
 
     def _shown(
         self,
@@ -573,6 +1062,7 @@ class AuditQuery:
         transactions: dict[int, datetime],
         visibility: Visibility | None,
         compact: bool,
+        scope: ColumnElement[bool] | None,
     ) -> list[Group]:
         if not transactions:
             return []
@@ -588,6 +1078,8 @@ class AuditQuery:
         ]
         if visibility is not None:
             conditions.append(visibility.predicate(a))
+        if scope is not None:
+            conditions.append(scope)
         rows: dict[int, list[ActivityRow]] = {}
         statement = select(a).where(*conditions).order_by(a.c.transaction_id, a.c.id)
         for mapping in session.execute(statement).mappings():
@@ -611,6 +1103,261 @@ class AuditQuery:
             header = _header(headers.get(transaction_id), raw[0])
             groups.append(Group(transaction=header, activities=activities))
         return groups
+
+
+class _Reference(NamedTuple):
+    object_type: str
+    object_id: str
+
+
+class _Label(NamedTuple):
+    created_at: datetime
+    id: int
+    label: str
+
+
+class _Found(NamedTuple):
+    activity_id: int
+    key: str
+    change: FieldChange
+    types: frozenset[str]
+
+
+class LabelResolver:
+    """Labels for the objects that entries' foreign keys and relationships name.
+
+    A change such as ``{"board_id": [1, 2]}`` stores ids. The resolver finds
+    which fields refer to other objects from the models' metadata, never from
+    field names: a column with a single-column ``ForeignKey`` to the primary
+    key of a mapped table, and every relationship (whose tracked changes list
+    member ids). It then looks each referenced object up in the audit trail,
+    not in the host's tables.
+
+    The label of an object is the newest non-null ``object_label`` among its
+    entries that ``visibility`` lets the caller see. So a deleted object keeps
+    the label of its ``entity.deleted`` entry, and an object the caller may
+    not see (its type, scope or verbs hidden) is not revealed: it gets the
+    fallback ``#<id>``, as does an object without a labelled entry, e.g. of a
+    model without a ``label`` option. A label is as fresh as the object's
+    last audited change: an unaudited rename is not reflected.
+
+    Not resolved: composite foreign keys, foreign keys to columns other than
+    the primary key, fields with an audit policy (``redact``, ``hash``) and
+    redacted or unknown values, as well as ``target_type``/``target_id``.
+
+    Args:
+        tables: The audit tables.
+        base: The registry of the models, or a declarative base class using
+            it, as for ``check_models``. Its mappers are configured.
+    """
+
+    def __init__(self, tables: AuditTables, base: registry | type[Any]) -> None:
+        self.tables = tables
+        reg = _registry_of(base)
+        reg.configure()
+        mappers = list(reg.mappers)
+        self._labelled = frozenset(
+            _type_name(mapper.class_)
+            for mapper in mappers
+            if options_of(mapper.class_).label is not None
+        )
+        self._fields: dict[str, dict[str, frozenset[str]]] = {}
+        for mapper in mappers:
+            fields = self._fields.setdefault(_type_name(mapper.class_), {})
+            for prop in mapper.column_attrs:
+                types = _referenced_types(mapper, prop.key, prop.columns, mappers)
+                if types:
+                    fields[prop.key] = types
+            for relationship in mapper.relationships:
+                fields[relationship.key] = _types_of(relationship.mapper)
+
+    def resolve(
+        self,
+        session: Session,
+        activities: Iterable[ActivityRow],
+        *,
+        visibility: Visibility | None = None,
+    ) -> dict[int, dict[str, FieldLabels]]:
+        """Label the referenced objects of the entries' changes.
+
+        Args:
+            session: The session to query with.
+            activities: The entries, e.g. those of a page's groups.
+            visibility: What the caller may see; ``None`` shows everything.
+
+        Returns:
+            By entry ``id``, then by field, the labels in the shape of the
+            change: ``[old, new]`` for a column, ``RelationshipLabels`` for a
+            relationship. Entries without reference fields are left out.
+        """
+        found: list[_Found] = []
+        wanted: set[_Reference] = set()
+        for activity in activities:
+            object_type = activity["object_type"]
+            fields = {} if object_type is None else self._fields.get(object_type, {})
+            for key, change in activity["data"].get("changes", {}).items():
+                types = fields.get(key)
+                ids = None if types is None else _referenced_ids(change)
+                if types is None or ids is None:
+                    continue
+                found.append(_Found(activity["id"], key, change, types))
+                wanted.update(
+                    _Reference(object_type, object_id)
+                    for object_type in types & self._labelled
+                    for object_id in ids
+                )
+        labels = self._labels(session, wanted, visibility)
+
+        def label(types: frozenset[str], object_id: str) -> str:
+            hits = [
+                labels[reference]
+                for reference in (_Reference(t, object_id) for t in types)
+                if reference in labels
+            ]
+            return max(hits).label if hits else f"#{object_id}"
+
+        result: dict[int, dict[str, FieldLabels]] = {}
+        for item in found:
+            change = item.change
+            labelled: FieldLabels
+            if isinstance(change, list):
+                labelled = [
+                    None if value is None else label(item.types, str(value))
+                    for value in change
+                ]
+            else:
+                labelled = {
+                    "added": [label(item.types, i) for i in change["added"]],
+                    "removed": [label(item.types, i) for i in change["removed"]],
+                }
+            result.setdefault(item.activity_id, {})[item.key] = labelled
+        return result
+
+    async def aresolve(
+        self,
+        session: AsyncSession,
+        activities: Iterable[ActivityRow],
+        *,
+        visibility: Visibility | None = None,
+    ) -> dict[int, dict[str, FieldLabels]]:
+        """Async variant of ``resolve``, with the same arguments.
+
+        Args:
+            session: The async session to query with.
+            activities: See ``resolve``.
+            visibility: See ``resolve``.
+
+        Returns:
+            See ``resolve``.
+        """
+        rows = list(activities)
+        return await session.run_sync(
+            lambda sync_session: self.resolve(sync_session, rows, visibility=visibility)
+        )
+
+    def _labels(
+        self,
+        session: Session,
+        wanted: set[_Reference],
+        visibility: Visibility | None,
+    ) -> dict[_Reference, _Label]:
+        if not wanted:
+            return {}
+        a = self.tables.activity
+        references = values(
+            column("object_type", String), column("object_id", String), name="wanted"
+        ).data(sorted(wanted))
+        conditions = [
+            a.c.object_type == references.c.object_type,
+            a.c.object_id == references.c.object_id,
+            a.c.object_label.is_not(None),
+        ]
+        if visibility is not None:
+            conditions.append(visibility.predicate(a))
+        # Newest labelled entry per object: one ordered read of the object
+        # index each, stopping at the first row.
+        latest = (
+            select(a.c.created_at, a.c.id, a.c.object_label)
+            .where(*conditions)
+            .order_by(a.c.created_at.desc(), a.c.id.desc())
+            .limit(1)
+            .lateral("latest")
+        )
+        statement = select(
+            references.c.object_type,
+            references.c.object_id,
+            latest.c.created_at,
+            latest.c.id,
+            latest.c.object_label,
+        ).select_from(references.join(latest, true()))
+        session.execute(_CUSTOM_PLAN)
+        return {
+            _Reference(object_type, object_id): _Label(created_at, row_id, label)
+            for object_type, object_id, created_at, row_id, label in session.execute(
+                statement
+            )
+        }
+
+
+def _type_name(model: type[Any]) -> str:
+    # The object_type of the model's instances (see diff.object_type_of).
+    return options_of(model).object_type or model.__name__
+
+
+def _types_of(mapper: Mapper[Any]) -> frozenset[str]:
+    # A reference to a class can name an instance of any of its subclasses.
+    return frozenset(_type_name(m.class_) for m in mapper.self_and_descendants)
+
+
+def _referenced_types(
+    mapper: Mapper[Any],
+    key: str,
+    columns: Sequence[ColumnElement[Any]],
+    mappers: list[Mapper[Any]],
+) -> frozenset[str]:
+    if len(columns) != 1 or not isinstance(columns[0], Column):
+        return frozenset()
+    local = columns[0]
+    if len(local.foreign_keys) != 1:
+        return frozenset()
+    if field_policy(mapper.class_, key, local) is not None:
+        return frozenset()  # redacted or hashed values are no ids
+    (foreign_key,) = local.foreign_keys
+    if foreign_key.constraint is None or len(foreign_key.constraint.elements) != 1:
+        return frozenset()
+    try:
+        referenced = foreign_key.column
+    except NoReferenceError:
+        return frozenset()
+    for candidate in mappers:
+        # The mapper that owns the referenced table, not one inheriting it.
+        owns = candidate.inherits is None or (
+            candidate.inherits.local_table is not candidate.local_table
+        )
+        if (
+            owns
+            and candidate.local_table is referenced.table
+            and len(candidate.primary_key) == 1
+            and candidate.primary_key[0] is referenced
+        ):
+            return _types_of(candidate)
+    return frozenset()
+
+
+def _referenced_ids(change: FieldChange) -> list[str] | None:
+    # The ids a change refers to, or None when its values cannot be ids.
+    if not isinstance(change, list):
+        return [*change["added"], *change["removed"]]
+    ids: list[str] = []
+    for value in change:
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            return None
+        if value in (REDACTED, UNKNOWN):
+            return None
+        ids.append(str(value))
+    return ids
 
 
 def _activity(row: RowMapping) -> ActivityRow:
@@ -694,6 +1441,17 @@ def _member_of(
 def _check_collection(values: Collection[object] | None, name: str) -> None:
     if isinstance(values, str):
         raise TypeError(f"{name} must be a collection of values, not a str")
+
+
+def _check_page(
+    since: datetime | None, until: datetime | None, cursor: Cursor | None, limit: int
+) -> None:
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    _check_aware(since, "since")
+    _check_aware(until, "until")
+    if cursor is not None:
+        _check_aware(cursor.created_at, "cursor created_at")
 
 
 def _check_aware(value: datetime | None, name: str) -> None:

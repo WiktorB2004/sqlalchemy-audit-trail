@@ -1,29 +1,17 @@
 """Query plans of ``list_groups`` on the sixth execution of each statement.
 
-Drivers prepare statements (asyncpg always, psycopg from the sixth
-execution), and PostgreSQL may then switch to a generic plan that no longer
-prunes partitions at plan time. The plans are the ones the server actually
-ran, reported by ``auto_explain`` as notices on the test's own connection.
-``auto_explain`` needs a superuser; without one the tests skip, except in CI
-(``AUDIT_TEST_EXPECT_PG`` set), where they fail.
+See ``plan_support`` for how the plans are captured.
 """
 
 from __future__ import annotations
 
-import json
-import os
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
-from sqlalchemy import Connection, Engine, create_engine, text
-from sqlalchemy.ext.asyncio import (
-    AsyncConnection,
-    AsyncEngine,
-    AsyncSession,
-    create_async_engine,
-)
+from sqlalchemy import Engine, text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
@@ -31,6 +19,16 @@ from audit_trail.maintenance import ensure_partitions
 from audit_trail.query import AuditQuery, Cursor
 from tests.conftest import with_driver
 from tests.db.listener_support import Sev, create_trail
+from tests.db.plan_support import (
+    MODES,
+    asixth_execution,
+    check_custom,
+    explained,
+    nodes,
+    relations,
+    require_superuser,
+    sixth_execution,
+)
 
 # Two rows (LOW and HIGH) per transaction, one transaction a minute going
 # back from the 20th of January to April 2026.
@@ -38,31 +36,6 @@ MONTHS = ["2026_01", "2026_02", "2026_03", "2026_04"]
 PER_MONTH = 2000
 CURSOR = Cursor(datetime(2026, 2, 20, tzinfo=timezone.utc) - timedelta(minutes=100), 0)
 LIMIT = 5
-
-EXPLAIN_SETTINGS = [
-    "LOAD 'auto_explain'",
-    "SET auto_explain.log_min_duration = 0",
-    "SET auto_explain.log_analyze = on",
-    "SET auto_explain.log_format = json",
-    "SET auto_explain.log_level = notice",
-]
-
-# The session's own plan_cache_mode: "auto" is the server default; with
-# "force_generic_plan" every execution is generic unless list_groups
-# overrides it.
-MODES = ["auto", "force_generic_plan"]
-
-
-def require_superuser(conn: Connection) -> None:
-    superuser: bool = conn.execute(
-        text("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
-    ).scalar_one()
-    if superuser:
-        return
-    reason = "auto_explain needs a superuser"
-    if os.environ.get("AUDIT_TEST_EXPECT_PG"):
-        pytest.fail(reason)
-    pytest.skip(reason)
 
 
 @pytest.fixture
@@ -121,11 +94,7 @@ async def alist_page(query: AuditQuery, session: AsyncSession) -> None:
 def plans_of(notices: list[str]) -> dict[str, dict[str, Any]]:
     """Plans of the auto_explain notices, keyed by statement kind."""
     plans: dict[str, dict[str, Any]] = {}
-    for notice in notices:
-        if "{" not in notice:
-            continue
-        explained = json.loads(notice[notice.index("{") :])
-        statement: str = explained["Query Text"]
+    for statement, plan in explained(notices):
         if "audit_transaction" in statement:
             kind = "transaction"
         elif "DISTINCT" in statement:
@@ -135,26 +104,8 @@ def plans_of(notices: list[str]) -> dict[str, dict[str, Any]]:
         else:
             kind = "stage 2"
         assert kind not in plans, statement
-        plans[kind] = explained["Plan"]
+        plans[kind] = plan
     return plans
-
-
-def nodes(plan: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    yield plan
-    for child in plan.get("Plans", []):
-        yield from nodes(child)
-
-
-def relations(plan: dict[str, Any]) -> set[str]:
-    return {node["Relation Name"] for node in nodes(plan) if "Relation Name" in node}
-
-
-def check_custom(plan: dict[str, Any]) -> None:
-    """A custom plan: pruned at plan time, no parameters left."""
-    for node in nodes(plan):
-        assert node.get("Subplans Removed", 0) == 0, node
-        for key in ("Index Cond", "Filter", "Recheck Cond"):
-            assert "$" not in node.get(key, ""), node
 
 
 def check_plans(notices: list[str]) -> None:
@@ -187,24 +138,9 @@ def check_plans(notices: list[str]) -> None:
 def test_sixth_execution_psycopg(
     query: AuditQuery, database_url: str, mode: str
 ) -> None:
-    engine = create_engine(database_url, poolclass=NullPool)
-    notices: list[str] = []
-    try:
-        with engine.connect() as conn:
-            driver: Any = conn.connection.dbapi_connection
-            driver.add_notice_handler(
-                lambda diagnostic: notices.append(diagnostic.message_primary)
-            )
-            for setting in [*EXPLAIN_SETTINGS, f"SET plan_cache_mode = {mode}"]:
-                conn.execute(text(setting))
-            conn.commit()
-            for _ in range(6):
-                notices.clear()
-                with Session(conn) as session:
-                    list_page(query, session)
-                conn.rollback()
-    finally:
-        engine.dispose()
+    notices = sixth_execution(
+        database_url, mode, lambda session: list_page(query, session)
+    )
 
     check_plans(notices)
 
@@ -221,38 +157,12 @@ async def plan_engine(
     await engine.dispose()
 
 
-async def notice_listener(conn: AsyncConnection, notices: list[str]) -> None:
-    raw = await conn.get_raw_connection()
-    driver: Any = raw.driver_connection
-    record: Callable[..., None]
-    if conn.dialect.driver == "asyncpg":
-
-        def record(_: Any, message: Any) -> None:
-            notices.append(message.message)
-
-        driver.add_log_listener(record)
-    else:
-
-        def record(diagnostic: Any) -> None:
-            notices.append(diagnostic.message_primary)
-
-        driver.add_notice_handler(record)
-
-
 @pytest.mark.parametrize("mode", MODES)
 async def test_sixth_execution_async(
     query: AuditQuery, plan_engine: AsyncEngine, mode: str
 ) -> None:
-    notices: list[str] = []
-    async with plan_engine.connect() as conn:
-        await notice_listener(conn, notices)
-        for setting in [*EXPLAIN_SETTINGS, f"SET plan_cache_mode = {mode}"]:
-            await conn.execute(text(setting))
-        await conn.commit()
-        for _ in range(6):
-            notices.clear()
-            async with AsyncSession(conn) as session:
-                await alist_page(query, session)
-            await conn.rollback()
+    notices = await asixth_execution(
+        plan_engine, mode, lambda session: alist_page(query, session)
+    )
 
     check_plans(notices)
