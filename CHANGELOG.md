@@ -20,6 +20,7 @@
 - `AuditTrail.scrub()` / `scrub_actor()` (and async variants), enabled with `allow_scrub=True`: erase an object's stored values or an actor's personal context in one transaction, recorded as an `audit.scrubbed` entry; erased values are never merged away when entries are grouped
 - `log()` / `alog()` accept just the event and take the session from `AuditTrail(session_provider=...)`; a missing session or one of the wrong kind raises a clear error
 - `AuditTrail(default_query_window=...)`: `list_groups()` without `since` reads only that window; `since=ALL_HISTORY` reads the whole log, the cursor keeps the first page's bound, and `Page.since` tells where the window started
+- Under `AsyncSession`, loading an expired column of an `Audited` model (for example assigning to it after a commit) or an unloaded tracked collection raises `AsyncLoadError`, a `MissingGreenlet` subclass that names the attribute and the fix
 
 ## 0.1.0a1 - 2026-09-25
 
