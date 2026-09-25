@@ -595,13 +595,12 @@ def test_ensure_names_without_schema(
             conn, unqualified_tables, [Sev.INFO, Sev.NOTICE], months_ahead=0, now=NOW
         )
 
-    # Names under a declared parent follow its (absent) schema; months under a
-    # severity partition found in the catalog carry the schema it lives in.
+    # Every name carries the schema the search_path resolved to.
     assert created == [
-        "audit_transaction_p2026_09",
+        f"{schema}.audit_transaction_p2026_09",
         f"{schema}.audit_activity_10_p2026_09",
-        "audit_activity_20",
-        "audit_activity_20_p2026_09",
+        f"{schema}.audit_activity_20",
+        f"{schema}.audit_activity_20_p2026_09",
     ]
 
 
@@ -631,7 +630,7 @@ def test_health_names_without_schema(
     with search_path_engine.connect() as conn:
         report = health(conn, unqualified_tables, [Sev.INFO], now=NOW)
 
-    assert report.transaction.table == "audit_transaction"
+    assert report.transaction.table == f"{schema}.audit_transaction"
     assert report.activity[Sev.INFO].table == f"{schema}.audit_activity_10"
 
 

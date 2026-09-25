@@ -440,7 +440,7 @@ def health(
     return HealthReport(
         min_months_ahead=min_months_ahead,
         transaction=check(
-            _name(tables.transaction.schema, tables.transaction.name),
+            _name(_shown_schemas(connection, tables)[0], tables.transaction.name),
             transaction_months,
         ),
         activity=activity,
@@ -666,25 +666,34 @@ def _ensure(
     months = _months(now, months_ahead)
     transaction_oid, activity_oid = (_oid(conn, name) for name in parents)
 
+    transaction_schema, activity_schema = _shown_schemas(conn, tables)
     created: list[str] = []
     created += _ensure_months(
-        conn, transaction.schema, transaction.name, transaction_oid, months
+        conn,
+        transaction.schema,
+        transaction_schema,
+        transaction.name,
+        transaction_oid,
+        months,
     )
 
     by_severity: dict[int, _Child] = {}
     for partition in _children(conn, activity_oid):
         for value in partition.list_values():
             by_severity.setdefault(value, partition)
-    schema = activity.schema
     for value in severities:
         child = by_severity.get(value)
         if child is None:
             name = severity_partition_name(activity.name, value)
             _execute_ddl(conn, create_severity_partition_sql(tables, value, name))
-            created.append(_name(schema, name))
-            created += _ensure_months(conn, schema, name, None, months)
+            created.append(_name(activity_schema, name))
+            created += _ensure_months(
+                conn, activity.schema, activity_schema, name, None, months
+            )
         elif child.relkind == "p":
-            created += _ensure_months(conn, child.schema, child.name, child.oid, months)
+            created += _ensure_months(
+                conn, child.schema, child.schema, child.name, child.oid, months
+            )
         # A severity partition that is a plain table takes any date.
 
     if previous_timeout is not None:
@@ -695,6 +704,7 @@ def _ensure(
 def _ensure_months(
     conn: Connection,
     schema: str | None,
+    shown_schema: str,
     parent: str,
     parent_oid: int | None,
     months: list[date],
@@ -708,12 +718,12 @@ def _ensure_months(
         name = month_partition_name(parent, month)
         if len(name.encode()) > MAX_IDENTIFIER_LENGTH:
             raise PartitionError(
-                f"cannot name the {month:%Y-%m} partition of {_name(schema, parent)}: "
+                f"cannot name the {month:%Y-%m} partition of {_name(shown_schema, parent)}: "
                 f"{name!r} is longer than {MAX_IDENTIFIER_LENGTH} bytes and "
                 "PostgreSQL would truncate it; rename the parent partition"
             )
         _execute_ddl(conn, create_month_partition_sql(schema, parent, month, name))
-        created.append(_name(schema, name))
+        created.append(_name(shown_schema, name))
     return created
 
 
@@ -956,9 +966,24 @@ def _qualified(table: Table) -> str:
     return qualified_name(table.schema, table.name)
 
 
-def _name(schema: str | None, name: str) -> str:
+def _name(schema: str, name: str) -> str:
     """Unquoted ``schema.name`` for returned and logged names."""
-    return name if schema is None else f"{schema}.{name}"
+    return f"{schema}.{name}"
+
+
+def _shown_schemas(conn: Connection, tables: AuditTables) -> tuple[str, str]:
+    """Schemas of the transaction and activity tables, for returned names.
+
+    A table declared without a schema lives in the session's
+    ``current_schema()``, looked up once.
+    """
+    declared = (tables.transaction.schema, tables.activity.schema)
+    if None not in declared:
+        return str(declared[0]), str(declared[1])
+    current: str | None = conn.execute(text("SELECT current_schema()")).scalar_one()
+    if current is None:
+        raise PartitionError("no schema on the search_path holds the audit tables")
+    return declared[0] or current, declared[1] or current
 
 
 def _lock_key(tables: AuditTables) -> str:
