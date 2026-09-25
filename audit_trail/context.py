@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
     from sqlalchemy.orm import Session
 
-SESSION_INFO_KEY = "audit_context"
+_SESSION_INFO_KEY = "audit_context"
 
 _SNAPSHOT_FIELDS = (
     "actor_type",
@@ -115,8 +115,14 @@ def current_context() -> AuditContext | None:
     return _current.get()
 
 
-class _ContextScope:
-    """Sync and async context manager that activates one ``AuditContext``."""
+class ContextScope:
+    """Sync and async context manager that activates one ``AuditContext``.
+
+    Returned by :func:`context`; entering it yields the activated context.
+
+    Args:
+        ctx: The context to activate.
+    """
 
     def __init__(self, ctx: AuditContext) -> None:
         self._ctx = ctx
@@ -146,7 +152,7 @@ class _ContextScope:
         self.__exit__(exc_type, exc, tb)
 
 
-def context(ctx: AuditContext | None = None, /, **fields: Any) -> _ContextScope:
+def context(ctx: AuditContext | None = None, /, **fields: Any) -> ContextScope:
     """Activate an audit context for a block of code.
 
     Usable as ``with context(...)`` and ``async with context(...)``. The
@@ -174,7 +180,7 @@ def context(ctx: AuditContext | None = None, /, **fields: Any) -> _ContextScope:
     """
     if ctx is not None and fields:
         raise TypeError("pass either an AuditContext or its fields, not both")
-    return _ContextScope(ctx if ctx is not None else AuditContext(**fields))
+    return ContextScope(ctx if ctx is not None else AuditContext(**fields))
 
 
 def set_actor(actor: Actor) -> AuditContext:
@@ -183,6 +189,10 @@ def set_actor(actor: Actor) -> AuditContext:
     The active object is mutated rather than replaced, so an actor set from a
     thread pool (for example a synchronous dependency) is visible to the
     caller.
+
+    A context bound with :func:`bind` takes precedence, so ``set_actor`` on
+    the active object does not reach that session; set the actor fields on
+    the bound object instead.
 
     Args:
         actor: The actor. All three actor fields are overwritten.
@@ -215,7 +225,7 @@ def bind(session: Session | AsyncSession, context: AuditContext) -> None:
         session: The session to attach the context to.
         context: The context used for audit entries written by this session.
     """
-    session.info[SESSION_INFO_KEY] = context
+    session.info[_SESSION_INFO_KEY] = context
 
 
 def resolve_context(
@@ -240,11 +250,11 @@ def resolve_context(
         TypeError: If ``session.info["audit_context"]`` is not an
             :class:`AuditContext`.
     """
-    bound = session.info.get(SESSION_INFO_KEY)
+    bound = session.info.get(_SESSION_INFO_KEY)
     if bound is not None:
         if not isinstance(bound, AuditContext):
             raise TypeError(
-                f'session.info["{SESSION_INFO_KEY}"] must be an AuditContext, '
+                f'session.info["{_SESSION_INFO_KEY}"] must be an AuditContext, '
                 f"got {type(bound).__name__}"
             )
         return bound
