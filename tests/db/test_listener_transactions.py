@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,7 +13,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from audit_trail import Audited, AuditOptions
-from tests.db.listener_support import Env, Sev, make_env
+from tests.db.listener_support import (
+    SESSION_KINDS,
+    Env,
+    SessionKind,
+    Sev,
+    each_session_kind,
+    make_env,
+    session_kind,
+)
 
 
 @dataclass
@@ -51,9 +60,17 @@ def models(engine: Engine, schema: str) -> Models:
     return Models(Tag, Item)
 
 
+@pytest.fixture(params=SESSION_KINDS)
+async def kind(
+    request: pytest.FixtureRequest, engine: Engine
+) -> AsyncIterator[SessionKind]:
+    async with session_kind(request.param, engine) as value:
+        yield value
+
+
 @pytest.fixture
-def env(engine: Engine, schema: str, models: Models) -> Env:
-    return make_env(engine, schema)
+def env(engine: Engine, schema: str, models: Models, kind: SessionKind) -> Env:
+    return make_env(engine, schema, kind)
 
 
 def labels(env: Env) -> list[str]:
@@ -76,10 +93,11 @@ def item_names(env: Env, models: Models) -> list[str]:
 
 
 @pytest.mark.parametrize("on_error", ["log", "raise"])
+@each_session_kind
 def test_rollback_writes_nothing(
-    engine: Engine, schema: str, models: Models, on_error: str
+    engine: Engine, schema: str, models: Models, kind: SessionKind, on_error: str
 ) -> None:
-    env = make_env(engine, schema, on_error=on_error)
+    env = make_env(engine, schema, kind, on_error=on_error)
     with env.factory() as session:
         session.add(models.Item(name="a"))
         session.flush()
@@ -90,6 +108,7 @@ def test_rollback_writes_nothing(
     assert env.transactions() == []
 
 
+@each_session_kind
 def test_released_savepoint_keeps_the_outer_transaction_row(
     env: Env, models: Models
 ) -> None:
@@ -105,6 +124,7 @@ def test_released_savepoint_keeps_the_outer_transaction_row(
     assert_one_transaction(env)
 
 
+@each_session_kind
 def test_row_created_in_a_rolled_back_savepoint_is_not_reused(
     env: Env, models: Models
 ) -> None:
@@ -120,6 +140,7 @@ def test_row_created_in_a_rolled_back_savepoint_is_not_reused(
     assert_one_transaction(env)
 
 
+@each_session_kind
 def test_rolling_back_a_later_savepoint_keeps_a_released_one(
     env: Env, models: Models
 ) -> None:
@@ -138,6 +159,7 @@ def test_rolling_back_a_later_savepoint_keeps_a_released_one(
     assert_one_transaction(env)
 
 
+@each_session_kind
 def test_rolling_back_a_savepoint_keeps_the_outer_row(env: Env, models: Models) -> None:
     with env.factory() as session:
         session.add(models.Item(name="outer"))
@@ -153,6 +175,7 @@ def test_rolling_back_a_savepoint_keeps_the_outer_row(env: Env, models: Models) 
     assert_one_transaction(env)
 
 
+@each_session_kind
 def test_outer_rollback_after_a_released_savepoint(env: Env, models: Models) -> None:
     with env.factory() as session:
         with session.begin_nested():
@@ -165,6 +188,7 @@ def test_outer_rollback_after_a_released_savepoint(env: Env, models: Models) -> 
     assert_one_transaction(env)
 
 
+@each_session_kind
 def test_disabling_audit_mid_transaction_keeps_the_cache_consistent(
     env: Env, models: Models
 ) -> None:
@@ -182,6 +206,7 @@ def test_disabling_audit_mid_transaction_keeps_the_cache_consistent(
     assert_one_transaction(env)
 
 
+@each_session_kind
 def test_savepoint_rollback_discards_relationship_changes(
     env: Env, models: Models
 ) -> None:
@@ -200,10 +225,15 @@ def test_savepoint_rollback_discards_relationship_changes(
     assert env.activities()[1]["data"]["changes"] == {"name": ["a", "b"]}
 
 
+@each_session_kind
 def test_failed_audit_write_is_logged_and_the_commit_goes_through(
-    engine: Engine, schema: str, models: Models, caplog: pytest.LogCaptureFixture
+    engine: Engine,
+    schema: str,
+    models: Models,
+    kind: SessionKind,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    env = make_env(engine, schema, partitions=[])  # no partitions: 23514
+    env = make_env(engine, schema, kind, partitions=[])  # no partitions: 23514
     with (
         caplog.at_level(logging.ERROR, logger="audit_trail"),
         env.factory() as session,
@@ -218,12 +248,13 @@ def test_failed_audit_write_is_logged_and_the_commit_goes_through(
     assert "run ensure_partitions" in caplog.text.lower()
 
 
+@each_session_kind
 def test_failed_activity_insert_leaves_no_transaction_row(
-    engine: Engine, schema: str, models: Models
+    engine: Engine, schema: str, models: Models, kind: SessionKind
 ) -> None:
     # Only the HIGH partitions exist: the transaction row fits, the LOW
     # activity row does not, and the savepoint takes both back.
-    env = make_env(engine, schema, partitions=[Sev.HIGH])
+    env = make_env(engine, schema, kind, partitions=[Sev.HIGH])
     with env.factory() as session:
         session.add(models.Item(name="business"))
         session.commit()
@@ -232,10 +263,11 @@ def test_failed_activity_insert_leaves_no_transaction_row(
     assert env.transactions() == []
 
 
+@each_session_kind
 def test_failed_audit_write_inside_a_session_savepoint(
-    engine: Engine, schema: str, models: Models
+    engine: Engine, schema: str, models: Models, kind: SessionKind
 ) -> None:
-    env = make_env(engine, schema, partitions=[])
+    env = make_env(engine, schema, kind, partitions=[])
     with env.factory() as session:
         session.add(models.Item(name="outer"))
         with session.begin_nested():
@@ -245,10 +277,11 @@ def test_failed_audit_write_inside_a_session_savepoint(
     assert sorted(item_names(env, models)) == ["inner", "outer"]
 
 
+@each_session_kind
 def test_failed_audit_write_aborts_the_commit_with_raise(
-    engine: Engine, schema: str, models: Models
+    engine: Engine, schema: str, models: Models, kind: SessionKind
 ) -> None:
-    env = make_env(engine, schema, partitions=[], on_error="raise")
+    env = make_env(engine, schema, kind, partitions=[], on_error="raise")
     with env.factory() as session:
         session.add(models.Item(name="business"))
         with pytest.raises(IntegrityError, match="no partition of relation"):
@@ -257,6 +290,7 @@ def test_failed_audit_write_aborts_the_commit_with_raise(
     assert item_names(env, models) == []
 
 
+@each_session_kind
 def test_closing_the_session_forgets_the_transaction_row(
     env: Env, models: Models
 ) -> None:
@@ -272,6 +306,7 @@ def test_closing_the_session_forgets_the_transaction_row(
     assert_one_transaction(env)
 
 
+@each_session_kind
 def test_leaving_the_session_block_forgets_the_transaction_row(
     env: Env, models: Models
 ) -> None:
@@ -285,6 +320,7 @@ def test_leaving_the_session_block_forgets_the_transaction_row(
     assert_one_transaction(env)
 
 
+@each_session_kind
 def test_rolling_back_an_enclosing_savepoint(env: Env, models: Models) -> None:
     with env.factory() as session:
         outer = session.begin_nested()
