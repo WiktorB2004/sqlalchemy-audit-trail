@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from dataclasses import dataclass
+from typing import Literal, get_args
 
 from sqlalchemy import (
     BigInteger,
@@ -35,18 +36,32 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 
+from audit_trail._typing import assert_never
+
 MAX_IDENTIFIER_LENGTH = 63
 """PostgreSQL's limit on identifier length in bytes; longer names are truncated."""
 
-DEFAULT_INDEXES: frozenset[str] = frozenset(
+IndexKey = Literal[
+    "severity",
+    "actor",
+    "object",
+    "target",
+    "scope",
+    "transaction",
+    "correlation",
+    "changes_gin",
+]
+"""Key of one ``audit_activity`` index."""
+
+DEFAULT_INDEXES: frozenset[IndexKey] = frozenset(
     {"severity", "actor", "object", "target", "scope", "transaction", "correlation"}
 )
 """Keys of the ``audit_activity`` indexes created unless ``indexes`` says otherwise."""
 
-OPTIONAL_INDEXES: frozenset[str] = frozenset({"changes_gin"})
+OPTIONAL_INDEXES: frozenset[IndexKey] = frozenset({"changes_gin"})
 """Keys of the indexes that exist but are off by default."""
 
-ALL_INDEXES: frozenset[str] = DEFAULT_INDEXES | OPTIONAL_INDEXES
+ALL_INDEXES: frozenset[IndexKey] = frozenset(get_args(IndexKey))
 """Every valid key for ``build_tables(indexes=...)``."""
 
 # Longest suffix a partition name gets: "_<smallint>_pYYYY_MM".
@@ -98,10 +113,13 @@ def build_tables(
     _check_name(activity_table, "activity_table", _PARTITION_SUFFIX_LENGTH)
     if transaction_table == activity_table:
         raise ValueError("transaction_table and activity_table must differ")
-    index_keys = DEFAULT_INDEXES if indexes is None else frozenset(indexes)
-    unknown = index_keys - ALL_INDEXES
-    if unknown:
-        raise ValueError(f"unknown index keys: {sorted(unknown)}")
+    if indexes is None:
+        index_keys = DEFAULT_INDEXES
+    else:
+        unknown = frozenset(indexes) - ALL_INDEXES
+        if unknown:
+            raise ValueError(f"unknown index keys: {sorted(unknown)}")
+        index_keys = ALL_INDEXES & frozenset(indexes)
 
     metadata = MetaData(schema=schema)
     transaction = Table(
@@ -156,7 +174,7 @@ def build_tables(
     return AuditTables(metadata=metadata, transaction=transaction, activity=activity)
 
 
-def _activity_index(table: Table, key: str) -> Index:
+def _activity_index(table: Table, key: IndexKey) -> Index:
     c = table.c
     name = f"{table.name}_{key}_idx"
     newest_first = (c.created_at.desc(), c.id.desc())
@@ -200,7 +218,7 @@ def _activity_index(table: Table, key: str) -> Index:
             changes = c.data.op("->", return_type=JSONB)(literal_column("'changes'"))
             return Index(name, changes, postgresql_using="gin")
         case _:
-            raise ValueError(f"unknown index key {key!r}")
+            assert_never(key)
 
 
 def _check_name(name: str, what: str, reserve: int) -> None:

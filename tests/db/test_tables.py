@@ -17,7 +17,13 @@ from audit_trail.migrations import (
     drop_audit_tables,
     qualified_name,
 )
-from audit_trail.tables import DEFAULT_INDEXES, AuditTables, build_tables
+from audit_trail.tables import (
+    ALL_INDEXES,
+    DEFAULT_INDEXES,
+    OPTIONAL_INDEXES,
+    AuditTables,
+    build_tables,
+)
 
 
 class Sev(IntEnum):
@@ -262,3 +268,14 @@ def test_build_tables_rejects_bad_config(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         build_tables(**kwargs)  # type: ignore[arg-type]
+
+
+def test_index_key_sets_partition_all_keys() -> None:
+    assert DEFAULT_INDEXES | OPTIONAL_INDEXES == ALL_INDEXES
+    assert not DEFAULT_INDEXES & OPTIONAL_INDEXES
+
+
+def test_every_index_key_builds_an_index() -> None:
+    tables = build_tables(indexes=ALL_INDEXES)
+    names = {index.name for index in tables.activity.indexes}
+    assert names == {f"audit_activity_{key}_idx" for key in ALL_INDEXES}
