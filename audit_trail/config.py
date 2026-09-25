@@ -2,22 +2,32 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Literal
 
+from audit_trail.context import Actor, resolve_context
 from audit_trail.context import bind as _bind
 from audit_trail.context import context as _context
 from audit_trail.context import set_actor as _set_actor
-from audit_trail.events import AuditEvent, EventRegistry, Severity
+from audit_trail.events import (
+    RESERVED_PREFIXES,
+    AuditEvent,
+    EventRegistry,
+    Severity,
+    resolve_write_flags,
+    validate_payload,
+)
 from audit_trail.maintenance import PartitionManager
 from audit_trail.serialization import KeyRing
 from audit_trail.serialization import pseudonymize as _pseudonymize
 from audit_trail.tables import build_tables
 
 if TYPE_CHECKING:
+    from pydantic import BaseModel
     from sqlalchemy.engine import Engine
     from sqlalchemy.ext.asyncio import AsyncEngine
     from sqlalchemy.orm import Session, sessionmaker
@@ -212,3 +222,142 @@ class AuditTrail:
         return _pseudonymize(
             value, purpose=purpose, keys=self.keys, json_encoder=self.json_encoder
         )
+
+    def log(
+        self,
+        session: Session,
+        event: AuditEvent,
+        *,
+        obj: object | None = None,
+        target: object | tuple[str, object] | None = None,
+        payload: Mapping[str, Any] | BaseModel | None = None,
+        actor: Actor | None = None,
+        durable: bool | None = None,
+    ) -> None:
+        """Record an explicit event in the session's current transaction.
+
+        The entry is inserted immediately on ``session.connection()``, in the
+        same database transaction as the session's changes: it is committed
+        or rolled back with them, and shares their ``audit_transaction`` row.
+        It is written even when ``session.info["audit_enabled"]`` is
+        ``False``, which only switches off the automatic ``entity.*`` entries.
+        Write failures follow ``on_error``.
+
+        Args:
+            session: A session of a class this ``AuditTrail`` is installed on.
+            event: A registered host event.
+            obj: The object the event is about; sets ``object_type``,
+                ``object_id``, ``object_label`` and, through its options,
+                ``scope_id`` and the default target. It must have a primary
+                key: flush a new object first.
+            target: The parent object, as an instance or ``(type, id)``. A
+                tuple id is formatted as a composite ``object_id``. Defaults
+                to the ``target`` option of ``obj``.
+            payload: The payload, validated against the event's schema.
+                ``Pseudonymized`` fields of a schema are pseudonymized with
+                their field name as the purpose.
+            actor: The actor of this entry. It sets the entry's ``actor_id``
+                and the actor fields of its ``data.context``; the
+                ``audit_transaction`` row keeps the actor of the context.
+            durable: Overrides the event's ``durable`` setting.
+
+        Raises:
+            TypeError: The session's class is not installed by this
+                ``AuditTrail``.
+            ValueError: The event uses a reserved prefix, ``obj`` or an
+                instance ``target`` has no primary key, or a
+                ``Pseudonymized`` field cannot be pseudonymized.
+            NotImplementedError: The write would be durable; durable writes
+                are not supported yet.
+            UnknownEventError: The event is not registered.
+            PayloadError: The payload does not match the event's schema, or a
+                ``Pseudonymized`` field already holds a pseudonym token.
+        """
+        from audit_trail.diff import (
+            USE_CONTEXT,
+            _format_identity,
+            object_type_of,
+            options_of,
+            resolve_label,
+            resolve_scope,
+            resolve_target,
+        )
+        from audit_trail.listener import installed_trail, write_entries
+        from audit_trail.writer import ENVELOPE_VERSION, context_data, encode_payload
+
+        if str(event).startswith(RESERVED_PREFIXES):
+            raise ValueError(f"{event!s} is reserved for the library")
+        severity = self.registry.severity_of(event)
+        if resolve_write_flags(event, durable).durable:
+            raise NotImplementedError("durable writes are not supported yet")
+        if installed_trail(session) is not self:
+            raise TypeError(
+                "log() needs a session of a class this AuditTrail is installed on"
+            )
+        encoded = encode_payload(
+            validate_payload(event, payload),
+            keys=self.keys,
+            json_encoder=self.json_encoder,
+        )
+
+        ctx = resolve_context(session, self.context_provider)
+        entry_ctx = ctx
+        if actor is not None:
+            entry_ctx = dataclasses.replace(
+                ctx, actor_type=actor.type, actor_id=actor.id, actor_label=actor.label
+            )
+
+        object_type = object_id = label = None
+        target_type: str | None = None
+        target_id: str | None = None
+        scope_id = ctx.scope_id
+        if obj is not None:
+            object_type, object_id = object_type_of(obj), _required_id(obj, "obj")
+            options = options_of(type(obj))
+            label = resolve_label(obj, options)
+            scope = resolve_scope(obj, options)
+            if scope is not USE_CONTEXT:
+                scope_id = scope
+            target_type, target_id = resolve_target(obj, options) or (None, None)
+        if isinstance(target, tuple):
+            given_type, given_id = target
+            ids = given_id if isinstance(given_id, tuple) else (given_id,)
+            target_type, target_id = str(given_type), _format_identity(ids)
+        elif target is not None:
+            target_type = object_type_of(target)
+            target_id = _required_id(target, "target")
+
+        write_entries(
+            session,
+            self,
+            [
+                {
+                    "verb": event.value,
+                    "severity": int(severity),
+                    "object_type": object_type,
+                    "object_id": object_id,
+                    "object_label": label,
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "actor_id": entry_ctx.actor_id,
+                    "scope_id": scope_id,
+                    "data": {
+                        "v": ENVELOPE_VERSION,
+                        "payload": encoded,
+                        "context": context_data(entry_ctx, self.json_encoder),
+                    },
+                }
+            ],
+            ctx,
+        )
+
+
+def _required_id(obj: object, name: str) -> str:
+    from audit_trail.diff import object_id_of
+
+    try:
+        return object_id_of(obj)
+    except ValueError:
+        raise ValueError(
+            f"{name} has no primary key yet; flush the session before logging"
+        ) from None

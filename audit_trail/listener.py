@@ -22,6 +22,10 @@ transaction and cached in ``session.info`` together with the
 - ``after_rollback`` never touches it, since it also fires when a savepoint
   is rolled back, which may leave a row of the enclosing transaction intact.
 
+``do_orm_execute`` warns (``warn_on_bulk``) about ORM or Core bulk
+``UPDATE``/``DELETE`` statements on an audited table executed through the
+session: they bypass the flush and get no entry.
+
 These state listeners run even when ``session.info["audit_enabled"]`` is
 ``False``; only capture is switched off, so toggling the flag in the middle
 of a transaction cannot leave a stale cache behind.
@@ -70,7 +74,12 @@ from audit_trail.writer import (
 )
 
 if TYPE_CHECKING:
-    from sqlalchemy.orm import Mapper, SessionTransaction, UOWTransaction
+    from sqlalchemy.orm import (
+        Mapper,
+        ORMExecuteState,
+        SessionTransaction,
+        UOWTransaction,
+    )
 
     from audit_trail.config import AuditTrail
 
@@ -131,6 +140,7 @@ def install(
         )
     listener = _Listener(trail)
     event.listen(cls, "after_flush", listener.after_flush)
+    event.listen(cls, "do_orm_execute", listener.do_orm_execute)
     event.listen(cls, "after_transaction_end", _after_transaction_end)
     event.listen(cls, "after_soft_rollback", _after_soft_rollback)
     event.listen(cls, "after_rollback", _after_rollback)
@@ -237,6 +247,29 @@ class _Listener:
         if entries:
             write_entries(session, self.trail, entries, ctx)
 
+    def do_orm_execute(self, orm_execute_state: ORMExecuteState) -> None:
+        """Warn about a bulk ``UPDATE``/``DELETE`` of an audited table.
+
+        Such statements bypass the flush, so no entry is written for them.
+        """
+        state = orm_execute_state
+        if not self.trail.warn_on_bulk:
+            return
+        if not (state.is_update or state.is_delete):
+            return
+        if state.session.info.get(AUDIT_ENABLED_KEY) is False:
+            return
+        if state.execution_options.get("audit_bulk_ok"):
+            return
+        model = _audited_model(state)
+        if model is not None:
+            logger.warning(
+                "Bulk %s of %s bypasses the audit trail: no entry is written. "
+                "Pass execution_options(audit_bulk_ok=True) if this is intended.",
+                "UPDATE" if state.is_update else "DELETE",
+                model.__qualname__,
+            )
+
     def _entries(self, session: Session, ctx: AuditContext) -> list[Entry]:
         trail = self.trail
         context = context_data(ctx, trail.json_encoder)
@@ -300,6 +333,16 @@ class _Listener:
             "scope_id": ctx.scope_id if scope is USE_CONTEXT else scope,
             "data": {"v": ENVELOPE_VERSION, "changes": changes, "context": context},
         }
+
+
+def _audited_model(state: ORMExecuteState) -> type[Any] | None:
+    # Matched by table, which covers ORM update(Model) and Core update(table).
+    table = getattr(state.statement, "table", None)
+    for cls in _subclasses(Audited):
+        mapper = inspect(cls, raiseerr=False)
+        if mapper is not None and table in mapper.tables:
+            return cls
+    return None
 
 
 def write_entries(
