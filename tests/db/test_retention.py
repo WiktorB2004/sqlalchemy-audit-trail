@@ -11,7 +11,15 @@ from enum import IntEnum
 from typing import Any, TypeVar
 
 import pytest
-from sqlalchemy import Connection, Engine, insert, select, text
+from sqlalchemy import (
+    Connection,
+    Engine,
+    MetaData,
+    create_engine,
+    insert,
+    select,
+    text,
+)
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -507,6 +515,124 @@ def test_session_lock_timeout_and_advisory_lock_are_released(
         assert drop_expired(auto, tables, retention, now=NOW, lock_timeout="1s")
         assert auto.execute(text("SHOW lock_timeout")).scalar_one() == "42s"
         assert advisory_locks(auto) == 0
+
+
+def test_retention_for_severity_without_partition_warns(
+    engine: Engine, tables: AuditTables, caplog: pytest.LogCaptureFixture
+) -> None:
+    retention = {Sev.INFO: 30 * DAY, Sev.NOTICE: None, Sev.CRITICAL: None}
+
+    drop(engine, tables, {**retention, 30: DAY, 99: None})
+
+    assert [w.split(",")[0] for w in warnings(caplog)] == [
+        "retention names severity 30",
+        "retention names severity 99",
+    ]
+
+
+def test_broken_connection_error_is_not_hidden(
+    engine: Engine, tables: AuditTables, pool: ThreadPoolExecutor
+) -> None:
+    def kill_waiting_detach() -> None:
+        poll(lambda: detach_waits(engine))
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE query LIKE '%DETACH PARTITION%' "
+                    "AND pid <> pg_backend_pid()"
+                )
+            )
+
+    with engine.connect() as blocker:
+        add_rows(blocker, tables, NOW)
+        try:
+            killer = pool.submit(kill_waiting_detach)
+            attempt = pool.submit(
+                drop, engine, tables, dict.fromkeys(Sev, DAY), lock_timeout="10s"
+            )
+            # The disconnect itself, not an error from the cleanup after it.
+            with pytest.raises(DBAPIError) as caught:
+                attempt.result(timeout=CAP)
+            killer.result(timeout=CAP)
+        finally:
+            blocker.rollback()
+
+    assert caught.value.connection_invalidated
+
+
+@pytest.fixture
+def search_path_engine(database_url: str, schema: str) -> Iterator[Engine]:
+    """An engine whose search_path is ``schema``, for tables built without one."""
+    eng = create_engine(
+        database_url, connect_args={"options": f"-c search_path={schema}"}
+    )
+    yield eng
+    eng.dispose()
+
+
+@pytest.fixture
+def unqualified_tables(search_path_engine: Engine) -> AuditTables:
+    # build_tables always sets a schema; an AuditTables built by hand may not.
+    # to_metadata takes schema=None at runtime; its annotation omits it.
+    source = build_tables()
+    metadata = MetaData()
+    t = AuditTables(
+        metadata,
+        source.transaction.to_metadata(metadata, schema=None),  # type: ignore[arg-type]
+        source.activity.to_metadata(metadata, schema=None),  # type: ignore[arg-type]
+    )
+    with search_path_engine.begin() as conn:
+        create_audit_tables(conn, t, [Sev.INFO])
+    return t
+
+
+def test_ensure_names_without_schema(
+    search_path_engine: Engine, unqualified_tables: AuditTables, schema: str
+) -> None:
+    with search_path_engine.begin() as conn:
+        created = ensure_partitions(
+            conn, unqualified_tables, [Sev.INFO, Sev.NOTICE], months_ahead=0, now=NOW
+        )
+
+    # Names under a declared parent follow its (absent) schema; months under a
+    # severity partition found in the catalog carry the schema it lives in.
+    assert created == [
+        "audit_transaction_p2026_09",
+        f"{schema}.audit_activity_10_p2026_09",
+        "audit_activity_20",
+        "audit_activity_20_p2026_09",
+    ]
+
+
+def test_drop_expired_names_without_schema(
+    search_path_engine: Engine, unqualified_tables: AuditTables, schema: str
+) -> None:
+    with search_path_engine.begin() as conn:
+        ensure_partitions(
+            conn,
+            unqualified_tables,
+            [Sev.INFO],
+            months_ahead=1,
+            now=datetime(2026, 7, 5, tzinfo=timezone.utc),
+        )
+
+    dropped = drop(search_path_engine, unqualified_tables, {Sev.INFO: 30 * DAY})
+
+    assert dropped == [
+        f"{schema}.audit_transaction_p2026_07",
+        f"{schema}.audit_activity_10_p2026_07",
+    ]
+
+
+def test_health_names_without_schema(
+    search_path_engine: Engine, unqualified_tables: AuditTables, schema: str
+) -> None:
+    with search_path_engine.connect() as conn:
+        report = health(conn, unqualified_tables, [Sev.INFO], now=NOW)
+
+    assert report.transaction.table == "audit_transaction"
+    assert report.activity[Sev.INFO].table == f"{schema}.audit_activity_10"
 
 
 def test_rejects_negative_retention_and_naive_now(

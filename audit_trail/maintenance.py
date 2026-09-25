@@ -118,8 +118,11 @@ class PartitionError(Exception):
 class PartitionLockTimeoutError(PartitionError):
     """A lock needed for partition maintenance was not granted within ``lock_timeout``.
 
-    From ``ensure_partitions``, nothing was created; ``months_ahead`` leaves
-    room for a later retry. From ``drop_expired``, the partitions dropped
+    ``lock_timeout`` applies to each lock wait, not to the whole call, so
+    ``ensure_partitions`` blocked behind ``drop_expired`` and then behind an
+    open transaction can take about twice ``lock_timeout`` before this is
+    raised. From ``ensure_partitions``, nothing was created; ``months_ahead``
+    leaves room for a later retry. From ``drop_expired``, the partitions dropped
     before the timeout stay dropped (each one is logged), and a detach left
     pending is finalized by the next call.
     """
@@ -143,7 +146,7 @@ class _Child:
 
     @property
     def display(self) -> str:
-        return f"{self.schema}.{self.name}"
+        return _name(self.schema, self.name)
 
     def covers(self, start: datetime, end: datetime) -> bool:
         return (
@@ -187,7 +190,10 @@ def ensure_partitions(
         months_ahead: Months to create after the current one.
         now: Reference time. ``None`` uses the database's ``now()``.
         lock_timeout: PostgreSQL ``lock_timeout`` for this transaction, such
-            as ``"5s"``. ``None`` keeps the session's setting.
+            as ``"5s"``. ``None`` keeps the session's setting. It bounds each
+            lock wait, not the whole call: blocked behind ``drop_expired``
+            (the advisory lock) and then behind an open transaction (the
+            ``CREATE``), a call can take about twice ``lock_timeout``.
 
     Returns:
         Schema-qualified names of the partitions created, parents first.
@@ -218,7 +224,9 @@ def ensure_partitions(
         if getattr(exc.orig, "sqlstate", None) == LOCK_NOT_AVAILABLE:
             raise PartitionLockTimeoutError(
                 f"partitions were not created: a lock was not granted within "
-                f"lock_timeout={lock_timeout!r}; retry later"
+                f"lock_timeout={lock_timeout!r}, which applies to each lock "
+                "wait, so waiting behind drop_expired and then an open "
+                "transaction takes about twice as long; retry later"
             ) from exc
         raise
 
@@ -353,7 +361,8 @@ def drop_expired(
         if getattr(exc.orig, "sqlstate", None) == LOCK_NOT_AVAILABLE:
             raise PartitionLockTimeoutError(
                 f"expired partitions were not all dropped: a lock was not "
-                f"granted within lock_timeout={lock_timeout!r}. An application "
+                f"granted within lock_timeout={lock_timeout!r}, which applies to "
+                "each lock wait. An application "
                 "transaction left open on an audit table for longer than that "
                 "causes this and is expected; retry later, and a detach left "
                 "pending is finalized then"
@@ -430,7 +439,10 @@ def health(
 
     return HealthReport(
         min_months_ahead=min_months_ahead,
-        transaction=check(_display(tables.transaction), transaction_months),
+        transaction=check(
+            _name(tables.transaction.schema, tables.transaction.name),
+            transaction_months,
+        ),
         activity=activity,
         pending_detach=[
             child.display
@@ -655,20 +667,21 @@ def _ensure(
     transaction_oid, activity_oid = (_oid(conn, name) for name in parents)
 
     created: list[str] = []
-    schema = str(transaction.schema)
-    created += _ensure_months(conn, schema, transaction.name, transaction_oid, months)
+    created += _ensure_months(
+        conn, transaction.schema, transaction.name, transaction_oid, months
+    )
 
     by_severity: dict[int, _Child] = {}
     for partition in _children(conn, activity_oid):
         for value in partition.list_values():
             by_severity.setdefault(value, partition)
-    schema = str(activity.schema)
+    schema = activity.schema
     for value in severities:
         child = by_severity.get(value)
         if child is None:
             name = severity_partition_name(activity.name, value)
             _execute_ddl(conn, create_severity_partition_sql(tables, value, name))
-            created.append(f"{schema}.{name}")
+            created.append(_name(schema, name))
             created += _ensure_months(conn, schema, name, None, months)
         elif child.relkind == "p":
             created += _ensure_months(conn, child.schema, child.name, child.oid, months)
@@ -681,7 +694,7 @@ def _ensure(
 
 def _ensure_months(
     conn: Connection,
-    schema: str,
+    schema: str | None,
     parent: str,
     parent_oid: int | None,
     months: list[date],
@@ -695,12 +708,12 @@ def _ensure_months(
         name = month_partition_name(parent, month)
         if len(name.encode()) > MAX_IDENTIFIER_LENGTH:
             raise PartitionError(
-                f"cannot name the {month:%Y-%m} partition of {schema}.{parent}: "
+                f"cannot name the {month:%Y-%m} partition of {_name(schema, parent)}: "
                 f"{name!r} is longer than {MAX_IDENTIFIER_LENGTH} bytes and "
                 "PostgreSQL would truncate it; rename the parent partition"
             )
         _execute_ddl(conn, create_month_partition_sql(schema, parent, month, name))
-        created.append(f"{schema}.{name}")
+        created.append(_name(schema, name))
     return created
 
 
@@ -775,16 +788,22 @@ def _drop(
                 _transaction_limit(limits, transaction_retention),
             )
         ]
-        undeclared: set[int] = set()
+        partitioned: set[int] = set()
         for child in _children(conn, activity_oid):
             values = child.list_values()
-            undeclared |= values - limits.keys()
+            partitioned |= values
             if child.relkind == "p":
                 parents.append((child.qualified, child.oid, _longest(limits, values)))
-        for value in sorted(undeclared):
+        for value in sorted(partitioned - limits.keys()):
             logger.warning(
                 "severity %s has no retention; its partitions are kept. "
                 "Declare it, with None to keep it forever.",
+                value,
+            )
+        for value in sorted(limits.keys() - partitioned):
+            logger.warning(
+                "retention names severity %s, which has no partition; "
+                "check for a typo or run ensure_partitions",
                 value,
             )
 
@@ -793,10 +812,13 @@ def _drop(
             dropped += _drop_months(conn, parent, parent_oid, limit, now)
         return dropped
     finally:
-        if locked:
-            conn.execute(text("SELECT pg_advisory_unlock(hashtext(:key))"), key)
-        if previous_timeout is not None:
-            _set_session(conn, "lock_timeout", previous_timeout)
+        # A broken connection is discarded by the pool, which releases the
+        # session's lock and setting; touching it would hide the real error.
+        if not conn.invalidated:
+            if locked:
+                conn.execute(text("SELECT pg_advisory_unlock(hashtext(:key))"), key)
+            if previous_timeout is not None:
+                _set_session(conn, "lock_timeout", previous_timeout)
 
 
 def _drop_months(
@@ -922,7 +944,7 @@ def _orphans(
             "activity": _qualified(tables.activity),
         },
     )
-    return [f"{schema}.{name}" for schema, name in rows if pattern.match(name)]
+    return [_name(schema, name) for schema, name in rows if pattern.match(name)]
 
 
 def _check_aware(now: datetime | None) -> None:
@@ -934,8 +956,9 @@ def _qualified(table: Table) -> str:
     return qualified_name(table.schema, table.name)
 
 
-def _display(table: Table) -> str:
-    return table.name if table.schema is None else f"{table.schema}.{table.name}"
+def _name(schema: str | None, name: str) -> str:
+    """Unquoted ``schema.name`` for returned and logged names."""
+    return name if schema is None else f"{schema}.{name}"
 
 
 def _lock_key(tables: AuditTables) -> str:
