@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Typecheck
+        run: uv run mypy
+
+  test:
+    name: test (py${{ matrix.python }}, pg${{ matrix.postgres }}, sa${{ matrix.sqlalchemy }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12"]
+        postgres: ["14", "16", "17", "18"]
+        sqlalchemy: ["2.0", "2.1"]
+        include:
+          # SQLAlchemy 2.1 requires Python 3.11+.
+          - { python: "3.10", postgres: "18", sqlalchemy: "2.0" }
+          - { python: "3.11", postgres: "18", sqlalchemy: "2.1" }
+          - { python: "3.13", postgres: "18", sqlalchemy: "2.1" }
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AUDIT_TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
+      AUDIT_TEST_EXPECT_PG: ${{ matrix.postgres }}
+      AUDIT_TEST_EXPECT_SA: ${{ matrix.sqlalchemy }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen
+
+      # uv.lock pins the newest SQLAlchemy; older lines are swapped in here.
+      - name: Install SQLAlchemy ${{ matrix.sqlalchemy }}
+        if: matrix.sqlalchemy != '2.1'
+        run: uv pip install "sqlalchemy[asyncio]==${{ matrix.sqlalchemy }}.*"
+
+      - name: Run tests
+        run: uv run --no-sync pytest -q
