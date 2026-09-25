@@ -28,6 +28,16 @@ transaction and cached in ``session.info`` together with the
 ``UPDATE``/``DELETE`` statements on an audited table executed through the
 session: they bypass the flush and get no entry.
 
+A second ``do_orm_execute`` handler explains loads that fail under
+``AsyncSession``. Loading an unloaded attribute outside an awaited call needs
+I/O that SQLAlchemy cannot run there, so it raises ``MissingGreenlet``. For
+the loads the library is responsible for (an expired column of an
+``Audited`` instance, which ``Audited`` also loads on assignment to keep the
+old value, and a collection named in ``track_relationships``) the error is
+replaced by ``AsyncLoadError``, which names the attribute and the fix. The
+handler adds no SQL and checks nothing in advance: it only translates the
+error once the load has failed, and only on an async dialect.
+
 These state listeners run even when ``session.info["audit_enabled"]`` is
 ``False``; only capture is switched off, so toggling the flag in the middle
 of a transaction cannot leave a stale cache behind.
@@ -42,6 +52,7 @@ from itertools import chain
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from sqlalchemy import event, inspect
+from sqlalchemy.exc import MissingGreenlet, StatementError
 from sqlalchemy.orm import Session, sessionmaker
 
 from audit_trail._compaction import FieldChange
@@ -76,8 +87,10 @@ from audit_trail.writer import (
 )
 
 if TYPE_CHECKING:
+    from sqlalchemy import Result
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
     from sqlalchemy.orm import (
+        InstanceState,
         Mapper,
         ORMExecuteState,
         SessionTransaction,
@@ -103,6 +116,25 @@ _VERBS: dict[ChangeKind, Crud] = {
 
 # Session class -> the AuditTrail installed on it.
 _installed: dict[type[Session], AuditTrail] = {}
+
+
+class AsyncLoadError(MissingGreenlet):
+    """An audited attribute needed a load that ``AsyncSession`` cannot run.
+
+    Raised in place of SQLAlchemy's ``MissingGreenlet`` (or, with psycopg,
+    the ``StatementError`` wrapping it) when host code touches, outside an
+    awaited call:
+
+    - an expired or unloaded column of an ``Audited`` instance, read or
+      assigned (``Audited`` loads an expired column's old value when it is
+      assigned);
+    - a collection named in the model's ``track_relationships`` that is not
+      loaded.
+
+    The message names the model and attribute and how to load it. The
+    original exception is the ``__cause__``. A subclass of
+    ``MissingGreenlet``, so existing handlers of that error still catch it.
+    """
 
 
 class _CachedRow(NamedTuple):
@@ -151,6 +183,7 @@ def install(
     listener = _Listener(trail)
     event.listen(cls, "after_flush", listener.after_flush)
     event.listen(cls, "do_orm_execute", listener.do_orm_execute)
+    event.listen(cls, "do_orm_execute", _explain_async_load)
     event.listen(cls, "after_transaction_end", _after_transaction_end)
     event.listen(cls, "after_soft_rollback", _after_soft_rollback)
     event.listen(cls, "after_rollback", _after_rollback)
@@ -367,6 +400,110 @@ class _Listener:
             "scope_id": ctx.scope_id if scope is USE_CONTEXT else scope,
             "data": {"v": ENVELOPE_VERSION, "changes": changes, "context": context},
         }
+
+
+# Private SQLAlchemy load option holding the instance of a column load (2.0
+# and 2.1); without it the message names only the model.
+_REFRESH_STATE = "_refresh_state"
+
+
+def _explain_async_load(orm_execute_state: ORMExecuteState) -> Result[Any] | None:
+    # Runs for every ORM statement of an installed session class, so the
+    # common case (not a lazy or expired-attribute load of an Audited
+    # instance on an async dialect) returns before running anything, and a
+    # session bound to a sync engine returns first.
+    state = orm_execute_state
+    bind = state.session.bind
+    if bind is not None and not bind.dialect.is_async:
+        return None
+    if state.is_column_load:
+        instance: InstanceState[Any] | None = getattr(
+            state.load_options, _REFRESH_STATE, None
+        )
+        mapper = state.bind_mapper if instance is None else instance.mapper
+    elif state.is_relationship_load:
+        instance = state.lazy_loaded_from
+        if instance is None:
+            return None  # an eager loader, run by an awaited query
+        mapper = instance.mapper
+    else:
+        return None
+    if mapper is None or not issubclass(mapper.class_, Audited):
+        return None
+    if bind is None:  # bound per mapper or table
+        bind = state.session.get_bind(**state.bind_arguments)
+        if not bind.dialect.is_async:
+            return None
+    try:
+        return state.invoke_statement()
+    except (MissingGreenlet, StatementError) as exc:
+        cause = exc if isinstance(exc, MissingGreenlet) else exc.orig
+        if not isinstance(cause, MissingGreenlet) or isinstance(exc, AsyncLoadError):
+            raise
+        message = (
+            _column_load_message(mapper, instance)
+            if state.is_column_load
+            else _collection_load_message(mapper, instance, state.bind_mapper)
+        )
+        if message is None:
+            raise
+        raise AsyncLoadError(message) from exc
+
+
+_NO_IMPLICIT_IO = (
+    "loading it needs database I/O, which an AsyncSession cannot run outside "
+    "an awaited call"
+)
+
+
+def _column_load_message(
+    mapper: Mapper[Any], instance: InstanceState[Any] | None
+) -> str:
+    name = mapper.class_.__qualname__
+    columns = {prop.key for prop in mapper.column_attrs}
+    unloaded = [] if instance is None else sorted(instance.unloaded & columns)
+    if not unloaded:
+        what = f"an attribute of {name} is"
+    elif len(unloaded) == 1:
+        what = f"{name}.{unloaded[0]} is"
+    else:
+        what = ", ".join(f"{name}.{key}" for key in unloaded) + " are"
+    return (
+        f"{what} not loaded (expired, e.g. by commit), and {_NO_IMPLICIT_IO}. "
+        "This happens when an unloaded attribute is read, and for an audited "
+        "column also when it is assigned: Audited loads the old value to "
+        "record the change. Load it first with `await session.refresh(obj)`, "
+        "or create the session with expire_on_commit=False."
+    )
+
+
+def _collection_load_message(
+    mapper: Mapper[Any],
+    instance: InstanceState[Any] | None,
+    target: Mapper[Any] | None,
+) -> str | None:
+    # SQLAlchemy does not say which relationship is being loaded: name the
+    # tracked ones that are unloaded and point at the loaded class.
+    if instance is None or target is None:
+        return None
+    tracked = options_of(mapper.class_).track_relationships
+    keys = [
+        rel.key
+        for rel in mapper.relationships
+        if rel.key in tracked
+        and rel.key in instance.unloaded
+        and (target.isa(rel.mapper) or rel.mapper.isa(target))
+    ]
+    if not keys:
+        return None
+    name = mapper.class_.__qualname__
+    attributes = " or ".join(f"{name}.{key}" for key in keys)
+    loaders = " or ".join(f"selectinload({name}.{key})" for key in keys)
+    return (
+        f"{attributes} is not loaded, and {_NO_IMPLICIT_IO}. Load tracked "
+        f"collections eagerly before changing them: {loaders} in the query, "
+        'or lazy="selectin" on the relationship.'
+    )
 
 
 def _audited_model(state: ORMExecuteState) -> type[Any] | None:

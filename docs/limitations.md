@@ -32,9 +32,16 @@ Rows deleted by the database, through `ForeignKey(..., ondelete="CASCADE")` with
 - a column filled by the database on INSERT (`server_default`, `Computed`, `Identity`) in an `entity.created` entry, **only** when the mapper sets `eager_defaults=False`. SQLAlchemy's default, `eager_defaults="auto"`, fetches these values with `RETURNING` on PostgreSQL, so the entry holds the real value;
 - a column that is not loaded when the object is deleted, such as a `deferred()` column, in an `entity.deleted` entry.
 
-## Tracked collections under AsyncSession
+## Unloaded attributes under AsyncSession
 
-Appending to or replacing a relationship collection that is not loaded makes SQLAlchemy load it first. `AsyncSession` cannot lazy-load, so the change fails with SQLAlchemy's `MissingGreenlet` error before the audit trail is involved. Load tracked collections eagerly (`selectinload(...)`, or `lazy="selectin"` on the relationship) before changing them. See the [async quickstart](quickstart.md#async).
+`AsyncSession` cannot load an attribute implicitly: outside an awaited call, a load needs database I/O that SQLAlchemy cannot run, and it raises `MissingGreenlet`. Two such loads come from using the audit trail, and for them the library raises `AsyncLoadError` instead, naming the model, the attribute and the fix. The original error is its `__cause__`.
+
+- **A tracked collection that is not loaded.** Appending to or replacing a collection makes SQLAlchemy load it first. Load collections named in `track_relationships` eagerly before changing them: `selectinload(Post.tags)` in the query, or `lazy="selectin"` on the relationship. See the [async quickstart](quickstart.md#async).
+- **An expired column of an `Audited` model.** To record the old value, `Audited` loads an expired column when it is assigned, not only when it is read. With the default `expire_on_commit=True`, every column is expired after `await session.commit()`, so `post.title = "new"` right after a commit needs a load. Refresh the object first (`await session.refresh(post)`), or create the session with `async_sessionmaker(..., expire_on_commit=False)`.
+
+`AsyncLoadError` subclasses SQLAlchemy's `MissingGreenlet`, so an `except MissingGreenlet` still catches it. With psycopg, SQLAlchemy wraps `MissingGreenlet` in a `StatementError`; for these two loads you get `AsyncLoadError` instead of that `StatementError`, on psycopg and asyncpg alike. Every other load (a relationship not in `track_relationships`, a model that is not `Audited`) keeps SQLAlchemy's own error.
+
+Inside the flush, the audit trail never loads anything: changes, labels, scopes and targets are built from what is already in memory.
 
 ## Relationships
 
