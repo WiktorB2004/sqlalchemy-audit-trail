@@ -16,6 +16,7 @@
 - `AuditTrail.dispose()` / `adispose()` close the durable pool the library created
 - `audit_trail.testing`: `assert_audited()` / `assert_not_audited()` (and async variants) that show the closest entries and their differences on failure, table setup helpers, and an opt-in pytest plugin (`pytest_plugins = ["audit_trail.pytest_plugin"]`)
 - `audit.query.get()`, `object_history()`, `related()` and `access_summary()` (with async variants): one entry in detail, an object's history, entries of related objects and access counts; `LabelResolver` turns stored ids in changes into display labels
+- `AuditTrail.scrub()` / `scrub_actor()` (and async variants), enabled with `allow_scrub=True`: erase an object's stored values or an actor's personal context in one transaction, recorded as an `audit.scrubbed` entry; erased values are never merged away when entries are grouped
 
 ## 0.1.0a1 - 2026-09-25
 

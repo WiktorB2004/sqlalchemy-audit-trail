@@ -8,6 +8,7 @@ from audit_trail.context import Actor, AuditContext
 from audit_trail.diff import AuditOptionError, FieldPolicyError
 from audit_trail.events import AuditEvent, Severity, event
 from audit_trail.mixin import Audited
+from audit_trail.privacy import ScrubNotAllowedError, ScrubResult
 from audit_trail.query import (
     AccessCount,
     ActivityDetail,
@@ -48,6 +49,8 @@ __all__ = [
     "Page",
     "Pseudonymized",
     "RelationshipLabels",
+    "ScrubNotAllowedError",
+    "ScrubResult",
     "Severity",
     "Target",
     "TransactionHeader",
