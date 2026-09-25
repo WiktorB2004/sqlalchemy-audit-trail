@@ -396,3 +396,28 @@ def test_replay_detects_a_lost_change() -> None:
     raw = CASES[0].rows()
     initial = {key: initial_state(rows) for key, rows in entity_rows(raw).items()}
     assert replay(raw[:1], initial) != replay(raw, initial)
+
+
+ERASED = "[erased]"
+
+
+def test_erased_ids_never_cancel() -> None:
+    raw = [
+        row(1, UPDATED, {"tags": {"added": [ERASED, "3"], "removed": []}}),
+        row(2, UPDATED, {"tags": {"added": [], "removed": [ERASED, "3"]}}),
+    ]
+    (merged,) = compact_rows(raw)
+    assert merged["data"]["changes"] == {
+        "tags": {"added": [ERASED], "removed": [ERASED]}
+    }
+
+
+def test_erased_ids_are_not_deduplicated() -> None:
+    raw = [
+        row(1, UPDATED, {"tags": {"added": ["4", ERASED], "removed": [ERASED]}}),
+        row(2, UPDATED, {"tags": {"added": [ERASED], "removed": [ERASED, "5"]}}),
+    ]
+    (merged,) = compact_rows(raw)
+    assert merged["data"]["changes"] == {
+        "tags": {"added": ["4", ERASED, ERASED], "removed": ["5", ERASED, ERASED]}
+    }

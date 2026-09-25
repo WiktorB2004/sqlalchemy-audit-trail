@@ -30,10 +30,13 @@ from audit_trail.serialization import pseudonymize as _pseudonymize
 from audit_trail.tables import build_tables
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from pydantic import BaseModel
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
     from sqlalchemy.orm import Session, sessionmaker
 
+    from audit_trail.privacy import ScrubbedRecord, ScrubResult
     from audit_trail.writer import Entry, TransactionValues
 
 OnError = Literal["log", "raise"]
@@ -146,7 +149,8 @@ class AuditTrail:
             an audited table.
         auto_create_partitions: Let durable writes create a missing partition
             and retry once. Needs DDL privileges.
-        allow_scrub: Enable ``scrub``/``scrub_actor``.
+        allow_scrub: Enable ``scrub``/``scrub_actor``. They run on ``engine``,
+            whose role then needs ``UPDATE`` on the audit tables.
 
     Attributes:
         severities: The severity enum in use.
@@ -481,6 +485,186 @@ class AuditTrail:
                 )
         except DURABLE_WRITE_ERRORS as exc:
             handle_durable_failure(exc, self.on_error, entry.flags.fail_closed)
+
+    def scrub(
+        self,
+        object_type: str,
+        object_id: str,
+        *,
+        include_targets: bool = True,
+        since: datetime | None = None,
+    ) -> ScrubResult:
+        """Erase the values the entries of one object hold.
+
+        Every non-null value in ``data.changes`` and ``data.payload`` of the
+        object's entries becomes ``"[erased]"`` (field keys stay, ``null``
+        stays ``null``) and ``object_label`` becomes ``NULL``. ``data.context``
+        is left to ``scrub_actor``. Runs in one transaction on ``engine``
+        together with an ``audit.scrubbed`` entry recording who scrubbed
+        which object and how many rows, without any erased value; nothing is
+        committed if either fails. With ``auto_create_partitions``, the
+        partitions of the current month are ensured first.
+
+        Args:
+            object_type: Stored ``object_type`` of the object.
+            object_id: Stored ``object_id`` of the object, as
+                ``audit_trail.diff.object_id_for`` formats it.
+            include_targets: Also erase entries whose target is the object,
+                such as changes of its children.
+            since: Only entries created at or after this aware datetime,
+                which also limits the partitions scanned. ``None`` for all.
+
+        Returns:
+            The number of rows erased; entries already erased are not counted.
+
+        Raises:
+            ScrubNotAllowedError: ``allow_scrub`` is ``False``.
+            TypeError: ``engine`` is async; use ``ascrub``.
+            ValueError: ``since`` is naive, or ``engine`` is in
+                ``AUTOCOMMIT`` mode.
+        """
+        from audit_trail import privacy
+
+        privacy.check_allowed(self.allow_scrub)
+        engine = self.engine
+        if not isinstance(engine, Engine):
+            raise TypeError("the engine is async; use ascrub")
+        privacy.check_since(since)
+        record = self._scrubbed_record()
+        if self.auto_create_partitions:
+            self.maintenance.ensure_partitions(months_ahead=0)
+        with engine.begin() as conn:
+            return privacy.scrub(
+                conn,
+                self.tables,
+                object_type,
+                object_id,
+                include_targets=include_targets,
+                since=since,
+                record=record,
+            )
+
+    async def ascrub(
+        self,
+        object_type: str,
+        object_id: str,
+        *,
+        include_targets: bool = True,
+        since: datetime | None = None,
+    ) -> ScrubResult:
+        """Async ``scrub``, for an ``AuditTrail`` built with an ``AsyncEngine``.
+
+        Args:
+            object_type: Stored ``object_type`` of the object.
+            object_id: Stored ``object_id`` of the object.
+            include_targets: Also erase entries whose target is the object.
+            since: Only entries created at or after this aware datetime.
+
+        Returns:
+            The number of rows erased.
+
+        Raises:
+            ScrubNotAllowedError: ``allow_scrub`` is ``False``.
+            TypeError: ``engine`` is sync; use ``scrub``.
+            ValueError: As for ``scrub``.
+        """
+        from audit_trail import privacy
+
+        privacy.check_allowed(self.allow_scrub)
+        engine = self.engine
+        if isinstance(engine, Engine):
+            raise TypeError("the engine is sync; use scrub")
+        privacy.check_since(since)
+        record = self._scrubbed_record()
+        if self.auto_create_partitions:
+            await self.maintenance.aensure_partitions(months_ahead=0)
+        async with engine.begin() as conn:
+            return await conn.run_sync(
+                lambda sync_conn: privacy.scrub(
+                    sync_conn,
+                    self.tables,
+                    object_type,
+                    object_id,
+                    include_targets=include_targets,
+                    since=since,
+                    record=record,
+                )
+            )
+
+    def scrub_actor(self, actor_id: str) -> ScrubResult:
+        """Clear the personal context stored for one actor.
+
+        ``audit_transaction`` rows created with this ``actor_id`` get
+        ``actor_label``, ``remote_addr``, ``user_agent`` and ``meta`` set to
+        ``NULL``, and entries with this ``actor_id`` lose those keys from
+        ``data.context``. ``actor_id`` stays. A transaction row keeps the
+        actor it was created with: a request that wrote its first entry
+        anonymously and called ``set_actor`` afterwards keeps its address
+        and user agent on that row. Runs in one transaction on ``engine``
+        with an ``audit.scrubbed`` entry, as ``scrub`` does.
+
+        Args:
+            actor_id: The actor's ``actor_id``.
+
+        Returns:
+            The numbers of activity and transaction rows changed.
+
+        Raises:
+            ScrubNotAllowedError: ``allow_scrub`` is ``False``.
+            TypeError: ``engine`` is async; use ``ascrub_actor``.
+            ValueError: ``engine`` is in ``AUTOCOMMIT`` mode.
+        """
+        from audit_trail import privacy
+
+        privacy.check_allowed(self.allow_scrub)
+        engine = self.engine
+        if not isinstance(engine, Engine):
+            raise TypeError("the engine is async; use ascrub_actor")
+        record = self._scrubbed_record()
+        if self.auto_create_partitions:
+            self.maintenance.ensure_partitions(months_ahead=0)
+        with engine.begin() as conn:
+            return privacy.scrub_actor(conn, self.tables, actor_id, record=record)
+
+    async def ascrub_actor(self, actor_id: str) -> ScrubResult:
+        """Async ``scrub_actor``, for an ``AuditTrail`` built with an ``AsyncEngine``.
+
+        Args:
+            actor_id: The actor's ``actor_id``.
+
+        Returns:
+            The numbers of activity and transaction rows changed.
+
+        Raises:
+            ScrubNotAllowedError: ``allow_scrub`` is ``False``.
+            TypeError: ``engine`` is sync; use ``scrub_actor``.
+            ValueError: ``engine`` is in ``AUTOCOMMIT`` mode.
+        """
+        from audit_trail import privacy
+
+        privacy.check_allowed(self.allow_scrub)
+        engine = self.engine
+        if isinstance(engine, Engine):
+            raise TypeError("the engine is sync; use scrub_actor")
+        record = self._scrubbed_record()
+        if self.auto_create_partitions:
+            await self.maintenance.aensure_partitions(months_ahead=0)
+        async with engine.begin() as conn:
+            return await conn.run_sync(
+                lambda sync_conn: privacy.scrub_actor(
+                    sync_conn, self.tables, actor_id, record=record
+                )
+            )
+
+    def _scrubbed_record(self) -> ScrubbedRecord:
+        from audit_trail.events import AuditSystem
+        from audit_trail.privacy import ScrubbedRecord, scrub_context
+
+        return ScrubbedRecord(
+            int(self.registry.severity_of(AuditSystem.SCRUBBED)),
+            scrub_context(self.context_provider),
+            self.json_encoder,
+        )
 
     def _transaction_values(self, ctx: AuditContext) -> TransactionValues:
         from audit_trail.writer import transaction_values
