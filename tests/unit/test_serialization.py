@@ -38,6 +38,10 @@ class Level(IntEnum):
     HIGH = 3
 
 
+class Mode(str, Enum):
+    FAST = "fast"
+
+
 class Money:
     def __init__(self, cents: int) -> None:
         self.cents = cents
@@ -426,3 +430,17 @@ def test_serialization_imports_without_pydantic() -> None:
         "s.Pseudonymized[str]"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+@pytest.mark.parametrize(
+    ("member", "expected"),
+    [(Level.HIGH, 3), (Mode.FAST, "fast")],
+)
+def test_enum_on_a_builtin_type_encodes_to_the_plain_value(
+    member: Enum, expected: object
+) -> None:
+    # IntEnum and str-mixin members compare equal to their value, so check
+    # the type: the member itself must not leak into the entry.
+    encoded = encode_value(member)
+    assert type(encoded) is type(expected)
+    assert encoded == expected

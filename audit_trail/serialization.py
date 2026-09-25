@@ -101,32 +101,36 @@ def encode_value(
         UnserializableValueError: Neither a built-in rule nor the host encoder
             handles the value (or a nested value), or a float is not finite.
     """
-    if isinstance(value, Enum):
-        return encode_value(value.value, json_encoder=json_encoder)
-    if value is None or isinstance(value, (bool, int, str)):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise UnserializableValueError(f"cannot encode non-finite float {value}")
-        return value
-    if isinstance(value, (datetime, date, time)):
-        return value.isoformat()
-    if isinstance(value, (Decimal, UUID)):
-        return str(value)
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        raw = bytes(value)
-        return {"sha256": hashlib.sha256(raw).hexdigest(), "len": len(raw)}
-    if isinstance(value, dict):
-        encoded: dict[str, JSONValue] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
+    match value:
+        case Enum():
+            return encode_value(value.value, json_encoder=json_encoder)
+        case None | bool() | int() | str():
+            return value
+        case float():
+            if not math.isfinite(value):
                 raise UnserializableValueError(
-                    f"cannot encode dict key of type {_type_name(key)}; keys must be str"
+                    f"cannot encode non-finite float {value}"
                 )
-            encoded[key] = encode_value(item, json_encoder=json_encoder)
-        return encoded
-    if isinstance(value, (list, tuple)):
-        return [encode_value(item, json_encoder=json_encoder) for item in value]
+            return value
+        case datetime() | date() | time():
+            return value.isoformat()
+        case Decimal() | UUID():
+            return str(value)
+        case bytes() | bytearray() | memoryview():
+            raw = bytes(value)
+            return {"sha256": hashlib.sha256(raw).hexdigest(), "len": len(raw)}
+        case dict():
+            encoded: dict[str, JSONValue] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise UnserializableValueError(
+                        f"cannot encode dict key of type {_type_name(key)}; "
+                        "keys must be str"
+                    )
+                encoded[key] = encode_value(item, json_encoder=json_encoder)
+            return encoded
+        case list() | tuple():
+            return [encode_value(item, json_encoder=json_encoder) for item in value]
     if json_encoder is not None:
         try:
             substitute = json_encoder().default(value)
