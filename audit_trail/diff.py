@@ -306,7 +306,21 @@ def object_id_of(obj: object) -> str:
     Raises:
         ValueError: The instance has no primary key value yet.
     """
-    state = instance_state(obj)
+    object_id = state_object_id(instance_state(obj))
+    if object_id is None:
+        raise ValueError(f"{type(obj).__qualname__} instance has no primary key yet")
+    return object_id
+
+
+def state_object_id(state: InstanceState[Any]) -> str | None:
+    """Return the ``object_id`` of an instance state, as :func:`object_id_of`.
+
+    Args:
+        state: The state of a mapped instance.
+
+    Returns:
+        The id, or ``None`` when the instance has no primary key value yet.
+    """
     if state.key is not None:
         return _format_identity(state.key[1])
     mapper = state.mapper
@@ -315,7 +329,7 @@ def object_id_of(obj: object) -> str:
         for column in mapper.primary_key
     )
     if any(value is None for value in values):
-        raise ValueError(f"{type(obj).__qualname__} instance has no primary key yet")
+        return None
     return _format_identity(values)
 
 
