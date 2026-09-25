@@ -356,7 +356,9 @@ def test_context_provider_falls_back_to_the_request_context() -> None:
 @pytest.fixture
 def installed() -> sessionmaker[Session]:
     factory = sessionmaker()
-    AuditTrail(create_engine("postgresql+psycopg://localhost/unused")).install(factory)
+    AuditTrail(
+        create_engine("postgresql+psycopg://localhost/unused"), events=[]
+    ).install(factory)
     return factory
 
 
@@ -404,7 +406,9 @@ def test_session_dependency_rejects_other_factories() -> None:
 def test_async_session_dependency_yields_and_tracks_the_session() -> None:
     sync_class = type("FastAPIUnitSession", (Session,), {})
     factory = async_sessionmaker(sync_session_class=sync_class)
-    AuditTrail(create_engine("postgresql+psycopg://localhost/unused")).install(factory)
+    AuditTrail(
+        create_engine("postgresql+psycopg://localhost/unused"), events=[]
+    ).install(factory)
     get_session = session_dependency(factory)
     results: list[object] = []
 

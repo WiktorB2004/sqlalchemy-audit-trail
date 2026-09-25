@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import gc
 import logging
 from dataclasses import dataclass
 from enum import IntEnum
@@ -30,6 +29,7 @@ from sqlalchemy.orm import (
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from audit_trail import Audited, AuditEvent, AuditOptions, AuditTrail, event, listener
+from audit_trail import events as events_module
 from audit_trail.config import DURABLE_POOL_SIZE, DURABLE_POOL_TIMEOUT
 from audit_trail.context import bind, context, current_context, set_actor
 from audit_trail.events import EventRegistryError, Severity
@@ -37,6 +37,7 @@ from audit_trail.listener import installed_trail
 from audit_trail.maintenance import PartitionManager
 from audit_trail.relations import pop_relationship_changes
 from audit_trail.serialization import KeyRing, pseudonymize
+from tests.unit.discovery_support import isolate_discovery
 
 KEY = b"k" * 32
 
@@ -76,16 +77,19 @@ def test_severity_settings_reach_the_registry(engine: Engine) -> None:
     assert audit.registry.default_severity is Level.MID
     assert audit.registry.system_severity is Level.LOW
     assert audit.registry.get("config_test.order_placed") is ShopEvent.ORDER_PLACED
-    with pytest.raises(EventRegistryError):
-        AuditTrail(engine, severities=Level, default_severity=Severity.INFO)
+    with pytest.raises(EventRegistryError, match="default_severity"):
+        AuditTrail(engine, severities=Level, default_severity=Severity.INFO, events=[])
 
 
-def test_events_default_to_discovery(engine: Engine) -> None:
-    gc.collect()  # drop event classes other tests defined locally
+def test_events_default_to_discovery(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    isolate_discovery(monkeypatch)
 
     class Discovered(AuditEvent):
         FOUND = event("config_test.found", Severity.INFO)
 
+    assert events_module._discover() == [Discovered]
     audit = AuditTrail(engine)
     assert audit.registry.get("config_test.found") is Discovered.FOUND
     explicit = AuditTrail(engine, events=[])
