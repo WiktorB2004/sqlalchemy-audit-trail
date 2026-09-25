@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `PartitionManager.drop_expired()`: drops monthly partitions past their per-severity retention with `DETACH ... CONCURRENTLY`, finishing interrupted detaches; `PartitionManager.health()` reports partition coverage ahead, pending detaches and orphaned tables
+- `ensure_partitions()` works with tables declared without a schema and returns schema-qualified names
+
 ## 0.1.0a1 - 2026-09-25
 
 Pre-release to verify the publishing pipeline. The flush listener and the read API are not included yet, so no audit entries are written.
