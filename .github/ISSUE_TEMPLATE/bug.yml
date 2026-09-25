@@ -1,0 +1,84 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. This tracker is for **sqlalchemy-audit-trail** only — not SQLAlchemy, PostgreSQL, the database drivers or FastAPI.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - flush listener / entity changes
+        - explicit events (log / alog)
+        - query API (audit.query)
+        - partitions / maintenance / migrations
+        - privacy (pseudonyms, redaction, scrub)
+        - FastAPI integration
+        - testing helpers / pytest plugin
+        - docs / CI / other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: sqlalchemy-audit-trail version
+      placeholder: "0.1.0a1 or commit"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12"
+    validations:
+      required: true
+  - type: input
+    id: sqlalchemy
+    attributes:
+      label: SQLAlchemy version
+      placeholder: "2.0.x"
+    validations:
+      required: true
+  - type: input
+    id: postgres
+    attributes:
+      label: PostgreSQL version
+      placeholder: "18"
+    validations:
+      required: true
+  - type: dropdown
+    id: driver
+    attributes:
+      label: Driver
+      options:
+        - psycopg (sync)
+        - psycopg (async)
+        - asyncpg
+        - other
+        - n/a (no database)
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: Include the full traceback or the audit rows you got.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal models and session code, or steps. Redact connection strings, keys and personal data.
+      render: python
+    validations:
+      required: true
