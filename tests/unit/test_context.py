@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import dataclasses
+import inspect
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import pytest
 from sqlalchemy.orm import Session
@@ -111,9 +114,37 @@ def test_context_rejects_object_and_fields_together() -> None:
         context(AuditContext(), channel="api")
 
 
+@pytest.mark.parametrize("name", [f.name for f in dataclasses.fields(AuditContext)])
+def test_context_rejects_object_with_any_field(name: str) -> None:
+    fields: dict[str, Any] = {name: object()}
+    with pytest.raises(TypeError):
+        context(AuditContext(), **fields)
+
+
 def test_context_rejects_unknown_field() -> None:
     with pytest.raises(TypeError):
-        context(no_such_field=1)
+        context(no_such_field=1)  # type: ignore[call-arg]
+
+
+def test_context_accepts_exactly_the_audit_context_fields() -> None:
+    # Keeps the explicit keyword arguments in sync with the dataclass.
+    params = inspect.signature(context).parameters.values()
+    keywords = {p.name for p in params if p.kind is p.KEYWORD_ONLY}
+    assert keywords == {f.name for f in dataclasses.fields(AuditContext)}
+
+
+def test_context_passes_every_field_through() -> None:
+    values: dict[str, Any] = {
+        f.name: object() for f in dataclasses.fields(AuditContext)
+    }
+    with context(**values) as ctx:
+        for name, value in values.items():
+            assert getattr(ctx, name) is value, name
+
+
+def test_context_defaults_match_audit_context() -> None:
+    with context() as ctx:
+        assert ctx == AuditContext()
 
 
 def test_bind_only_sets_session_info(session: Session) -> None:

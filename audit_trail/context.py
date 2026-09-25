@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
 _SESSION_INFO_KEY = "audit_context"
+_ANONYMOUS = "anonymous"
 
 
 @dataclass(frozen=True)
@@ -70,7 +71,7 @@ class AuditContext:
         extra: Additional host-defined context, stored as ``meta``.
     """
 
-    actor_type: str = "anonymous"
+    actor_type: str = _ANONYMOUS
     actor_id: str | None = None
     actor_label: str | None = None
     remote_addr: str | None = None
@@ -140,12 +141,32 @@ class ContextScope:
         self.__exit__(exc_type, exc, tb)
 
 
-def context(ctx: AuditContext | None = None, /, **fields: Any) -> ContextScope:
+def context(
+    ctx: AuditContext | None = None,
+    /,
+    *,
+    actor_type: str | None = None,
+    actor_id: str | None = None,
+    actor_label: str | None = None,
+    remote_addr: str | None = None,
+    user_agent: str | None = None,
+    method: str | None = None,
+    path: str | None = None,
+    channel: str | None = None,
+    auth_method: str | None = None,
+    request_id: UUID | None = None,
+    correlation_id: UUID | None = None,
+    scope_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> ContextScope:
     """Activate an audit context for a block of code.
 
     Usable as ``with context(...)`` and ``async with context(...)``. The
     previous context is restored on exit. A nested block replaces the outer
     context; it does not inherit its fields.
+
+    Pass either a ready :class:`AuditContext` or the fields of a new one; the
+    keyword arguments mirror the :class:`AuditContext` attributes.
 
     Example::
 
@@ -153,22 +174,65 @@ def context(ctx: AuditContext | None = None, /, **fields: Any) -> ContextScope:
             ...
 
     Args:
-        ctx: A ready context to activate. Mutually exclusive with ``fields``.
-        **fields: Fields of a new :class:`AuditContext`: ``actor_type``,
-            ``actor_id``, ``actor_label``, ``remote_addr``, ``user_agent``,
-            ``method``, ``path``, ``channel``, ``auth_method``,
-            ``request_id``, ``correlation_id``, ``scope_id``, ``extra``.
+        ctx: A ready context to activate. Mutually exclusive with the
+            keyword arguments.
+        actor_type: Kind of actor. ``None`` means ``"anonymous"``.
+        actor_id: Opaque identifier of the actor.
+        actor_label: Human-readable snapshot of the actor.
+        remote_addr: Client IP address.
+        user_agent: Client user agent.
+        method: Request method.
+        path: Request path.
+        channel: Entry point, for example ``"worker"``.
+        auth_method: How the actor authenticated.
+        request_id: Identifier of the request.
+        correlation_id: Links several database transactions. Defaults to
+            ``request_id``.
+        scope_id: Scope of the change, for example a tenant.
+        extra: Additional host-defined context, stored as ``meta``.
 
     Returns:
         A context manager yielding the active :class:`AuditContext`.
 
     Raises:
-        TypeError: If both ``ctx`` and ``fields`` are given, or a field name
-            is unknown.
+        TypeError: If both ``ctx`` and keyword arguments are given.
     """
-    if ctx is not None and fields:
-        raise TypeError("pass either an AuditContext or its fields, not both")
-    return ContextScope(ctx if ctx is not None else AuditContext(**fields))
+    fields = (
+        actor_type,
+        actor_id,
+        actor_label,
+        remote_addr,
+        user_agent,
+        method,
+        path,
+        channel,
+        auth_method,
+        request_id,
+        correlation_id,
+        scope_id,
+        extra,
+    )
+    if ctx is not None:
+        if any(value is not None for value in fields):
+            raise TypeError("pass either an AuditContext or its fields, not both")
+        return ContextScope(ctx)
+    return ContextScope(
+        AuditContext(
+            actor_type=actor_type if actor_type is not None else _ANONYMOUS,
+            actor_id=actor_id,
+            actor_label=actor_label,
+            remote_addr=remote_addr,
+            user_agent=user_agent,
+            method=method,
+            path=path,
+            channel=channel,
+            auth_method=auth_method,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            scope_id=scope_id,
+            extra=extra if extra is not None else {},
+        )
+    )
 
 
 def set_actor(actor: Actor) -> AuditContext:
