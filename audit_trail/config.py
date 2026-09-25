@@ -44,7 +44,9 @@ class AuditOptions:
     read only attributes already loaded on it: reading an expired or unloaded
     attribute emits no SQL, logs a warning on ``audit_trail.diff`` (once per
     model, attribute and option) and the option falls back (``label`` and
-    ``target`` to ``None``, ``scope`` to the context). Reading a
+    ``target`` to ``None``, ``scope`` to the context). A column that was
+    never set on a new instance reads as ``None``, as stored, unless it has a
+    server-side default. Reading a
     ``functools.cached_property`` raises ``AuditOptionError``. Any other
     exception they raise propagates and aborts the flush.
 

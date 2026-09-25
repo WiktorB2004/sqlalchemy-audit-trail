@@ -21,6 +21,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 
 from sqlalchemy import Column, inspect
+from sqlalchemy.orm import ColumnProperty
 from sqlalchemy.orm.attributes import instance_state
 from sqlalchemy.orm.base import NO_VALUE
 
@@ -388,7 +389,9 @@ class _LoadedOnly:
     """Read-only view of an instance that never loads anything.
 
     Mapped attributes come from the instance's loaded state; one that would
-    need SQL raises ``_UnloadedAttributeError``. Properties, hybrids and
+    need SQL raises ``_UnloadedAttributeError``. A column never set on an
+    instance without an identity yet is ``None``, unless it has a server-side
+    default. Properties, hybrids and
     methods of the class run with the view as ``self``, so they cannot load
     through the real instance either; so do ``__repr__`` and ``__str__``.
     Loaded related instances are wrapped, also inside collections.
@@ -411,6 +414,8 @@ class _LoadedOnly:
         if name in state.manager:
             value = state.dict.get(name, NO_VALUE)
             if value is NO_VALUE:
+                if _unset_is_null(state, name):
+                    return None
                 raise _UnloadedAttributeError(cls, name)
             return _wrap_related(state.mapper, name, value)
         instance_dict: dict[str, Any] = getattr(obj, "__dict__", {})
@@ -454,6 +459,19 @@ class _LoadedOnly:
             # object.__str__ defers to __repr__, which applies the same rules.
             return self.__repr__()
         return str(method(self))
+
+
+def _unset_is_null(state: InstanceState[Any], key: str) -> bool:
+    # A column never set on an instance that has no identity yet (new, or
+    # inserted by the flush being audited) is NULL in the row, as in
+    # entity_changes' "created" set, unless the database fills it in.
+    if state.key is not None:
+        return False
+    prop = state.mapper.get_property(key)
+    return isinstance(prop, ColumnProperty) and all(
+        isinstance(column, Column) and column.server_default is None
+        for column in prop.columns
+    )
 
 
 def _wrap_related(mapper: Mapper[Any], name: str, value: object) -> object:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
@@ -232,11 +233,41 @@ def test_install_tracks_relationships_before_and_after_configuration(
     assert late.records_changes()  # configured after install
 
 
-def test_track_relationships_must_name_a_relationship(engine: Engine) -> None:
+def test_untrackable_names_are_skipped_with_a_warning(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
     AuditTrail(engine, events=[]).install(sessionmaker(engine))
-    broken = _tracked_model("broken", track="missing")
-    try:
-        with pytest.raises(ValueError, match="'missing', which is not a relationship"):
-            broken.registry.configure()
-    finally:
-        broken.registry.dispose()  # a failed mapper breaks later configuration
+
+    class Base(DeclarativeBase):
+        pass
+
+    class Tag(Base):
+        __tablename__ = "untrackable_tag"
+        id: Mapped[int] = mapped_column(primary_key=True)
+
+    class Owner(Base, Audited):
+        __tablename__ = "untrackable"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        tag_id: Mapped[int | None] = mapped_column(ForeignKey("untrackable_tag.id"))
+        tag: Mapped[Tag | None] = relationship()
+        __audit__ = AuditOptions(track_relationships={"missing", "tag", "tag_id"})
+
+    with caplog.at_level(logging.WARNING, logger="audit_trail"):
+        Base.registry.configure()  # must not fail configuration
+    suffix = "; it is not tracked (check_models() reports this)"
+    # Leftover models of other tests may be configured here too.
+    own = f"{Owner.__qualname__}: "
+    messages = [
+        "Owner: " + r.getMessage().removeprefix(own)
+        for r in caplog.records
+        if r.getMessage().startswith(own)
+    ]
+    assert messages == [
+        "Owner: track_relationships names 'missing', which is not a relationship"
+        + suffix,
+        "Owner: track_relationships names 'tag', which is a scalar relationship"
+        + suffix,
+        "Owner: track_relationships names 'tag_id', which is not a relationship"
+        + suffix,
+    ]
+    Base.registry.dispose()

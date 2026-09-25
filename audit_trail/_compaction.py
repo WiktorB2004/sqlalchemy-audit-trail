@@ -17,6 +17,7 @@ from uuid import UUID
 
 from audit_trail._typing import assert_never
 from audit_trail.context import ContextSnapshot
+from audit_trail.diff import REDACTED, UNKNOWN
 from audit_trail.events import Crud
 from audit_trail.relations import RelationshipChange
 from audit_trail.serialization import JSONValue
@@ -25,9 +26,6 @@ __all__ = ["ActivityData", "ActivityRow", "FieldChange", "compact_rows"]
 
 FieldChange: TypeAlias = list[JSONValue] | RelationshipChange
 """A column change ``[old, new]`` or a relationship change."""
-
-_REDACTED = "***"  # same as diff.REDACTED
-_UNKNOWN = "<unknown>"  # same as diff.UNKNOWN
 
 _CRUD_BY_VERB: dict[str, Crud] = {member.value: member for member in Crud}
 
@@ -273,7 +271,7 @@ def _unchanged(old: JSONValue, new: JSONValue) -> bool:
 
 
 def _is_marker(value: JSONValue) -> bool:
-    return value == _REDACTED or value == _UNKNOWN
+    return value == REDACTED or value == UNKNOWN
 
 
 def _canonical(value: JSONValue) -> str:

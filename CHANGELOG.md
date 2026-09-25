@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `PartitionManager.drop_expired()`: drops monthly partitions past their per-severity retention with `DETACH ... CONCURRENTLY`, finishing interrupted detaches; `PartitionManager.health()` reports partition coverage ahead, pending detaches and orphaned tables
+- `ensure_partitions()` works with tables declared without a schema and returns schema-qualified names
+- Renovate opens pull requests for dependency and GitHub Actions updates
+- `check_models()`: static checks for CI that report sensitive-looking columns without an audit policy, JSON columns whose in-place changes go undetected, relationships tracked on both sides, and tracked names that are not collection relationships
+- `AuditTrail.install()`: the session listener writes one `entity.created`/`updated`/`deleted` row per flush and object, with a lazily created `audit_transaction` row per database transaction, inside the business transaction; `on_error="log"` isolates audit write failures in a savepoint
+- `AuditTrail` gains `default_severity`, `system_severity`, `events` and `global_redact`, and exposes `context()`, `set_actor()`, `bind()`, `pseudonymize()` and `maintenance`
+- Audit options read a column never set on a new instance as `None` instead of falling back as if it were not loaded
+
 ## 0.1.0a1 - 2026-09-25
 
 Pre-release to verify the publishing pipeline. The flush listener and the read API are not included yet, so no audit entries are written.
