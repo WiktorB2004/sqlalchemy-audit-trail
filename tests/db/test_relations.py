@@ -496,6 +496,73 @@ def test_tracking_twice_does_not_double_count(
     assert net_changes(session, post, "tags") == (set(), {"101"})
 
 
+@dataclass
+class InheritedModels:
+    Item: Any
+    Owner: Any
+    SubOwner: Any
+
+
+@pytest.fixture
+def inherited(engine: Engine, schema: str) -> InheritedModels:
+    class Base(DeclarativeBase):
+        metadata = MetaData(schema=schema)
+
+    owner_items = Table(
+        "owner_items",
+        Base.metadata,
+        Column("owner_id", ForeignKey("owner.id"), primary_key=True),
+        Column("item_id", ForeignKey("item.id"), primary_key=True),
+    )
+
+    class Item(Base):
+        __tablename__ = "item"
+        id: Mapped[int] = mapped_column(primary_key=True)
+
+    class Owner(Base):
+        __tablename__ = "owner"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        kind: Mapped[str]
+        items: Mapped[list[Item]] = relationship(secondary=owner_items)
+        __mapper_args__ = {  # noqa: RUF012
+            "polymorphic_on": "kind",
+            "polymorphic_identity": "owner",
+        }
+
+    class SubOwner(Owner):
+        __mapper_args__ = {"polymorphic_identity": "sub"}  # noqa: RUF012
+
+    Base.metadata.create_all(engine)
+    return InheritedModels(Item, Owner, SubOwner)
+
+
+def test_tracking_subclass_after_base_does_not_double_count(
+    engine: Engine, inherited: InheritedModels
+) -> None:
+    track_relationships(inherited.Owner.items)
+    track_relationships(inherited.SubOwner.items)
+
+    with sessionmaker(engine, class_=RecordingSession)() as session:
+        owner = inherited.SubOwner(id=1, items=[inherited.Item(id=1)])
+        session.add(owner)
+        session.flush()
+        item = inherited.Item(id=2)
+        owner.items.append(item)
+        owner.items.remove(item)
+        session.commit()
+
+        assert net_changes(session, owner, "items") == ({"1"}, set())
+
+
+def test_tracking_base_after_subclass_is_rejected(
+    inherited: InheritedModels,
+) -> None:
+    track_relationships(inherited.SubOwner.items)
+
+    with pytest.raises(ValueError, match=r"Owner\.items.*SubOwner\.items"):
+        track_relationships(inherited.Owner.items)
+
+
 REVISIT = (
     "SQLAlchemy changed how collection history behaves across an autoflush; "
     "revisit the relationship tracking design"

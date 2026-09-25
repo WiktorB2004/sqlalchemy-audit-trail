@@ -37,7 +37,7 @@ __all__ = [
 
 _INFO_KEY = "audit_trail.relations"
 
-_tracked: set[tuple[object, str]] = set()
+_tracked: set[tuple[type[Any], str]] = set()
 
 
 class _Delta:
@@ -93,25 +93,37 @@ def track_relationships(*attributes: InstrumentedAttribute[Any]) -> None:
     Registers ``append`` and ``remove`` listeners on each attribute (also
     covering assignment, ``clear()``, slicing and ``del``, which emit the same
     events) and an ``expire`` listener on its class. Listeners propagate to
-    subclasses. Registering the same attribute again is a no-op.
+    subclasses, so registering an attribute already tracked on the same class
+    or a base class is a no-op.
 
     Args:
         *attributes: Class-bound collection relationships, e.g. ``Post.tags``.
 
     Raises:
-        ValueError: If an attribute is not a collection ``relationship()``.
+        ValueError: If an attribute is not a collection ``relationship()``,
+            or if the same relationship is already tracked on a subclass.
     """
     for attr in attributes:
         prop = attr.property
         if not isinstance(prop, RelationshipProperty) or not prop.uselist:
             raise ValueError(f"{attr} is not a collection relationship")
-        token = (attr.class_, attr.key)
-        if token in _tracked:
+        cls, key = cast("type[Any]", attr.class_), attr.key
+        # Listeners propagate to subclasses, so a key tracked on any class in
+        # the MRO already covers this one; registering again would count
+        # every change twice.
+        if any((base, key) in _tracked for base in cls.__mro__):
             continue
-        _listen(attr, attr.key)
-        if not event.contains(attr.class_, "expire", _on_expire):
-            event.listen(attr.class_, "expire", _on_expire, raw=True, propagate=True)
-        _tracked.add(token)
+        for tracked_cls, tracked_key in _tracked:
+            if tracked_key == key and issubclass(tracked_cls, cls):
+                raise ValueError(
+                    f"cannot track {cls.__name__}.{key}: subclass attribute "
+                    f"{tracked_cls.__name__}.{key} is already tracked and its "
+                    "changes would be counted twice"
+                )
+        _listen(attr, key)
+        if not event.contains(cls, "expire", _on_expire):
+            event.listen(cls, "expire", _on_expire, raw=True, propagate=True)
+        _tracked.add((cls, key))
 
 
 def _listen(attr: InstrumentedAttribute[Any], key: str) -> None:
