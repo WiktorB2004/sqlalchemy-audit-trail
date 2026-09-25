@@ -27,13 +27,14 @@ from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.orm.session import make_transient_to_detached
 
 from audit_trail import diff
-from audit_trail.config import AuditOptions
+from audit_trail.config import AuditOptions, Target
 from audit_trail.diff import (
     REDACTED,
     UNKNOWN,
     USE_CONTEXT,
     AuditOptionError,
     FieldPolicyError,
+    ResolvedTarget,
     entity_changes,
     field_policy,
     object_id_for,
@@ -407,9 +408,10 @@ def test_scope_fallback_to_context_versus_explicit_none() -> None:
 def test_target_formats_id_like_object_id() -> None:
     obj = account(parent_id=5)
     assert resolve_target(obj, AuditOptions()) is None
-    assert resolve_target(
-        obj, AuditOptions(target=lambda o: ("Parent", o.parent_id))
-    ) == ("Parent", "5")
+    resolved = resolve_target(
+        obj, AuditOptions(target=lambda o: Target("Parent", o.parent_id))
+    )
+    assert resolved == ResolvedTarget(type="Parent", id="5")
     assert resolve_target(obj, AuditOptions(target=lambda o: ("Pair", ("a", 1)))) == (
         "Pair",
         '["a","1"]',
