@@ -515,7 +515,9 @@ class AuditTrail:
                 which also limits the partitions scanned. ``None`` for all.
 
         Returns:
-            The number of rows erased; entries already erased are not counted.
+            A ``ScrubResult``: ``activity_rows`` is the number of entries
+            erased (entries already erased are not counted);
+            ``transaction_rows`` is always ``0``.
 
         Raises:
             ScrubNotAllowedError: ``allow_scrub`` is ``False``.
@@ -561,7 +563,7 @@ class AuditTrail:
             since: Only entries created at or after this aware datetime.
 
         Returns:
-            The number of rows erased.
+            A ``ScrubResult``; see ``scrub``.
 
         Raises:
             ScrubNotAllowedError: ``allow_scrub`` is ``False``.
@@ -607,7 +609,8 @@ class AuditTrail:
             actor_id: The actor's ``actor_id``.
 
         Returns:
-            The numbers of activity and transaction rows changed.
+            A ``ScrubResult`` with the numbers of activity and transaction
+            rows changed.
 
         Raises:
             ScrubNotAllowedError: ``allow_scrub`` is ``False``.
@@ -633,7 +636,8 @@ class AuditTrail:
             actor_id: The actor's ``actor_id``.
 
         Returns:
-            The numbers of activity and transaction rows changed.
+            A ``ScrubResult`` with the numbers of activity and transaction
+            rows changed.
 
         Raises:
             ScrubNotAllowedError: ``allow_scrub`` is ``False``.

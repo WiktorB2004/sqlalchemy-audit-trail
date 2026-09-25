@@ -201,9 +201,11 @@ def entity_changes(
     (``MutableDict``) without ``snapshot_on_load``, a ``deleted`` column that
     is not loaded (for example ``deferred``), and a ``created`` column filled
     by a server-side default (``server_default``, ``Computed``, ``Identity``)
-    that was not fetched back. Set ``eager_defaults=True`` on the mapper to
-    get real server defaults in ``created`` entries. A ``created`` column that
-    was not set and has no server-side default is ``None``, as stored.
+    that was not fetched back. On PostgreSQL the mapper's default
+    ``eager_defaults="auto"`` fetches them with ``RETURNING`` on INSERT, so
+    ``created`` entries hold the real values; only a mapper with
+    ``eager_defaults=False`` leaves them ``"<unknown>"``. A ``created`` column
+    that was not set and has no server-side default is ``None``, as stored.
 
     Args:
         obj: A mapped instance.

@@ -46,17 +46,28 @@ nav:
       - Privacy and GDPR: guides/privacy.md
       - Partitions and retention: guides/partitions.md
       - Testing your application: guides/testing.md
+      - Database roles and permissions: guides/permissions.md
+      - Operations: guides/operations.md
   - Limitations: limitations.md
+  - Migrating from sqlalchemy-continuum: migrating-from-continuum.md
   - API:
       - audit_trail.config: api/config.md
+      - audit_trail.mixin: api/mixin.md
+      - audit_trail.diff: api/diff.md
+      - audit_trail.relations: api/relations.md
       - audit_trail.events: api/events.md
       - audit_trail.context: api/context.md
+      - audit_trail.serialization: api/serialization.md
+      - audit_trail.writer: api/writer.md
       - audit_trail.tables: api/tables.md
+      - audit_trail.migrations: api/migrations.md
       - audit_trail.query: api/query.md
       - audit_trail.maintenance: api/maintenance.md
       - audit_trail.privacy: api/privacy.md
       - audit_trail.checks: api/checks.md
       - audit_trail.testing: api/testing.md
+      - audit_trail.pytest_plugin: api/pytest_plugin.md
+      - audit_trail.integrations.fastapi: api/integrations_fastapi.md
   - Development: development.md
   - Changelog: changelog.md
 
