@@ -19,7 +19,7 @@ the session fires no ``remove`` on that parent.
 from __future__ import annotations
 
 import json
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple, TypedDict, cast
 
 from sqlalchemy import event, inspect
 from sqlalchemy.orm import (
@@ -30,12 +30,25 @@ from sqlalchemy.orm import (
 )
 
 __all__ = [
+    "RelationshipChange",
     "discard_relationship_changes",
     "pop_relationship_changes",
     "track_relationships",
 ]
 
 _INFO_KEY = "audit_trail.relations"
+
+
+class RelationshipChange(TypedDict):
+    """Net change of one tracked collection since the last flush.
+
+    Attributes:
+        added: Object ids of members added to the collection.
+        removed: Object ids of members removed from it.
+    """
+
+    added: list[str]
+    removed: list[str]
 
 
 class _TrackedAttribute(NamedTuple):
@@ -145,7 +158,7 @@ def _listen(attr: InstrumentedAttribute[Any], key: str) -> None:
     event.listen(attr, "remove", on_remove, raw=True, propagate=True)
 
 
-def pop_relationship_changes(obj: object) -> dict[str, dict[str, list[str]]]:
+def pop_relationship_changes(obj: object) -> dict[str, RelationshipChange]:
     """Return and clear the net collection changes of ``obj``.
 
     Meant to be called from ``after_flush`` or later, when every added item
@@ -165,7 +178,7 @@ def pop_relationship_changes(obj: object) -> dict[str, dict[str, list[str]]]:
     store: dict[str, _Delta] | None = state.info.pop(_INFO_KEY, None)
     if not store:
         return {}
-    changes: dict[str, dict[str, list[str]]] = {}
+    changes: dict[str, RelationshipChange] = {}
     for key, delta in store.items():
         added = _object_ids(delta.added)
         removed = _object_ids(delta.removed)
