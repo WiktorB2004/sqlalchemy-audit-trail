@@ -55,7 +55,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Literal, TypeVar
+from typing import TYPE_CHECKING, Literal, NamedTuple, TypeVar
 
 from sqlalchemy import Connection, Engine, Table, bindparam, text
 from sqlalchemy.exc import DBAPIError
@@ -126,6 +126,29 @@ class PartitionLockTimeoutError(PartitionError):
     before the timeout stay dropped (each one is logged), and a detach left
     pending is finalized by the next call.
     """
+
+
+class _RetentionTarget(NamedTuple):
+    """A partitioned table whose monthly partitions expire together."""
+
+    parent: str
+    """Quoted, schema-qualified name of the partitioned table."""
+    oid: int
+    limit: timedelta | None
+    """How long its partitions are kept; ``None`` keeps them forever."""
+
+
+class _Coverage(NamedTuple):
+    covers_now: bool
+    months_ahead: int | None
+    """Whole months after the current one covered; ``None`` when unbounded."""
+
+
+class _ShownSchemas(NamedTuple):
+    """Schemas of the audit tables, as used in returned names."""
+
+    transaction: str
+    activity: str
 
 
 @dataclass(frozen=True)
@@ -440,7 +463,9 @@ def health(
     return HealthReport(
         min_months_ahead=min_months_ahead,
         transaction=check(
-            _name(_shown_schemas(connection, tables)[0], tables.transaction.name),
+            _name(
+                _shown_schemas(connection, tables).transaction, tables.transaction.name
+            ),
             transaction_months,
         ),
         activity=activity,
@@ -790,9 +815,8 @@ def _drop(
         if now is None:
             now = conn.execute(text("SELECT now()")).scalar_one()
 
-        # (quoted parent, its monthly partitions, retention)
-        parents: list[tuple[str, int, timedelta | None]] = [
-            (
+        targets = [
+            _RetentionTarget(
                 _qualified(transaction),
                 transaction_oid,
                 _transaction_limit(limits, transaction_retention),
@@ -803,7 +827,11 @@ def _drop(
             values = child.list_values()
             partitioned |= values
             if child.relkind == "p":
-                parents.append((child.qualified, child.oid, _longest(limits, values)))
+                targets.append(
+                    _RetentionTarget(
+                        child.qualified, child.oid, _longest(limits, values)
+                    )
+                )
         for value in sorted(partitioned - limits.keys()):
             logger.warning(
                 "severity %s has no retention; its partitions are kept. "
@@ -818,8 +846,8 @@ def _drop(
             )
 
         dropped: list[str] = []
-        for parent, parent_oid, limit in parents:
-            dropped += _drop_months(conn, parent, parent_oid, limit, now)
+        for target in targets:
+            dropped += _drop_months(conn, target, now)
         return dropped
     finally:
         # A broken connection is discarded by the pool, which releases the
@@ -832,13 +860,9 @@ def _drop(
 
 
 def _drop_months(
-    conn: Connection,
-    parent: str,
-    parent_oid: int,
-    limit: timedelta | None,
-    now: datetime,
+    conn: Connection, target: _RetentionTarget, now: datetime
 ) -> list[str]:
-    cutoff = None if limit is None else now - limit
+    cutoff = None if target.limit is None else now - target.limit
 
     def expired(child: _Child) -> bool:
         return (
@@ -848,11 +872,11 @@ def _drop_months(
             and child.upper < cutoff
         )
 
-    children = _children(conn, parent_oid)
+    children = _children(conn, target.oid)
     dropped: list[str] = []
     # At most one partition per parent can be pending; finish it first.
     for child in (c for c in children if c.pending):
-        _execute_ddl(conn, _detach_sql(parent, child, "FINALIZE"))
+        _execute_ddl(conn, _detach_sql(target.parent, child, "FINALIZE"))
         if expired(child):
             dropped.append(_drop_table(conn, child))
         else:
@@ -863,7 +887,7 @@ def _drop_months(
             )
     live = [c for c in children if not c.pending and expired(c)]
     for child in sorted(live, key=lambda c: c.upper or now):
-        _execute_ddl(conn, _detach_sql(parent, child, "CONCURRENTLY"))
+        _execute_ddl(conn, _detach_sql(target.parent, child, "CONCURRENTLY"))
         dropped.append(_drop_table(conn, child))
     return dropped
 
@@ -910,7 +934,7 @@ def _longest(limits: dict[int, timedelta | None], values: set[int]) -> timedelta
     return longest if values else None
 
 
-def _coverage(children: list[_Child], now: datetime) -> tuple[bool, int | None]:
+def _coverage(children: list[_Child], now: datetime) -> _Coverage:
     """Whether the current month is covered, and how many months after it."""
     live = [c for c in children if not c.pending]
     month = _months(now, 0)[0]
@@ -919,9 +943,9 @@ def _coverage(children: list[_Child], now: datetime) -> tuple[bool, int | None]:
         start, end = month_bounds(month)
         covering = next((c for c in live if c.covers(start, end)), None)
         if covering is None:
-            return months_ahead >= 0, max(months_ahead, 0)
+            return _Coverage(months_ahead >= 0, max(months_ahead, 0))
         if covering.upper is None:
-            return True, None
+            return _Coverage(True, None)
         months_ahead += 1
         month = end.date()
 
@@ -971,7 +995,7 @@ def _name(schema: str, name: str) -> str:
     return f"{schema}.{name}"
 
 
-def _shown_schemas(conn: Connection, tables: AuditTables) -> tuple[str, str]:
+def _shown_schemas(conn: Connection, tables: AuditTables) -> _ShownSchemas:
     """Schemas of the transaction and activity tables, for returned names.
 
     A table declared without a schema lives in the session's
@@ -979,11 +1003,11 @@ def _shown_schemas(conn: Connection, tables: AuditTables) -> tuple[str, str]:
     """
     declared = (tables.transaction.schema, tables.activity.schema)
     if None not in declared:
-        return str(declared[0]), str(declared[1])
+        return _ShownSchemas(str(declared[0]), str(declared[1]))
     current: str | None = conn.execute(text("SELECT current_schema()")).scalar_one()
     if current is None:
         raise PartitionError("no schema on the search_path holds the audit tables")
-    return declared[0] or current, declared[1] or current
+    return _ShownSchemas(declared[0] or current, declared[1] or current)
 
 
 def _lock_key(tables: AuditTables) -> str:
