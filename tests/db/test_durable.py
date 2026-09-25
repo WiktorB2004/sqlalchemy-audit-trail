@@ -205,7 +205,8 @@ def test_missing_severity_partition_is_created_and_retried(
 
     assert verbs(env) == [verb.value]
     assert "audit_activity_40" in partitions(engine, schema)
-    assert "created" in caplog.text and "retried once" in caplog.text
+    assert "created" in caplog.text
+    assert "retried once" in caplog.text
 
 
 @pytest.mark.parametrize("verb", [DurableEvent.DENIED, DurableEvent.LOCKED])

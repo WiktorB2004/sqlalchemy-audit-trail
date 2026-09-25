@@ -89,9 +89,9 @@ class _Expected:
 
     verb: str | Unset
     obj: _ObjectKey | Unset
-    target: _ObjectKey | None | Unset
-    actor_id: str | None | Unset
-    scope_id: str | None | Unset
+    target: _ObjectKey | Unset | None
+    actor_id: str | Unset | None
+    scope_id: str | Unset | None
     severity: int | Unset
     changes: Mapping[str, object] | Unset
     payload: Mapping[str, object] | Unset
@@ -109,8 +109,8 @@ class _Filters(NamedTuple):
     verb: str | Unset
     obj: object
     target: object
-    actor_id: str | None | Unset
-    scope_id: str | None | Unset
+    actor_id: str | Unset | None
+    scope_id: str | Unset | None
     severity: int | Unset
     changes: Mapping[str, object] | Unset
     payload: Mapping[str, object] | Unset
@@ -123,8 +123,8 @@ def assert_audited(
     verb: str | Unset = UNSET,
     obj: object = UNSET,
     target: object = UNSET,
-    actor_id: str | None | Unset = UNSET,
-    scope_id: str | None | Unset = UNSET,
+    actor_id: str | Unset | None = UNSET,
+    scope_id: str | Unset | None = UNSET,
     severity: int | Unset = UNSET,
     changes: Mapping[str, object] | Unset = UNSET,
     payload: Mapping[str, object] | Unset = UNSET,
@@ -179,8 +179,8 @@ def assert_not_audited(
     verb: str | Unset = UNSET,
     obj: object = UNSET,
     target: object = UNSET,
-    actor_id: str | None | Unset = UNSET,
-    scope_id: str | None | Unset = UNSET,
+    actor_id: str | Unset | None = UNSET,
+    scope_id: str | Unset | None = UNSET,
     severity: int | Unset = UNSET,
     changes: Mapping[str, object] | Unset = UNSET,
     payload: Mapping[str, object] | Unset = UNSET,
@@ -219,8 +219,8 @@ async def aassert_audited(
     verb: str | Unset = UNSET,
     obj: object = UNSET,
     target: object = UNSET,
-    actor_id: str | None | Unset = UNSET,
-    scope_id: str | None | Unset = UNSET,
+    actor_id: str | Unset | None = UNSET,
+    scope_id: str | Unset | None = UNSET,
     severity: int | Unset = UNSET,
     changes: Mapping[str, object] | Unset = UNSET,
     payload: Mapping[str, object] | Unset = UNSET,
@@ -261,8 +261,8 @@ async def aassert_not_audited(
     verb: str | Unset = UNSET,
     obj: object = UNSET,
     target: object = UNSET,
-    actor_id: str | None | Unset = UNSET,
-    scope_id: str | None | Unset = UNSET,
+    actor_id: str | Unset | None = UNSET,
+    scope_id: str | Unset | None = UNSET,
     severity: int | Unset = UNSET,
     changes: Mapping[str, object] | Unset = UNSET,
     payload: Mapping[str, object] | Unset = UNSET,

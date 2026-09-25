@@ -297,7 +297,7 @@ def test_compact_false_returns_rows_unchanged() -> None:
     raw = CASES[0].rows()
     result = compact_rows(raw, compact=False)
     assert result == raw
-    assert all(got is given for got, given in zip(result, raw))
+    assert all(got is given for got, given in zip(result, raw, strict=True))
 
 
 @pytest.mark.parametrize("case", CASES, ids=[case.name for case in CASES])

@@ -10,7 +10,7 @@ its timestamp.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, cast
@@ -418,7 +418,7 @@ def test_scrub_is_refused_without_allow_scrub(engine: Engine, schema: str) -> No
 
 def test_naive_since_is_refused(trail: AuditTrail) -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
-        trail.scrub("Doc", "1", since=datetime(2026, 3, 1))  # noqa: DTZ001
+        trail.scrub("Doc", "1", since=datetime(2026, 3, 1))
 
 
 def test_autocommit_engine_is_refused(engine: Engine, schema: str) -> None:
@@ -530,12 +530,10 @@ SessionMaker = Callable[[], Any]
 
 
 @pytest.fixture
-def sessions(
-    engine: Engine, trail: AuditTrail, models: Models
-) -> Iterator[SessionMaker]:
+def sessions(engine: Engine, trail: AuditTrail, models: Models) -> SessionMaker:
     factory = sessionmaker(engine)
     trail.install(factory)
-    yield factory
+    return factory
 
 
 def ann(**changes: Any) -> AuditContext:
@@ -776,14 +774,14 @@ async def test_async_scrub_is_refused_without_allow_scrub(
 
 
 async def test_sync_methods_refuse_an_async_engine(async_trail: AuditTrail) -> None:
-    with pytest.raises(TypeError, match="use ascrub$"):
+    with pytest.raises(TypeError, match=r"use ascrub$"):
         async_trail.scrub("Doc", "1")
     with pytest.raises(TypeError, match="use ascrub_actor"):
         async_trail.scrub_actor("u1")
 
 
 async def test_async_methods_refuse_a_sync_engine(trail: AuditTrail) -> None:
-    with pytest.raises(TypeError, match="use scrub$"):
+    with pytest.raises(TypeError, match=r"use scrub$"):
         await trail.ascrub("Doc", "1")
     with pytest.raises(TypeError, match="use scrub_actor"):
         await trail.ascrub_actor("u1")

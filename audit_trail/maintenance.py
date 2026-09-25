@@ -565,7 +565,7 @@ class PartitionManager:
         transaction_retention: timedelta | None = None,
         lock_timeout: str | None = "5s",
     ) -> list[str]:
-        """Drop expired partitions on an ``AUTOCOMMIT`` connection; see ``drop_expired``.
+        """Drop expired partitions in ``AUTOCOMMIT`` mode; see ``drop_expired``.
 
         Args:
             retention: Retention by severity value; ``None`` keeps forever.
@@ -743,7 +743,8 @@ def _ensure_months(
         name = month_partition_name(parent, month)
         if len(name.encode()) > MAX_IDENTIFIER_LENGTH:
             raise PartitionError(
-                f"cannot name the {month:%Y-%m} partition of {_name(shown_schema, parent)}: "
+                f"cannot name the {month:%Y-%m} partition of "
+                f"{_name(shown_schema, parent)}: "
                 f"{name!r} is longer than {MAX_IDENTIFIER_LENGTH} bytes and "
                 "PostgreSQL would truncate it; rename the parent partition"
             )

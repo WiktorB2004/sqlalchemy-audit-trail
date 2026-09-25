@@ -101,7 +101,7 @@ def test_encode_value_aware_time_keeps_offset() -> None:
 
 
 def test_encode_value_naive_datetime_gets_no_invented_offset() -> None:
-    naive = datetime(2026, 9, 25, 10, 30)  # noqa: DTZ001
+    naive = datetime(2026, 9, 25, 10, 30)
     assert encode_value(naive) == "2026-09-25T10:30:00"
 
 
@@ -145,7 +145,9 @@ def test_encode_value_set_is_not_encoded() -> None:
 
 
 def test_encode_value_non_str_dict_key_raises() -> None:
-    with pytest.raises(UnserializableValueError, match="dict key of type builtins.int"):
+    with pytest.raises(
+        UnserializableValueError, match=r"dict key of type builtins\.int"
+    ):
         encode_value({1: "a"})
 
 
@@ -160,7 +162,7 @@ def test_encode_value_uses_host_encoder_for_unknown_types() -> None:
 
 
 def test_encode_value_host_encoder_fallthrough_raises_with_type_name() -> None:
-    with pytest.raises(UnserializableValueError, match="builtins.object"):
+    with pytest.raises(UnserializableValueError, match=r"builtins\.object"):
         encode_value(object(), json_encoder=MoneyEncoder)
 
 
@@ -396,7 +398,7 @@ def test_pseudonymized_does_not_change_validation_or_schema() -> None:
         reason: str
 
     assert LoginFailed(login="a", reason="b").login == "a"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"LoginFailed\nlogin\n"):
         LoginFailed.model_validate({"login": 1, "reason": "b"})
     schema = LoginFailed.model_json_schema()
     assert schema["properties"] == Plain.model_json_schema()["properties"]

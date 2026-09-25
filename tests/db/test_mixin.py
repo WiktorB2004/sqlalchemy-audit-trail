@@ -92,10 +92,10 @@ def reset_fallback_warnings() -> Iterator[None]:
 
 
 @pytest.fixture
-def db(engine: Engine, schema: str) -> Iterator[Engine]:
+def db(engine: Engine, schema: str) -> Engine:
     bound = engine.execution_options(schema_translate_map={None: schema})
     Base.metadata.create_all(bound)
-    yield bound
+    return bound
 
 
 @pytest.fixture
@@ -148,7 +148,10 @@ def test_expired_attribute_falls_back_without_sql(
     messages = [record.getMessage() for record in caplog.records]
     assert len(messages) == 3
     for option, attribute, message in zip(
-        ("label", "scope", "target"), ("title", "company_id", "company_id"), messages
+        ("label", "scope", "target"),
+        ("title", "company_id", "company_id"),
+        messages,
+        strict=True,
     ):
         assert f"AuditOptions.{option} of Order read '{attribute}'" in message
 

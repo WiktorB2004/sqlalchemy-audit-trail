@@ -460,8 +460,8 @@ def test_cached_property_is_refused_with_a_clear_error() -> None:
     with pytest.raises(
         AuditOptionError,
         match=(
-            "AuditOptions.label of Account read 'cached_name': cached_property is "
-            "not supported in audit options; read the underlying column"
+            r"AuditOptions\.label of Account read 'cached_name': cached_property is "
+            r"not supported in audit options; read the underlying column"
         ),
     ):
         resolve_label(account(name="Acme"), options)

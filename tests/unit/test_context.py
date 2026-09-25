@@ -88,11 +88,16 @@ def test_set_actor_overwrites_all_actor_fields() -> None:
 
 def test_context_restores_previous_on_exit_and_error() -> None:
     outer = AuditContext(channel="cli")
-    with context(outer):
-        with pytest.raises(ValueError), context(channel="worker") as inner:
+
+    def fail_in_worker() -> None:
+        with context(channel="worker") as inner:
             assert current_context() is inner
             assert inner.channel == "worker"
-            raise ValueError
+            raise ValueError("worker failed")
+
+    with context(outer):
+        with pytest.raises(ValueError, match="worker failed"):
+            fail_in_worker()
         assert current_context() is outer
     assert current_context() is None
 

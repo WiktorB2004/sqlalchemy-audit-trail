@@ -6,7 +6,6 @@ import asyncio
 import subprocess
 import sys
 import uuid
-from collections.abc import Iterator
 from typing import NamedTuple
 
 import pytest
@@ -169,7 +168,8 @@ def test_concurrent_requests_get_their_own_context() -> None:
 
     asyncio.run(main())
     first, second = seen["0"], seen["1"]
-    assert first is not None and second is not None
+    assert first is not None
+    assert second is not None
     assert (first.user_agent, second.user_agent) == ("0", "1")
     assert first.request_id != second.request_id
 
@@ -327,8 +327,10 @@ def test_context_provider_prefers_a_nested_context() -> None:
 
     run(AuditMiddleware(app), http_scope())
     ((outer, inner),) = results
-    assert outer is not None and outer.channel == "api"
-    assert inner is not None and inner.actor_type == "system"
+    assert outer is not None
+    assert outer.channel == "api"
+    assert inner is not None
+    assert inner.actor_type == "system"
     assert context_provider() is None
 
 
@@ -344,17 +346,18 @@ def test_context_provider_falls_back_to_the_request_context() -> None:
 
     run(AuditMiddleware(app), http_scope())
     (provided,) = results
-    assert provided is not None and provided.path == "/items/1"
+    assert provided is not None
+    assert provided.path == "/items/1"
 
 
 # Session dependency
 
 
 @pytest.fixture
-def installed() -> Iterator[sessionmaker[Session]]:
+def installed() -> sessionmaker[Session]:
     factory = sessionmaker()
     AuditTrail(create_engine("postgresql+psycopg://localhost/unused")).install(factory)
-    yield factory
+    return factory
 
 
 def test_session_dependency_yields_and_tracks_the_session(
