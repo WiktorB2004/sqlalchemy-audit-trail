@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://wiktorb2004.github.io/sqlalchemy-audit-trail/
+    about: Install, quickstart, guides and API reference
+  - name: Security advisory
+    url: https://github.com/WiktorB2004/sqlalchemy-audit-trail/security/advisories/new
+    about: Report a vulnerability privately
