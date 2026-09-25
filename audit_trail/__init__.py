@@ -8,6 +8,7 @@ from audit_trail.context import Actor, AuditContext
 from audit_trail.diff import AuditOptionError, FieldPolicyError
 from audit_trail.events import AuditEvent, Severity, event
 from audit_trail.mixin import Audited
+from audit_trail.query import Cursor, Group, Page, TransactionHeader, Visibility
 from audit_trail.serialization import Pseudonymized
 
 try:
@@ -23,11 +24,16 @@ __all__ = [
     "AuditOptions",
     "AuditTrail",
     "Audited",
+    "Cursor",
     "FieldPolicyError",
+    "Group",
     "ModelIssue",
+    "Page",
     "Pseudonymized",
     "Severity",
     "Target",
+    "TransactionHeader",
+    "Visibility",
     "__version__",
     "check_models",
     "event",
