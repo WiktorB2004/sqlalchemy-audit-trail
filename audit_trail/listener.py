@@ -211,13 +211,22 @@ def _subclasses(cls: type[Any]) -> Iterable[type[Any]]:
 
 
 def _track_model(mapper: Mapper[_A], cls: type[_A]) -> None:
-    for name in options_of(cls).track_relationships:
+    # Runs inside mapper configuration, for every Audited model in the
+    # process: an exception here would leave SQLAlchemy's configuration
+    # failed for all models, so a bad name is skipped with a warning and
+    # check_models() reports it as an error.
+    for name in sorted(options_of(cls).track_relationships):
         prop = mapper.relationships.get(name)
-        if prop is None:
-            raise ValueError(
-                f"{cls.__qualname__}: track_relationships names {name!r}, "
-                "which is not a relationship"
+        if prop is None or not prop.uselist:
+            what = "not a relationship" if prop is None else "a scalar relationship"
+            logger.warning(
+                "%s: track_relationships names %r, which is %s; it is not "
+                "tracked (check_models() reports this)",
+                cls.__qualname__,
+                name,
+                what,
             )
+            continue
         # Tracked on the declaring class; tracking again from a subclass is a
         # no-op in track_relationships.
         track_relationships(getattr(prop.parent.class_, name))
