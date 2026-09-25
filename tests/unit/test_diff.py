@@ -24,6 +24,7 @@ from sqlalchemy.orm import (
     relationship,
 )
 from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.orm.session import make_transient_to_detached
 
 from audit_trail import diff
 from audit_trail.config import AuditOptions
@@ -122,6 +123,13 @@ def reset_fallback_warnings() -> Iterator[None]:
 def account(**values: Any) -> Account:
     values.setdefault("id", 1)
     return Account(**values)
+
+
+def persisted(**values: Any) -> Account:
+    """An account with an identity whose other attributes are not loaded."""
+    obj = account(**values)
+    make_transient_to_detached(obj)
+    return obj
 
 
 # --- object ids --------------------------------------------------------------
@@ -344,7 +352,7 @@ def test_label_reading_unloaded_attribute_falls_back_and_logs(
 ) -> None:
     options = AuditOptions(label=lambda obj: obj.name)
     with caplog.at_level(logging.WARNING, logger="audit_trail.diff"):
-        assert resolve_label(account(), options) is None
+        assert resolve_label(persisted(), options) is None
     [record] = caplog.records
     assert record.name == "audit_trail.diff"
     message = record.getMessage()
@@ -356,7 +364,7 @@ def test_label_reading_unloaded_attribute_falls_back_and_logs(
 def test_property_runs_against_the_proxy() -> None:
     options = AuditOptions(label=lambda obj: obj.shouting_name)
     assert resolve_label(account(name="acme"), options) == "ACME"
-    assert resolve_label(account(), options) is None
+    assert resolve_label(persisted(), options) is None
 
 
 def test_unloaded_related_object_falls_back() -> None:
@@ -388,7 +396,10 @@ def test_options_cannot_modify_the_instance() -> None:
 def test_scope_fallback_to_context_versus_explicit_none() -> None:
     obj = account(name="t1")
     assert resolve_scope(obj, AuditOptions()) is USE_CONTEXT
-    assert resolve_scope(obj, AuditOptions(scope=lambda o: o.parent_id)) is USE_CONTEXT
+    assert (
+        resolve_scope(persisted(), AuditOptions(scope=lambda o: o.parent_id))
+        is USE_CONTEXT
+    )
     assert resolve_scope(obj, AuditOptions(scope=lambda o: None)) is None
     assert resolve_scope(obj, AuditOptions(scope=lambda o: o.name)) == "t1"
 
@@ -415,9 +426,9 @@ def test_fallback_warning_is_logged_once_per_model_attribute_and_option(
     label = AuditOptions(label=lambda obj: obj.name)
     scope = AuditOptions(scope=lambda obj: obj.name)
     with caplog.at_level(logging.WARNING, logger="audit_trail.diff"):
-        assert resolve_label(account(), label) is None
-        assert resolve_label(account(id=2), label) is None
-        assert resolve_scope(account(), scope) is USE_CONTEXT
+        assert resolve_label(persisted(), label) is None
+        assert resolve_label(persisted(id=2), label) is None
+        assert resolve_scope(persisted(), scope) is USE_CONTEXT
     assert [record.getMessage().split(" read ")[0] for record in caplog.records] == [
         "AuditOptions.label of Account",
         "AuditOptions.scope of Account",
@@ -431,7 +442,7 @@ def test_repr_and_str_run_against_the_proxy() -> None:
     assert (
         resolve_label(account(name="Acme"), AuditOptions(label=str)) == "Account(Acme)"
     )
-    assert resolve_label(account(), AuditOptions(label=str)) is None
+    assert resolve_label(persisted(), AuditOptions(label=str)) is None
 
 
 def test_default_repr_describes_the_real_instance() -> None:
@@ -460,3 +471,35 @@ def test_dict_keyed_collection_items_are_wrapped() -> None:
     assert resolve_label(parent, options) == "first"
     unloaded = AuditOptions(label=lambda obj: obj.children["a"].parent_id)
     assert resolve_label(parent, unloaded) is None
+
+
+def test_unset_column_of_a_new_instance_reads_as_null(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    obj = account(name="t1")
+    with caplog.at_level(logging.WARNING, logger="audit_trail.diff"):
+        assert resolve_scope(obj, AuditOptions(scope=lambda o: o.parent_id)) is None
+        assert resolve_label(obj, AuditOptions(label=lambda o: o.api_token)) is None
+        assert (
+            resolve_target(obj, AuditOptions(target=lambda o: ("Parent", o.parent_id)))
+            is None
+        )
+    assert caplog.records == []
+
+
+def test_unset_server_default_column_of_a_new_instance_is_not_loaded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    obj = account()
+    with caplog.at_level(logging.WARNING, logger="audit_trail.diff"):
+        assert resolve_scope(obj, AuditOptions(scope=lambda o: o.marker)) is USE_CONTEXT
+    [record] = caplog.records
+    assert "'marker'" in record.getMessage()
+
+
+def test_unset_relationship_of_a_new_instance_is_not_loaded() -> None:
+    options = AuditOptions(label=lambda obj: obj.parent.title)
+    assert resolve_label(account(), options) is None
+    assert (
+        resolve_scope(account(), AuditOptions(scope=lambda o: o.parent)) is USE_CONTEXT
+    )
