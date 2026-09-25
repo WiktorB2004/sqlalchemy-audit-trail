@@ -15,8 +15,9 @@ same (or wider) bounds, counts as present. Names and bounds are described in
 
 Locking: ``CREATE TABLE ... PARTITION OF`` takes an ``ACCESS EXCLUSIVE`` lock
 on the parent, so it waits for every open transaction that has touched the
-parent, including business transactions with uncommitted audit rows, and
-while it waits every new audit insert queues behind it. ``lock_timeout``
+parent, including business transactions with uncommitted audit rows. Under
+PostgreSQL's documented lock queueing, later lock requests that conflict with
+the waiting one, such as new audit inserts, queue behind it. ``lock_timeout``
 bounds that wait: past it the whole call is rolled back and
 ``PartitionLockTimeoutError`` is raised; retrying later is safe.
 """
@@ -33,16 +34,16 @@ from sqlalchemy import Connection, Engine, bindparam, text
 from sqlalchemy.exc import DBAPIError
 
 from audit_trail.migrations import (
+    _execute_ddl,
     create_month_partition_sql,
     create_severity_partition_sql,
-    execute_ddl,
     month_bounds,
     month_partition_name,
     qualified_name,
     severity_partition_name,
     severity_values,
 )
-from audit_trail.tables import AuditTables
+from audit_trail.tables import MAX_IDENTIFIER_LENGTH, AuditTables
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -148,7 +149,9 @@ def ensure_partitions(
     Raises:
         ValueError: If ``months_ahead`` is negative or the connection is in
             ``AUTOCOMMIT`` mode.
-        PartitionError: If a parent table does not exist.
+        PartitionError: If a parent table does not exist, or a monthly
+            partition name derived from an existing severity partition would
+            be longer than PostgreSQL allows.
         PartitionLockTimeoutError: If a lock was not granted within
             ``lock_timeout``; the transaction must be rolled back.
     """
@@ -286,7 +289,7 @@ def _ensure(
         child = by_severity.get(value)
         if child is None:
             name = severity_partition_name(activity.name, value)
-            execute_ddl(conn, create_severity_partition_sql(tables, value, name))
+            _execute_ddl(conn, create_severity_partition_sql(tables, value, name))
             created.append(f"{schema}.{name}")
             created += _ensure_months(conn, schema, name, None, months)
         elif child.relkind == "p":
@@ -312,7 +315,13 @@ def _ensure_months(
         if any(child.covers(start, end) for child in existing):
             continue
         name = month_partition_name(parent, month)
-        execute_ddl(conn, create_month_partition_sql(schema, parent, month, name))
+        if len(name.encode()) > MAX_IDENTIFIER_LENGTH:
+            raise PartitionError(
+                f"cannot name the {month:%Y-%m} partition of {schema}.{parent}: "
+                f"{name!r} is longer than {MAX_IDENTIFIER_LENGTH} bytes and "
+                "PostgreSQL would truncate it; rename the parent partition"
+            )
+        _execute_ddl(conn, create_month_partition_sql(schema, parent, month, name))
         created.append(f"{schema}.{name}")
     return created
 

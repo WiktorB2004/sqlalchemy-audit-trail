@@ -193,6 +193,25 @@ def test_severity_partition_under_other_name_is_reused(
     assert ensure(engine, tables, severities=[10, 20, 30, 40], months_ahead=1) == []
 
 
+def test_too_long_month_name_under_user_partition_is_rejected(
+    engine: Engine, schema: str
+) -> None:
+    tables = build_tables(schema=schema)
+    long_name = "s" * 55  # + "_p2026_09" is 64 bytes, one over the limit
+    with engine.begin() as conn:
+        create_audit_tables(conn, tables, [])
+        conn.exec_driver_sql(
+            f"CREATE TABLE {schema}.{long_name} PARTITION OF "
+            f"{qualified_name(schema, 'audit_activity')} "
+            "FOR VALUES IN (10) PARTITION BY RANGE (created_at)"
+        )
+
+    with pytest.raises(PartitionError, match=f"{long_name}_p2026_09"):
+        ensure(engine, tables, severities=[10])
+    with engine.begin() as conn:
+        assert not [n for n in partitions(conn, schema) if "_p2026_" in n]
+
+
 def test_new_severity_is_added(
     engine: Engine, tables: AuditTables, schema: str
 ) -> None:

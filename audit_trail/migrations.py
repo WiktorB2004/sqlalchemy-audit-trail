@@ -269,7 +269,7 @@ def create_audit_tables(
         severities: A severity ``IntEnum`` class, or any iterable of ints.
     """
     for statement in create_statements(tables, severities):
-        execute_ddl(connection, statement)
+        _execute_ddl(connection, statement)
 
 
 def drop_audit_tables(connection: Connection, tables: AuditTables) -> None:
@@ -280,10 +280,10 @@ def drop_audit_tables(connection: Connection, tables: AuditTables) -> None:
         tables: The audit tables.
     """
     for statement in drop_statements(tables):
-        execute_ddl(connection, statement)
+        _execute_ddl(connection, statement)
 
 
-def execute_ddl(connection: Connection, statement: str) -> None:
+def _execute_ddl(connection: Connection, statement: str) -> None:
     """Execute one DDL statement from this module as-is.
 
     The statement goes to the driver without parameters, so ``%`` and ``:``
