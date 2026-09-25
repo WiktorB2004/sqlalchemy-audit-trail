@@ -4,6 +4,8 @@
 
 - `PartitionManager.drop_expired()`: drops monthly partitions past their per-severity retention with `DETACH ... CONCURRENTLY`, finishing interrupted detaches; `PartitionManager.health()` reports partition coverage ahead, pending detaches and orphaned tables
 - `ensure_partitions()` works with tables declared without a schema and returns schema-qualified names
+- Renovate opens pull requests for dependency and GitHub Actions updates
+- `check_models()`: static checks for CI that report sensitive-looking columns without an audit policy, JSON columns whose in-place changes go undetected, relationships tracked on both sides, and tracked names that are not collection relationships
 
 ## 0.1.0a1 - 2026-09-25
 
