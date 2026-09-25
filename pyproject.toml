@@ -60,7 +60,7 @@ dev = [
     "pydantic>=2",
     "pytest",
     "pytest-asyncio",
-    "ruff==0.16.8",
+    "ruff==0.16.9",
     "sqlalchemy[asyncio]",
     "testcontainers[postgres]>=4.8",
 ]
