@@ -8,6 +8,7 @@ will.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -32,11 +33,14 @@ from audit_trail.config import AuditOptions
 from audit_trail.diff import (
     REDACTED,
     UNKNOWN,
+    USE_CONTEXT,
     ChangeKind,
     Changes,
     entity_changes,
     object_id_for,
     object_id_of,
+    resolve_label,
+    resolve_scope,
 )
 from audit_trail.mixin import Audited, refresh_snapshot
 from audit_trail.serialization import KeyRing, hash_value
@@ -361,3 +365,40 @@ def test_snapshot_change_restored_in_place_writes_nothing(
     item.snapped["a"] = 1
     session.flush()
     assert recorder.take() == []
+
+
+def test_options_see_unset_columns_of_an_inserted_instance_as_null(
+    session: Session, caplog: pytest.LogCaptureFixture
+) -> None:
+    seen: list[object] = []
+
+    def after_flush(session: Session, flush_context: UOWTransaction) -> None:
+        for obj in session.new:
+            seen.append(resolve_label(obj, AuditOptions(label=lambda o: o.name)))
+            seen.append(resolve_scope(obj, AuditOptions(scope=lambda o: o.notes)))
+            seen.append(resolve_scope(obj, AuditOptions(scope=lambda o: o.marker)))
+
+    event.listen(session, "after_flush", after_flush)
+    with caplog.at_level(logging.WARNING, logger="audit_trail.diff"):
+        session.add(Item(id=1))
+        session.flush()
+    # marker's server default is fetched back by the INSERT (eager_defaults).
+    assert seen == [None, None, "x"]
+    assert caplog.records == []
+
+
+def test_options_fall_back_for_expired_attributes_of_a_persistent_instance(
+    session: Session, recorder: Recorder
+) -> None:
+    item = add_item(session, recorder, name="a", notes="n")
+    seen: list[object] = []
+
+    def after_flush(session: Session, flush_context: UOWTransaction) -> None:
+        for obj in session.dirty:
+            # Setting amount reloads the expired row, but not the deferred notes.
+            seen.append(resolve_scope(obj, AuditOptions(scope=lambda o: o.notes)))
+
+    event.listen(session, "after_flush", after_flush)
+    item.amount = Decimal("1.00")
+    session.flush()
+    assert seen == [USE_CONTEXT]
