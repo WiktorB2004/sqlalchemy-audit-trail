@@ -310,7 +310,7 @@ def test_rotation_writes_with_highest_version() -> None:
 
 def test_rotation_old_tokens_verify_with_kept_key() -> None:
     old_hash = hash_value("x", keys=KeyRing(KEY_V1))
-    old_pseudonym = pseudonymize("x", purpose="p", keys=KeyRing(KEY_V1))
+    old_pseudonym = pseudonymize("x", purpose="login_attempt", keys=KeyRing(KEY_V1))
     ring = KeyRing({1: KEY_V1, 2: KEY_V2})
     assert verify(old_hash, "x", keys=ring)
     assert verify(old_pseudonym, "x", keys=ring)
