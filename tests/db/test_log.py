@@ -178,6 +178,7 @@ def test_targets_and_context_scope(env: Env, models: Models) -> None:
         env.trail.log(session, LogEvent.VIEWED, target=folder)
         env.trail.log(session, LogEvent.VIEWED, target=("Order", ("a", 1)))
         env.trail.log(session, LogEvent.VIEWED, target=("Order", 7))
+        env.trail.log(session, LogEvent.VIEWED, target=("Order", None))
         session.commit()
 
     rows = logged(env)
@@ -185,6 +186,7 @@ def test_targets_and_context_scope(env: Env, models: Models) -> None:
         ("Folder", "3"),
         ("Order", '["a","1"]'),
         ("Order", "7"),
+        (None, None),
     ]
     assert {r["object_type"] for r in rows} == {None}
     assert {r["scope_id"] for r in rows} == {"ctx"}

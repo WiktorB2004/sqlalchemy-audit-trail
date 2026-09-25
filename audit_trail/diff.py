@@ -588,7 +588,20 @@ def resolve_target(obj: object, options: AuditOptions) -> tuple[str, str] | None
     ok, value = _call_option(obj, "target", options.target)
     if not ok or value is None:
         return None
-    target_type, target_id = value
+    return format_target(value)
+
+
+def format_target(target: tuple[str, object]) -> tuple[str, str] | None:
+    """Format a ``(type, id)`` pair as stored in ``target_type``/``target_id``.
+
+    Args:
+        target: The type name and the id; a tuple id is a composite key.
+
+    Returns:
+        ``(target_type, target_id)`` with the id formatted like an
+        ``object_id``, or ``None`` when the id is ``None``.
+    """
+    target_type, target_id = target
     if target_id is None:
         return None
     ids = target_id if isinstance(target_id, tuple) else (target_id,)

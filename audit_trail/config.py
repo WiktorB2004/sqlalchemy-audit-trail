@@ -253,8 +253,9 @@ class AuditTrail:
                 ``scope_id`` and the default target. It must have a primary
                 key: flush a new object first.
             target: The parent object, as an instance or ``(type, id)``. A
-                tuple id is formatted as a composite ``object_id``. Defaults
-                to the ``target`` option of ``obj``.
+                tuple id is formatted as a composite ``object_id``; an id of
+                ``None`` means no target. Defaults to the ``target`` option
+                of ``obj``.
             payload: The payload, validated against the event's schema.
                 ``Pseudonymized`` fields of a schema are pseudonymized with
                 their field name as the purpose.
@@ -277,7 +278,7 @@ class AuditTrail:
         """
         from audit_trail.diff import (
             USE_CONTEXT,
-            _format_identity,
+            format_target,
             object_type_of,
             options_of,
             resolve_label,
@@ -322,9 +323,7 @@ class AuditTrail:
                 scope_id = scope
             target_type, target_id = resolve_target(obj, options) or (None, None)
         if isinstance(target, tuple):
-            given_type, given_id = target
-            ids = given_id if isinstance(given_id, tuple) else (given_id,)
-            target_type, target_id = str(given_type), _format_identity(ids)
+            target_type, target_id = format_target(target) or (None, None)
         elif target is not None:
             target_type = object_type_of(target)
             target_id = _required_id(target, "target")
