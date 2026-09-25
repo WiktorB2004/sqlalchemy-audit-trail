@@ -18,16 +18,20 @@ the session fires no ``remove`` on that parent.
 
 from __future__ import annotations
 
-import json
+from collections.abc import Iterable
 from typing import Any, NamedTuple, TypedDict, cast
 
 from sqlalchemy import event, inspect
 from sqlalchemy.orm import (
+    AttributeEventToken,
     InstanceState,
     InstrumentedAttribute,
     RelationshipProperty,
     Session,
 )
+from sqlalchemy.orm.attributes import instance_state
+
+from audit_trail.diff import state_object_id
 
 __all__ = [
     "RelationshipChange",
@@ -93,7 +97,7 @@ def _delta(state: InstanceState[Any], key: str) -> _Delta:
     return store.setdefault(key, _Delta())
 
 
-def _on_expire(state: InstanceState[Any], attrs: Any) -> None:
+def _on_expire(state: InstanceState[Any], attrs: Iterable[str] | None) -> None:
     # Rollback, savepoint rollback, expire() and refresh() all throw away the
     # ORM's unflushed collection state; the deltas describing it go too.
     store: dict[str, _Delta] | None = state.info.get(_INFO_KEY)
@@ -148,11 +152,15 @@ def track_relationships(*attributes: InstrumentedAttribute[Any]) -> None:
 def _listen(attr: InstrumentedAttribute[Any], key: str) -> None:
     # The key comes from the closure, not from ``initiator.key``: an event
     # triggered through a backref carries the other side's token.
-    def on_append(state: InstanceState[Any], value: Any, initiator: Any) -> None:
-        _delta(state, key).append(inspect(value))
+    def on_append(
+        state: InstanceState[Any], value: object, initiator: AttributeEventToken
+    ) -> None:
+        _delta(state, key).append(instance_state(value))
 
-    def on_remove(state: InstanceState[Any], value: Any, initiator: Any) -> None:
-        _delta(state, key).remove(inspect(value))
+    def on_remove(
+        state: InstanceState[Any], value: object, initiator: AttributeEventToken
+    ) -> None:
+        _delta(state, key).remove(instance_state(value))
 
     event.listen(attr, "append", on_append, raw=True, propagate=True)
     event.listen(attr, "remove", on_remove, raw=True, propagate=True)
@@ -208,29 +216,7 @@ def discard_relationship_changes(session: Session) -> None:
 def _object_ids(states: dict[InstanceState[Any], None]) -> list[str]:
     ids = []
     for state in states:
-        identity = _primary_key(state)
-        if identity is not None:
-            ids.append(_object_id(identity))
+        object_id = state_object_id(state)
+        if object_id is not None:
+            ids.append(object_id)
     return ids
-
-
-def _primary_key(state: InstanceState[Any]) -> tuple[Any, ...] | None:
-    if state.key is not None:
-        return state.key[1]
-    # Objects inserted by the current flush get their identity key only after
-    # after_flush; their primary key values are already in the instance dict.
-    mapper = state.mapper
-    values = tuple(
-        state.dict.get(mapper.get_property_by_column(column).key)
-        for column in mapper.primary_key
-    )
-    return None if any(value is None for value in values) else values
-
-
-def _object_id(identity: tuple[Any, ...]) -> str:
-    # Temporary local copy of the object_id format until the public
-    # object_id_of helper lands: single-column key -> str(pk), composite key
-    # -> canonical JSON array of strings.
-    if len(identity) == 1:
-        return str(identity[0])
-    return json.dumps([str(v) for v in identity], separators=(",", ":"))
