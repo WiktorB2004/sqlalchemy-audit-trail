@@ -46,6 +46,7 @@ asyncpg = ["asyncpg>=0.29", "sqlalchemy[asyncio]>=2.0,<2.2"]
 Homepage = "https://github.com/WiktorB2004/sqlalchemy-audit-trail"
 Repository = "https://github.com/WiktorB2004/sqlalchemy-audit-trail"
 Issues = "https://github.com/WiktorB2004/sqlalchemy-audit-trail/issues"
+Documentation = "https://wiktorb2004.github.io/sqlalchemy-audit-trail/"
 Changelog = "https://github.com/WiktorB2004/sqlalchemy-audit-trail/blob/main/CHANGELOG.md"
 
 [dependency-groups]
@@ -62,6 +63,10 @@ dev = [
     "ruff==0.16.8",
     "sqlalchemy[asyncio]",
     "testcontainers[postgres]>=4.8",
+]
+docs = [
+    "mkdocs-material>=9.6",
+    "mkdocstrings[python]>=0.29",
 ]
 
 [build-system]
