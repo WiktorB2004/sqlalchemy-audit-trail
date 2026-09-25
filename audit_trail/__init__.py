@@ -10,6 +10,7 @@ from audit_trail.events import AuditEvent, Severity, event
 from audit_trail.mixin import Audited
 from audit_trail.query import Cursor, Group, Page, TransactionHeader, Visibility
 from audit_trail.serialization import Pseudonymized
+from audit_trail.writer import AuditWriteError
 
 try:
     __version__ = version("sqlalchemy-audit-trail")
@@ -23,6 +24,7 @@ __all__ = [
     "AuditOptionError",
     "AuditOptions",
     "AuditTrail",
+    "AuditWriteError",
     "Audited",
     "Cursor",
     "FieldPolicyError",

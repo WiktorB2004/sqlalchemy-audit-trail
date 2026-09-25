@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -33,11 +33,15 @@ from sqlalchemy.orm import (
 from audit_trail import Actor, AuditContext, Audited, AuditOptions
 from audit_trail.serialization import UnserializableValueError
 from tests.db.listener_support import (
+    SESSION_KINDS,
     Env,
+    SessionKind,
     Sev,
     create_trail,
+    each_session_kind,
     make_env,
     record_statements,
+    session_kind,
 )
 
 
@@ -128,9 +132,17 @@ def models(engine: Engine, schema: str) -> Models:
     return Models(User, Tag, Post, Comment, Note, Blob)
 
 
+@pytest.fixture(params=SESSION_KINDS)
+async def kind(
+    request: pytest.FixtureRequest, engine: Engine
+) -> AsyncIterator[SessionKind]:
+    async with session_kind(request.param, engine) as value:
+        yield value
+
+
 @pytest.fixture
-def env(engine: Engine, schema: str, models: Models) -> Env:
-    return make_env(engine, schema)
+def env(engine: Engine, schema: str, models: Models, kind: SessionKind) -> Env:
+    return make_env(engine, schema, kind)
 
 
 def only(rows: list[Any]) -> Any:
@@ -138,6 +150,7 @@ def only(rows: list[Any]) -> Any:
     return rows[0]
 
 
+@each_session_kind
 def test_created_entry(env: Env, models: Models) -> None:
     with env.factory() as session:
         post = models.Post(
@@ -174,6 +187,7 @@ def test_created_entry(env: Env, models: Models) -> None:
     assert transaction["actor_type"] == "anonymous"
 
 
+@each_session_kind
 def test_updated_entry_has_only_net_changes(env: Env, models: Models) -> None:
     with env.factory() as session:
         post = models.Post(title="a", price=Decimal("1.5"))
@@ -192,6 +206,7 @@ def test_updated_entry_has_only_net_changes(env: Env, models: Models) -> None:
     assert len(env.transactions()) == 2
 
 
+@each_session_kind
 def test_deleted_entry(env: Env, models: Models) -> None:
     with env.factory() as session:
         post = models.Post(title="gone", tenant="t1")
@@ -209,6 +224,7 @@ def test_deleted_entry(env: Env, models: Models) -> None:
     assert row["data"]["changes"]["tenant"] == ["t1", None]
 
 
+@each_session_kind
 def test_severity_target_and_context_scope(env: Env, models: Models) -> None:
     with env.factory() as session:
         env.trail.bind(session, AuditContext(scope_id="ctx-scope"))
@@ -232,6 +248,7 @@ def test_severity_target_and_context_scope(env: Env, models: Models) -> None:
     assert post_row["scope_id"] is None  # the option returned None: no scope
 
 
+@each_session_kind
 def test_relationship_changes(env: Env, models: Models) -> None:
     with env.factory() as session:
         tags = [models.Tag(id=1), models.Tag(id=2)]
@@ -254,6 +271,7 @@ def test_relationship_changes(env: Env, models: Models) -> None:
     assert "tags" not in deleted["data"]["changes"]
 
 
+@each_session_kind
 def test_context_actor_and_meta(env: Env, models: Models) -> None:
     ctx = AuditContext(
         actor_type="system",
@@ -280,6 +298,7 @@ def test_context_actor_and_meta(env: Env, models: Models) -> None:
     }
 
 
+@each_session_kind
 def test_actor_label_survives_deleting_the_user(env: Env, models: Models) -> None:
     with env.factory() as session:
         user = models.User(id=7, email="a@b.pl")
@@ -299,6 +318,7 @@ def test_actor_label_survives_deleting_the_user(env: Env, models: Models) -> Non
     assert row["data"]["context"]["actor_label"] == "a@b.pl"
 
 
+@each_session_kind
 def test_only_installed_sessions_are_audited(
     engine: Engine, env: Env, models: Models
 ) -> None:
@@ -335,8 +355,11 @@ def test_session_subclass_install_covers_its_factories(
     assert only(env.activities())["verb"] == "entity.created"
 
 
-def test_global_redact(engine: Engine, schema: str, models: Models) -> None:
-    env = make_env(engine, schema, global_redact={"password"})
+@each_session_kind
+def test_global_redact(
+    engine: Engine, schema: str, models: Models, kind: SessionKind
+) -> None:
+    env = make_env(engine, schema, kind, global_redact={"password"})
     with env.factory() as session:
         session.add(models.Post(title="x", password="hunter2"))
         session.commit()
@@ -345,6 +368,7 @@ def test_global_redact(engine: Engine, schema: str, models: Models) -> None:
     assert changes["title"] == [None, "x"]
 
 
+@each_session_kind
 def test_snapshot_is_refreshed_after_each_flush(env: Env, models: Models) -> None:
     with env.factory() as session:
         post = models.Post(title="x", settings={"a": 1})
@@ -361,6 +385,7 @@ def test_snapshot_is_refreshed_after_each_flush(env: Env, models: Models) -> Non
     assert second["data"]["changes"] == {"settings": [{"a": 2}, {"a": 3}]}
 
 
+@each_session_kind
 def test_expired_attributes_after_commit(env: Env, models: Models) -> None:
     with env.factory() as session:
         post = models.Post(title="old", price=Decimal(1))
@@ -372,6 +397,7 @@ def test_expired_attributes_after_commit(env: Env, models: Models) -> None:
     assert env.activities()[1]["data"]["changes"] == {"title": ["old", "new"]}
 
 
+@each_session_kind
 def test_deleting_an_expired_instance(env: Env, models: Models) -> None:
     # The flush reloads an expired instance before deleting it, so after_flush
     # sees its values; a deferred column is not loaded and stays unknown.
@@ -387,6 +413,7 @@ def test_deleting_an_expired_instance(env: Env, models: Models) -> None:
     assert changes["body"] == ["<unknown>", None]
 
 
+@each_session_kind
 def test_after_flush_emits_no_sql_besides_audit_inserts(
     env: Env, models: Models, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -434,6 +461,7 @@ def test_after_flush_emits_no_sql_besides_audit_inserts(
     assert "AuditOptions.label of" in caplog.text
 
 
+@each_session_kind
 def test_orm_cascade_and_passive_deletes(env: Env, models: Models) -> None:
     with env.factory() as session:
         post = models.Post(title="p")
@@ -457,6 +485,7 @@ def test_orm_cascade_and_passive_deletes(env: Env, models: Models) -> None:
         assert conn.execute(select(models.Note.__table__)).all() == []
 
 
+@each_session_kind
 def test_one_row_per_flush_and_object(env: Env, models: Models) -> None:
     with env.factory() as session:
         post = models.Post(title="a")
@@ -482,10 +511,11 @@ def test_one_row_per_flush_and_object(env: Env, models: Models) -> None:
 
 
 @pytest.mark.parametrize("on_error", ["log", "raise"])
+@each_session_kind
 def test_serialization_errors_propagate(
-    engine: Engine, schema: str, models: Models, on_error: str
+    engine: Engine, schema: str, models: Models, kind: SessionKind, on_error: str
 ) -> None:
-    env = make_env(engine, schema, on_error=on_error)
+    env = make_env(engine, schema, kind, on_error=on_error)
     with env.factory() as session:
         session.add(models.Blob(value={1, 2}))
         with pytest.raises(UnserializableValueError):
@@ -505,6 +535,7 @@ def failing_label(models: Models) -> Iterator[None]:
 
 
 @pytest.mark.usefixtures("failing_label")
+@each_session_kind
 def test_label_errors_propagate_in_log_mode(env: Env, models: Models) -> None:
     with env.factory() as session:
         session.add(models.Post(title="x"))

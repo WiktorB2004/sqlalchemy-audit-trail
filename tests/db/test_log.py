@@ -209,13 +209,11 @@ def test_obj_and_target_need_a_primary_key(env: Env, models: Models) -> None:
     [
         ({"event": UnregisteredEvent.OTHER}, UnknownEventError, "Unknown audit event"),
         ({"event": Crud.CREATED}, ValueError, "reserved"),
-        ({"event": LogEvent.DENIED}, NotImplementedError, "durable writes"),
         (
-            {"event": LogEvent.VIEWED, "durable": True},
-            NotImplementedError,
-            "durable writes",
+            {"event": LogEvent.LOCKED, "durable": False},
+            ValueError,
+            "durable=False cannot weaken it",
         ),
-        ({"event": LogEvent.LOCKED}, NotImplementedError, "durable writes"),
     ],
 )
 def test_refused_events(
