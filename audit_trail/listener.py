@@ -286,7 +286,7 @@ class _Listener:
             return None
         options = options_of(type(obj))
         scope = resolve_scope(obj, options)
-        target = resolve_target(obj, options)
+        target_type, target_id = resolve_target(obj, options) or (None, None)
         event_ = _VERBS[kind]
         return {
             "verb": event_.value,
@@ -294,8 +294,8 @@ class _Listener:
             "object_type": object_type_of(obj),
             "object_id": object_id_of(obj),
             "object_label": resolve_label(obj, options),
-            "target_type": None if target is None else target[0],
-            "target_id": None if target is None else target[1],
+            "target_type": target_type,
+            "target_id": target_id,
             "actor_id": ctx.actor_id,
             "scope_id": ctx.scope_id if scope is USE_CONTEXT else scope,
             "data": {"v": ENVELOPE_VERSION, "changes": changes, "context": context},
