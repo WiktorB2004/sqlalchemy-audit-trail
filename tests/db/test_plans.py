@@ -36,6 +36,8 @@ MONTHS = ["2026_01", "2026_02", "2026_03", "2026_04"]
 PER_MONTH = 2000
 CURSOR = Cursor(datetime(2026, 2, 20, tzinfo=timezone.utc) - timedelta(minutes=100), 0)
 LIMIT = 5
+# A window ending at the cursor's time starts in February too.
+WINDOW = timedelta(days=10)
 
 
 @pytest.fixture
@@ -91,6 +93,26 @@ async def alist_page(query: AuditQuery, session: AsyncSession) -> None:
     assert len(page.groups) == LIMIT
 
 
+def windowed_page(query: AuditQuery, session: Session, first: bool) -> None:
+    # The first page anchors the default window at `until`; a later page
+    # takes the bound from its cursor, whatever the query's window.
+    if first:
+        windowed = AuditQuery(query.tables, query.severities, default_window=WINDOW)
+        page = windowed.list_groups(
+            session, severities={Sev.HIGH}, until=CURSOR.created_at, limit=LIMIT
+        )
+    else:
+        cursor = CURSOR._replace(since=CURSOR.created_at - WINDOW)
+        page = query.list_groups(
+            session, severities={Sev.HIGH}, cursor=cursor, limit=LIMIT
+        )
+    assert len(page.groups) == LIMIT
+
+
+async def awindowed_page(query: AuditQuery, session: AsyncSession, first: bool) -> None:
+    await session.run_sync(lambda sync: windowed_page(query, sync, first))
+
+
 def plans_of(notices: list[str]) -> dict[str, dict[str, Any]]:
     """Plans of the auto_explain notices, keyed by statement kind."""
     plans: dict[str, dict[str, Any]] = {}
@@ -134,6 +156,36 @@ def check_plans(notices: list[str]) -> None:
     assert relations(plans["transaction"]) == {"audit_transaction_p2026_02"}
 
 
+def check_windowed_plans(notices: list[str], first: bool) -> None:
+    plans = plans_of(notices)
+    expected = {"stage 1", "stage 2", "transaction"}
+    assert set(plans) == (expected if first else {"boundary", *expected})
+    for plan in plans.values():
+        check_custom(plan)
+
+    # January is before the window: pruned at plan time, not merely unread.
+    stage_one = plans["stage 1"]
+    assert not [node for node in nodes(stage_one) if node["Node Type"] == "Sort"]
+    assert relations(stage_one) == {"audit_activity_40_p2026_02"}
+    assert relations(plans["stage 2"]) == {
+        "audit_activity_10_p2026_02",
+        "audit_activity_40_p2026_02",
+    }
+    assert relations(plans["transaction"]) == {"audit_transaction_p2026_02"}
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["first", "cursor"])
+@pytest.mark.parametrize("mode", MODES)
+def test_windowed_sixth_execution_psycopg(
+    query: AuditQuery, database_url: str, mode: str, first: bool
+) -> None:
+    notices = sixth_execution(
+        database_url, mode, lambda session: windowed_page(query, session, first)
+    )
+
+    check_windowed_plans(notices, first)
+
+
 @pytest.mark.parametrize("mode", MODES)
 def test_sixth_execution_psycopg(
     query: AuditQuery, database_url: str, mode: str
@@ -166,3 +218,15 @@ async def test_sixth_execution_async(
     )
 
     check_plans(notices)
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["first", "cursor"])
+@pytest.mark.parametrize("mode", MODES)
+async def test_windowed_sixth_execution_async(
+    query: AuditQuery, plan_engine: AsyncEngine, mode: str, first: bool
+) -> None:
+    notices = await asixth_execution(
+        plan_engine, mode, lambda session: awindowed_page(query, session, first)
+    )
+
+    check_windowed_plans(notices, first)

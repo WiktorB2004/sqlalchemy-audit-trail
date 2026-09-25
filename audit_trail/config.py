@@ -30,7 +30,7 @@ from audit_trail.serialization import pseudonymize as _pseudonymize
 from audit_trail.tables import build_tables
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     from pydantic import BaseModel
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -152,6 +152,10 @@ class AuditTrail:
             and retry once. Needs DDL privileges.
         allow_scrub: Enable ``scrub``/``scrub_actor``. They run on ``engine``,
             whose role then needs ``UPDATE`` on the audit tables.
+        default_query_window: How far back ``query.list_groups`` reads when
+            it is not given ``since``, for example ``timedelta(days=30)``;
+            ``since=ALL_HISTORY`` still lists the whole log. ``None`` reads
+            the whole log, which gets slower as it grows.
 
     Attributes:
         severities: The severity enum in use.
@@ -165,9 +169,11 @@ class AuditTrail:
 
     Raises:
         EventRegistryError: An event or a severity setting is invalid.
-        ValueError: A table name or an index key is invalid, or
-            ``pseudonymize_key`` is too short.
-        TypeError: ``pseudonymize_key`` has the wrong type.
+        ValueError: A table name or an index key is invalid,
+            ``pseudonymize_key`` is too short, or ``default_query_window`` is
+            not positive.
+        TypeError: ``pseudonymize_key`` or ``default_query_window`` has the
+            wrong type.
     """
 
     context = staticmethod(_context)
@@ -194,6 +200,7 @@ class AuditTrail:
         warn_on_bulk: bool = True,
         auto_create_partitions: bool = False,
         allow_scrub: bool = False,
+        default_query_window: timedelta | None = None,
     ) -> None:
         self.engine = engine
         self.schema = schema
@@ -225,7 +232,9 @@ class AuditTrail:
         self.maintenance = PartitionManager(engine, self.tables, self.severities)
         from audit_trail.query import AuditQuery
 
-        self.query = AuditQuery(self.tables, self.severities)
+        self.query = AuditQuery(
+            self.tables, self.severities, default_window=default_query_window
+        )
 
     def install(
         self,

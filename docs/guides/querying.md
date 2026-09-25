@@ -31,7 +31,7 @@ Filters (all optional, keyword-only):
 | Argument | Selects entries |
 |---|---|
 | `severities` | with one of these severity values; `None` means every configured severity |
-| `since`, `until` | with `since <= created_at < until`; timezone-aware datetimes |
+| `since`, `until` | with `since <= created_at < until`; timezone-aware datetimes. `since=ALL_HISTORY` sets no lower bound (see [the default window](#the-default-time-window)) |
 | `actor_id` | of this actor |
 | `object_type`, `object_id` | on this object type or object |
 | `target_type`, `target_id` | whose parent is this type or object |
@@ -46,6 +46,64 @@ For collection filters, `None` means no restriction and an empty collection matc
 Paging: pass `cursor=page.next_cursor` to get the next page. A transaction appears on exactly one page, and the listing ends only when `next_cursor` is `None`: a page may hold fewer than `limit` groups even when more follow. To hand a cursor to a client, use `Cursor.encode()` and `Cursor.decode(token)`.
 
 Give a time window (`since`) when you can. A query without one reads the indexes of every monthly partition of the requested severities.
+
+### The default time window
+
+Rather than passing `since` everywhere, configure a default window:
+
+```python
+from datetime import timedelta
+
+audit = AuditTrail(engine, default_query_window=timedelta(days=30))
+```
+
+`list_groups()` without `since` then lists the entries of the last 30 days: from `until` (or now) minus the window. The default is `None`, which reads the whole log. `since` decides:
+
+| `since` | Lower bound |
+|---|---|
+| not given (`None`) | the bound recorded in `cursor`, otherwise the default window, otherwise none |
+| a datetime | that datetime |
+| `ALL_HISTORY` | none, even with a default window |
+
+```python
+from audit_trail import ALL_HISTORY
+
+everything = audit.query.list_groups(session, since=ALL_HISTORY)
+```
+
+The first page fixes the bound and `next_cursor` carries it, also through `Cursor.encode()`. Later pages therefore neither move the window nor drop it, and a listing started with `ALL_HISTORY` stays unbounded. `Page.since` reports the bound a page used (`None` for none).
+
+To offer "load older", read the window before the current one: pass `Page.since` as `until`. The windows meet without overlap, since `since` is inclusive and `until` exclusive:
+
+```python
+def load_older(session, page):
+    """The window before `page`'s, or None when `page` already reached the start."""
+    if page.since is None:
+        return None
+    return audit.query.list_groups(session, until=page.since)
+```
+
+or, to walk back window by window:
+
+```python
+def walk_back(session, stop: datetime):
+    """Every group down to the window that reaches `stop`."""
+    until = None
+    while True:
+        page = audit.query.list_groups(session, until=until)
+        while True:
+            show(page.groups)
+            if page.next_cursor is None:
+                break
+            page = audit.query.list_groups(session, cursor=page.next_cursor)
+        if page.since is None or page.since <= stop:
+            return  # no lower bound: that was the whole log
+        until = page.since
+```
+
+With a default window `page.since` is never `None`, and an empty window does not mean the log ends there: give the walk a stop of your own, as `stop` here.
+
+The window applies to `list_groups()` and `alist_groups()` only. `object_history()` and `related()` read one record's or one correlation's entries through their own indexes, and a window would hide exactly what they are for, such as the entry that created a record. `access_summary()` counts every access. Their `since` stays optional, and their cursors carry it the same way.
 
 ## Groups and entries
 
@@ -157,4 +215,4 @@ def export_since(session, mark: datetime) -> datetime:
         cursor = page.next_cursor
 ```
 
-The library does not apply a lag itself; an interactive list view does not need one.
+The library does not apply a lag itself; an interactive list view does not need one. An export always passes `since`: with a default window, a first export that should read the whole log passes `since=ALL_HISTORY`.
