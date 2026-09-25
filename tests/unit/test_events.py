@@ -4,7 +4,7 @@ import gc
 import subprocess
 import sys
 from collections.abc import Iterator
-from enum import IntEnum
+from enum import Enum, IntEnum
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -20,6 +20,7 @@ from audit_trail.events import (
     Severity,
     UnknownEventError,
     WriteFlags,
+    event,
     resolve_write_flags,
     validate_payload,
 )
@@ -55,8 +56,8 @@ def _collect_event_classes() -> Iterator[None]:
 def test_member_carries_metadata() -> None:
     class Shop(AuditEvent):
         PLACED = "shop.order_placed", Severity.INFO, OrderPlaced
-        REFUND_DENIED = "shop.refund_denied", Severity.WARNING, None, True
-        CARD_VIEWED = "shop.card_viewed", Severity.CRITICAL, None, False, True
+        REFUND_DENIED = event("shop.refund_denied", Severity.WARNING, durable=True)
+        CARD_VIEWED = event("shop.card_viewed", Severity.CRITICAL, fail_closed=True)
 
     placed = Shop.PLACED
     assert (placed.severity, placed.schema) == (Severity.INFO, OrderPlaced)
@@ -66,6 +67,19 @@ def test_member_carries_metadata() -> None:
 
     assert placed == "shop.order_placed"
     assert str(placed) == f"{placed}" == "shop.order_placed"
+
+
+def test_event_helper_passes_every_field() -> None:
+    assert event("shop.x", Severity.INFO) == (
+        "shop.x",
+        Severity.INFO,
+        None,
+        False,
+        False,
+    )
+    assert event(
+        "shop.x", Severity.INFO, OrderPlaced, durable=True, fail_closed=True
+    ) == ("shop.x", Severity.INFO, OrderPlaced, True, True)
 
 
 def test_default_severity_levels() -> None:
@@ -210,6 +224,14 @@ def test_default_and_system_severity_must_be_in_enum(setting: str) -> None:
         EventRegistry(HostSeverity, events=[], **{setting: Severity.INFO})
 
 
+def test_severities_must_be_int_enum() -> None:
+    class Plain(Enum):
+        LOW = "low"
+
+    with pytest.raises(EventRegistryError, match="IntEnum subclass"):
+        EventRegistry(Plain, events=[])  # type: ignore[arg-type]
+
+
 def test_empty_severity_enum_is_rejected() -> None:
     class Empty(IntEnum):
         pass
@@ -306,14 +328,16 @@ def test_resolve_write_flags(
     durable: bool, fail_closed: bool, override: bool | None, expected: WriteFlags
 ) -> None:
     class Shop(AuditEvent):
-        EVENT = "shop.event", Severity.INFO, None, durable, fail_closed
+        EVENT = event(
+            "shop.event", Severity.INFO, durable=durable, fail_closed=fail_closed
+        )
 
     assert resolve_write_flags(Shop.EVENT, override) == expected
 
 
 def test_durable_override_cannot_weaken_fail_closed() -> None:
     class Shop(AuditEvent):
-        CARD_VIEWED = "shop.card_viewed", Severity.CRITICAL, None, False, True
+        CARD_VIEWED = event("shop.card_viewed", Severity.CRITICAL, fail_closed=True)
 
     with pytest.raises(ValueError, match="fail_closed"):
         resolve_write_flags(Shop.CARD_VIEWED, durable=False)

@@ -26,19 +26,48 @@ class Severity(IntEnum):
     CRITICAL = 40
 
 
+def event(
+    value: str,
+    severity: IntEnum | None,
+    schema: type[BaseModel] | None = None,
+    *,
+    durable: bool = False,
+    fail_closed: bool = False,
+) -> tuple[str, IntEnum | None, type[BaseModel] | None, bool, bool]:
+    """Build an ``AuditEvent`` member value with the flags named.
+
+    Enum passes a member's value to ``__new__`` positionally, so this helper
+    exists to keep member definitions readable.
+
+    Args:
+        value: The verb, ``domain.action`` in snake_case.
+        severity: Member of the configured severity enum.
+        schema: Pydantic model that validates the payload.
+        durable: Write on a separate connection and commit immediately.
+        fail_closed: Commit the entry before data is returned and raise on a
+            write failure. Implies ``durable``.
+
+    Returns:
+        The member value: the positional arguments of ``AuditEvent.__new__``.
+    """
+    return (value, severity, schema, durable, fail_closed)
+
+
 class AuditEvent(str, Enum):
     """Base class for audit events. It has no members, so it can be subclassed.
 
-    Each member is a verb carrying its metadata. Enum passes the member's
-    tuple to ``__new__`` positionally, so the flags go by position:
+    Each member is a verb carrying its metadata, built with ``event``:
 
     ```python
     class ShopEvent(AuditEvent):
-        ORDER_PLACED = "shop.order_placed", MySeverity.LOW, OrderPlaced
-        REFUND_DENIED = "shop.refund_denied", MySeverity.HIGH, None, True
+        ORDER_PLACED = event("shop.order_placed", MySeverity.LOW, OrderPlaced)
+        REFUND_DENIED = event("shop.refund_denied", MySeverity.HIGH, durable=True)
     ```
 
     Members compare equal to their verb string, and ``str()`` returns the verb.
+    Type checkers reject calling the class with a verb (``ShopEvent("...")``)
+    because of the custom ``__new__``; look verbs up with
+    ``EventRegistry.get`` instead.
 
     Attributes:
         severity: Member of the configured severity enum. ``None`` only on
@@ -98,9 +127,9 @@ class Crud(AuditEvent):
     by ``EventRegistry.severity_of`` rather than fixed here.
     """
 
-    CREATED = "entity.created", None
-    UPDATED = "entity.updated", None
-    DELETED = "entity.deleted", None
+    CREATED = event("entity.created", None)
+    UPDATED = event("entity.updated", None)
+    DELETED = event("entity.deleted", None)
 
 
 class AuditSystem(AuditEvent):
@@ -109,7 +138,7 @@ class AuditSystem(AuditEvent):
     Their severity is the registry's ``system_severity``.
     """
 
-    SCRUBBED = "audit.scrubbed", None, None, True
+    SCRUBBED = event("audit.scrubbed", None, durable=True)
 
 
 _BUILTINS: tuple[type[AuditEvent], ...] = (Crud, AuditSystem)
@@ -146,7 +175,9 @@ class EventRegistry:
         severities: The host's severity ``IntEnum`` (or ``Severity``).
         events: Event classes to register. ``None`` collects every
             ``AuditEvent`` subclass that has members. The built-ins are
-            always registered.
+            always registered. Pass the classes explicitly when discovery
+            would see a module twice (reloaded, or imported under two names),
+            which otherwise fails as a duplicate verb.
         default_severity: Severity of ``entity.*`` entries whose model sets
             none. ``None`` uses the lowest member of ``severities``.
         system_severity: Severity of the library's ``audit.*`` events.
@@ -155,7 +186,8 @@ class EventRegistry:
             the one kept longest; set this when it is not.
 
     Raises:
-        EventRegistryError: A verb is defined twice, a severity is not a
+        EventRegistryError: ``severities`` is not a non-empty ``IntEnum``,
+            a verb is defined twice, a severity is not a
             member of ``severities``, a host event uses a reserved prefix or
             has no severity, or a payload schema is not a pydantic model (or
             pydantic is not installed).
@@ -169,6 +201,10 @@ class EventRegistry:
         default_severity: IntEnum | None = None,
         system_severity: IntEnum | None = None,
     ) -> None:
+        if not (isinstance(severities, type) and issubclass(severities, IntEnum)):
+            raise EventRegistryError(
+                f"severities must be an IntEnum subclass, got {severities!r}"
+            )
         if not len(severities):
             raise EventRegistryError(f"{severities.__name__} has no members")
         self.severities = severities
