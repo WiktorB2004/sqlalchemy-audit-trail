@@ -244,9 +244,9 @@ def test_models_without_hash_columns_need_no_key_ring() -> None:
 
 def test_global_redact_matches_attribute_key() -> None:
     changes = entity_changes(
-        account(name="Acme"), "created", keys=KEYS, global_redact={"name"}
+        account(api_token="t0k"), "created", keys=KEYS, global_redact={"api_token"}
     )
-    assert changes["name"] == [None, REDACTED]
+    assert changes["api_token"] == [None, REDACTED]
 
 
 def test_global_redact_matches_column_name() -> None:
@@ -349,7 +349,7 @@ def test_options_cannot_modify_the_instance() -> None:
         return "x"
 
     obj = account(name="Acme")
-    with pytest.raises(AttributeError):
+    with pytest.raises(AttributeError, match="must not modify the instance"):
         resolve_label(obj, AuditOptions(label=rename))
     assert obj.name == "Acme"
 

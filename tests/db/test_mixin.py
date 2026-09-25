@@ -164,6 +164,17 @@ def test_loaded_relationship_is_readable(order: Order, statements: Statements) -
     assert statements.count == 0
 
 
+def test_expired_attribute_of_related_object_emits_no_sql(
+    session: Session, order: Order, statements: Statements
+) -> None:
+    assert order.company.name == "Acme"
+    session.expire(order.company)
+    statements.count = 0
+    options = AuditOptions(label=lambda obj: obj.company.name)
+    assert resolve_label(order, options) is None
+    assert statements.count == 0
+
+
 async def test_expired_attribute_under_async_session(
     async_engine: AsyncEngine, session: Session, schema: str
 ) -> None:
@@ -183,10 +194,13 @@ def test_snapshot_taken_on_load_and_partial_refresh(
 
     with db.begin() as conn:
         conn.execute(update(Order).values(settings={"a": 2}, title="Changed"))
-    session.refresh(order, ["title"])
-    assert snapshot(order) == {"settings": {"a": 1}}
-    session.refresh(order, ["settings"])
-    assert snapshot(order) == {"settings": {"a": 2}}
+    with session.no_autoflush:
+        assert order.settings is not None
+        order.settings["a"] = 5  # pending; refreshing other attributes keeps it
+        session.refresh(order, ["title"])
+        assert snapshot(order) == {"settings": {"a": 1}}
+        session.refresh(order, ["settings"])
+        assert snapshot(order) == {"settings": {"a": 2}}
 
 
 def test_snapshot_is_a_deep_copy(order: Order) -> None:
