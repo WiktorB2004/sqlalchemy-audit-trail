@@ -221,7 +221,7 @@ def test_refused_events(
 ) -> None:
     with env.factory() as session:
         with pytest.raises(error, match=match):
-            env.trail.log(session, **kwargs)
+            env.trail.log(session, kwargs.pop("event"), **kwargs)
         session.commit()
     assert env.activities() == []
 
@@ -236,6 +236,35 @@ def test_log_needs_an_installed_session(
     other.install(factory)
     with factory() as session, pytest.raises(TypeError, match="installed"):
         env.trail.log(session, LogEvent.VIEWED)
+
+
+def test_log_without_a_session_uses_the_session_provider(
+    env: Env, models: Models
+) -> None:
+    with env.factory() as session:
+        env.trail.session_provider = lambda: session
+        env.trail.log(LogEvent.VIEWED)
+        session.rollback()
+    assert env.activities() == []
+
+    with env.factory() as session:
+        env.trail.session_provider = lambda: session
+        session.add(models.Folder(id=1))
+        session.flush()
+        env.trail.log(LogEvent.VIEWED)
+        env.trail.log(None, LogEvent.VIEWED)
+        session.commit()
+    created, *explicit = env.activities()
+    assert [row["verb"] for row in explicit] == ["log_test.viewed"] * 2
+    assert {row["transaction_id"] for row in explicit} == {created["transaction_id"]}
+
+
+def test_an_explicit_session_wins_over_the_provider(env: Env) -> None:
+    env.trail.session_provider = lambda: pytest.fail("the provider was called")
+    with env.factory() as session:
+        env.trail.log(session, LogEvent.VIEWED)
+        session.commit()
+    assert [row["verb"] for row in env.activities()] == ["log_test.viewed"]
 
 
 def test_log_writes_when_capture_is_disabled(env: Env, models: Models) -> None:

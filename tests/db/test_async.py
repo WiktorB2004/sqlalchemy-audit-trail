@@ -212,6 +212,23 @@ async def test_alog_writes_in_the_session_transaction(
     assert noted["transaction_id"] == created["transaction_id"]
 
 
+async def test_alog_without_a_session_uses_the_session_provider(
+    make: EnvMaker, models: Models
+) -> None:
+    env = make()
+    async with env.factory() as session:
+        env.trail.session_provider = lambda: session
+        post = models.Post(title="kept")
+        session.add(post)
+        await session.flush()
+        await env.trail.alog(AsyncEvent.NOTED, obj=post)
+        await session.commit()
+    created, noted = env.activities()
+    assert noted["verb"] == "async_test.noted"
+    assert noted["object_id"] == created["object_id"]
+    assert noted["transaction_id"] == created["transaction_id"]
+
+
 async def test_alog_durable_entry_survives_rollback(
     make: EnvMaker, models: Models
 ) -> None:
