@@ -19,6 +19,7 @@ from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 from sqlalchemy.orm.attributes import instance_state
 
+from audit_trail import diff
 from audit_trail.config import AuditOptions
 from audit_trail.diff import (
     SNAPSHOT_INFO_KEY,
@@ -63,6 +64,12 @@ class Order(Base, Audited):
     def display(self) -> str:
         return f"#{self.id} {self.title}"
 
+    def __repr__(self) -> str:
+        return f"Order({self.title})"
+
+    def __str__(self) -> str:
+        return self.title
+
 
 def snapshot(obj: object) -> dict[str, object]:
     result: dict[str, object] = instance_state(obj).info.get(SNAPSHOT_INFO_KEY, {})
@@ -75,6 +82,13 @@ class Statements:
 
     def __call__(self, *args: object) -> None:
         self.count += 1
+
+
+@pytest.fixture(autouse=True)
+def reset_fallback_warnings() -> Iterator[None]:
+    diff._warned.clear()
+    yield
+    diff._warned.clear()
 
 
 @pytest.fixture
@@ -162,6 +176,43 @@ def test_loaded_relationship_is_readable(order: Order, statements: Statements) -
     options = AuditOptions(label=lambda obj: obj.company.name)
     assert resolve_label(order, options) == "Acme"
     assert statements.count == 0
+
+
+@pytest.mark.parametrize(
+    ("render", "expected"), [(str, "First"), (repr, "Order(First)")]
+)
+def test_str_and_repr_of_expired_instance_emit_no_sql(
+    session: Session,
+    order: Order,
+    statements: Statements,
+    render: Any,
+    expected: str,
+) -> None:
+    options = AuditOptions(label=lambda obj: render(obj))
+    assert resolve_label(order, options) == expected
+    session.expire(order)
+    assert resolve_label(order, options) is None
+    assert statements.count == 0
+
+
+def test_fallback_is_logged_once_across_flushes(
+    session: Session, order: Order, caplog: pytest.LogCaptureFixture
+) -> None:
+    labels: list[str | None] = []
+
+    def after_flush(sess: Session, flush_context: object) -> None:
+        for obj in sess.dirty:
+            labels.append(resolve_label(obj, options_of(Order)))
+
+    event.listen(session, "after_flush", after_flush)
+    with caplog.at_level(logging.WARNING, logger="audit_trail.diff"):
+        for value in (2, 3):
+            session.expire(order, ["title"])
+            assert order.settings is not None
+            order.settings["a"] = value
+            session.flush()
+    assert labels == [None, None]
+    assert len(caplog.records) == 1
 
 
 def test_expired_attribute_of_related_object_emits_no_sql(

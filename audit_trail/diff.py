@@ -12,9 +12,10 @@ A column's policy is set where the column is defined::
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
@@ -61,6 +62,10 @@ _ValuePolicy: TypeAlias = Literal["redact", "hash"]
 
 class FieldPolicyError(ValueError):
     """A column's audit policy is invalid or cannot be applied."""
+
+
+class AuditOptionError(TypeError):
+    """An audit option (``label``, ``scope``, ``target``) is misconfigured."""
 
 
 class UseContext(Enum):
@@ -356,16 +361,30 @@ class _UnloadedAttributeError(Exception):
         self.attribute = attribute
 
 
+class _CachedPropertyError(Exception):
+    """Internal: an option read a ``functools.cached_property``."""
+
+    def __init__(self, model: type[Any], attribute: str) -> None:
+        super().__init__(f"{model.__qualname__}.{attribute} is a cached_property")
+        self.model = model
+        self.attribute = attribute
+
+
 class _LoadedOnly:
     """Read-only view of an instance that never loads anything.
 
     Mapped attributes come from the instance's loaded state; one that would
     need SQL raises ``_UnloadedAttributeError``. Properties, hybrids and
     methods of the class run with the view as ``self``, so they cannot load
-    through the real instance either. Loaded related instances are wrapped.
+    through the real instance either; so do ``__repr__`` and ``__str__``.
+    Loaded related instances are wrapped, also inside collections.
+    ``functools.cached_property`` is refused: it would have to store its
+    result on the view.
     """
 
     __slots__ = ("_audit_obj", "_audit_state")
+    _audit_obj: object
+    _audit_state: InstanceState[Any]
 
     def __init__(self, obj: object) -> None:
         object.__setattr__(self, "_audit_obj", obj)
@@ -373,7 +392,7 @@ class _LoadedOnly:
 
     def __getattr__(self, name: str) -> Any:
         obj = self._audit_obj
-        state: InstanceState[Any] = self._audit_state
+        state = self._audit_state
         cls = type(obj)
         if name in state.manager:
             value = state.dict.get(name, NO_VALUE)
@@ -397,6 +416,8 @@ class _LoadedOnly:
         )
         if not is_data_descriptor and name in instance_dict:
             return instance_dict[name]
+        if isinstance(attr, functools.cached_property):
+            raise _CachedPropertyError(cls, name)
         if hasattr(descriptor, "__get__"):
             return attr.__get__(self, cls)
         return attr
@@ -405,18 +426,37 @@ class _LoadedOnly:
         raise AttributeError("audit options must not modify the instance")
 
     def __repr__(self) -> str:
-        return f"<loaded-only view of {self._audit_obj!r}>"
+        obj = self._audit_obj
+        cls: type[object] = type(obj)
+        method: Callable[[object], str] = cls.__repr__
+        if method is object.__repr__:
+            return object.__repr__(obj)
+        return str(method(self))
+
+    def __str__(self) -> str:
+        cls: type[object] = type(self._audit_obj)
+        method: Callable[[object], str] = cls.__str__
+        if method is object.__str__:
+            # object.__str__ defers to __repr__, which applies the same rules.
+            return self.__repr__()
+        return str(method(self))
 
 
 def _wrap_related(mapper: Mapper[Any], name: str, value: object) -> object:
     if name not in mapper.relationships or value is None:
         return value
+    if isinstance(value, Mapping):
+        return {key: _LoadedOnly(item) for key, item in value.items()}
     if mapper.relationships[name].uselist:
         return [_LoadedOnly(item) for item in cast(Iterable[object], value)]
     return _LoadedOnly(value)
 
 
 _OptionName: TypeAlias = Literal["label", "scope", "target"]
+
+# (model, attribute, option) already reported, so a misconfigured option on a
+# busy model logs once per process instead of once per flush.
+_warned: set[tuple[type[Any], str, _OptionName]] = set()
 
 
 def _call_option(
@@ -425,15 +465,24 @@ def _call_option(
     try:
         return True, fn(_LoadedOnly(obj))
     except _UnloadedAttributeError as exc:
-        logger.warning(
-            "AuditOptions.%s of %s read %r, which is not loaded; using the "
-            "fallback. Options may only read attributes already loaded on "
-            "the instance.",
-            option,
-            exc.model.__qualname__,
-            exc.attribute,
-        )
+        key = (exc.model, exc.attribute, option)
+        if key not in _warned:
+            _warned.add(key)
+            logger.warning(
+                "AuditOptions.%s of %s read %r, which is not loaded; using the "
+                "fallback. Options may only read attributes already loaded on "
+                "the instance. Logged once per process.",
+                option,
+                exc.model.__qualname__,
+                exc.attribute,
+            )
         return False, None
+    except _CachedPropertyError as exc:
+        raise AuditOptionError(
+            f"AuditOptions.{option} of {exc.model.__qualname__} read "
+            f"{exc.attribute!r}: cached_property is not supported in audit "
+            "options; read the underlying column"
+        ) from None
 
 
 def resolve_label(obj: object, options: AuditOptions) -> str | None:
@@ -446,7 +495,11 @@ def resolve_label(obj: object, options: AuditOptions) -> str | None:
     Returns:
         The label as a string, or ``None`` when there is no ``label`` option,
         it returns ``None``, or it read an attribute that is not loaded (then
-        logged on the ``audit_trail.diff`` logger).
+        logged once per model, attribute and option on the
+        ``audit_trail.diff`` logger).
+
+    Raises:
+        AuditOptionError: The option read a ``functools.cached_property``.
     """
     if options.label is None:
         return None
@@ -463,9 +516,13 @@ def resolve_scope(obj: object, options: AuditOptions) -> str | None | UseContext
 
     Returns:
         ``USE_CONTEXT`` when there is no ``scope`` option or it read an
-        attribute that is not loaded (then logged on the ``audit_trail.diff``
-        logger). Otherwise ``None`` when the option returned ``None`` (an
-        explicit "no scope"), else the value as a string.
+        attribute that is not loaded (then logged once per model, attribute
+        and option on the ``audit_trail.diff`` logger). Otherwise ``None``
+        when the option returned ``None`` (an explicit "no scope"), else the
+        value as a string.
+
+    Raises:
+        AuditOptionError: The option read a ``functools.cached_property``.
     """
     if options.scope is None:
         return USE_CONTEXT
@@ -488,8 +545,11 @@ def resolve_target(obj: object, options: AuditOptions) -> tuple[str, str] | None
     Returns:
         ``(target_type, target_id)``, or ``None`` when there is no ``target``
         option, it returns ``None`` or an id of ``None``, or it read an
-        attribute that is not loaded (then logged on the ``audit_trail.diff``
-        logger).
+        attribute that is not loaded (then logged once per model, attribute
+        and option on the ``audit_trail.diff`` logger).
+
+    Raises:
+        AuditOptionError: The option read a ``functools.cached_property``.
     """
     if options.target is None:
         return None

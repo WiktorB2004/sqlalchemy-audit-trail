@@ -22,9 +22,11 @@ class AuditOptions:
     ``label``, ``scope`` and ``target`` run while the session flushes and get
     a read-only view of the instance instead of the instance itself. They may
     read only attributes already loaded on it: reading an expired or unloaded
-    attribute emits no SQL, logs a warning on ``audit_trail.diff`` and the
-    option falls back (``label`` and ``target`` to ``None``, ``scope`` to the
-    context). Any other exception they raise propagates and aborts the flush.
+    attribute emits no SQL, logs a warning on ``audit_trail.diff`` (once per
+    model, attribute and option) and the option falls back (``label`` and
+    ``target`` to ``None``, ``scope`` to the context). Reading a
+    ``functools.cached_property`` raises ``AuditOptionError``. Any other
+    exception they raise propagates and aborts the flush.
 
     Attributes:
         severity: Severity of the model's ``entity.*`` entries. ``None`` uses

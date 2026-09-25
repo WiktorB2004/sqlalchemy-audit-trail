@@ -6,9 +6,11 @@ state is set with ``set_committed_value`` where a test needs history.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import uuid
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -16,17 +18,20 @@ from sqlalchemy import Column, ForeignKey, PickleType, String, text
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
+    attribute_keyed_dict,
     mapped_column,
     registry,
     relationship,
 )
 from sqlalchemy.orm.attributes import set_committed_value
 
+from audit_trail import diff
 from audit_trail.config import AuditOptions
 from audit_trail.diff import (
     REDACTED,
     UNKNOWN,
     USE_CONTEXT,
+    AuditOptionError,
     FieldPolicyError,
     entity_changes,
     field_policy,
@@ -66,11 +71,30 @@ class Account(Base, Audited):
     def shouting_name(self) -> str:
         return str(self.name).upper()
 
+    @functools.cached_property
+    def cached_name(self) -> str:
+        return str(self.name)
+
+    def __repr__(self) -> str:
+        return f"Account({self.name})"
+
 
 class Parent(Base):
     __tablename__ = "parent"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str | None] = mapped_column(String)
+    children: Mapped[dict[str, Child]] = relationship(
+        collection_class=attribute_keyed_dict("key")
+    )
+
+
+class Child(Base):
+    __tablename__ = "child"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("parent.id"))
+    key: Mapped[str] = mapped_column(String)
     title: Mapped[str | None] = mapped_column(String)
 
 
@@ -86,6 +110,13 @@ class Thing(Base, Audited):
     __audit__ = AuditOptions(object_type="Widget")
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+
+
+@pytest.fixture(autouse=True)
+def reset_fallback_warnings() -> Iterator[None]:
+    diff._warned.clear()
+    yield
+    diff._warned.clear()
 
 
 def account(**values: Any) -> Account:
@@ -376,3 +407,56 @@ def test_target_formats_id_like_object_id() -> None:
     assert (
         resolve_target(account(), AuditOptions(target=lambda o: ("P", o.name))) is None
     )
+
+
+def test_fallback_warning_is_logged_once_per_model_attribute_and_option(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    label = AuditOptions(label=lambda obj: obj.name)
+    scope = AuditOptions(scope=lambda obj: obj.name)
+    with caplog.at_level(logging.WARNING, logger="audit_trail.diff"):
+        assert resolve_label(account(), label) is None
+        assert resolve_label(account(id=2), label) is None
+        assert resolve_scope(account(), scope) is USE_CONTEXT
+    assert [record.getMessage().split(" read ")[0] for record in caplog.records] == [
+        "AuditOptions.label of Account",
+        "AuditOptions.scope of Account",
+    ]
+
+
+def test_repr_and_str_run_against_the_proxy() -> None:
+    assert (
+        resolve_label(account(name="Acme"), AuditOptions(label=repr)) == "Account(Acme)"
+    )
+    assert (
+        resolve_label(account(name="Acme"), AuditOptions(label=str)) == "Account(Acme)"
+    )
+    assert resolve_label(account(), AuditOptions(label=str)) is None
+
+
+def test_default_repr_describes_the_real_instance() -> None:
+    parent = Parent(id=1)
+    label = resolve_label(parent, AuditOptions(label=repr))
+    assert label is not None
+    assert label.startswith(f"<{Parent.__module__}.Parent object at")
+    assert resolve_label(parent, AuditOptions(label=str)) == label
+
+
+def test_cached_property_is_refused_with_a_clear_error() -> None:
+    options = AuditOptions(label=lambda obj: obj.cached_name)
+    with pytest.raises(
+        AuditOptionError,
+        match=(
+            "AuditOptions.label of Account read 'cached_name': cached_property is "
+            "not supported in audit options; read the underlying column"
+        ),
+    ):
+        resolve_label(account(name="Acme"), options)
+
+
+def test_dict_keyed_collection_items_are_wrapped() -> None:
+    parent = Parent(id=1, children={"a": Child(id=1, key="a", title="first")})
+    options = AuditOptions(label=lambda obj: obj.children["a"].title)
+    assert resolve_label(parent, options) == "first"
+    unloaded = AuditOptions(label=lambda obj: obj.children["a"].parent_id)
+    assert resolve_label(parent, unloaded) is None
