@@ -443,7 +443,10 @@ def health(
 
 
 class PartitionManager:
-    """Creates partitions on the library's own connection and transaction.
+    """Runs partition maintenance on the library's own connections.
+
+    ``ensure_partitions`` runs in one transaction; ``drop_expired`` switches
+    its connection to ``AUTOCOMMIT`` itself.
 
     Args:
         engine: Sync or async engine with DDL privileges. Must not be
@@ -848,8 +851,10 @@ def _transaction_limit(
 ) -> timedelta | None:
     finite = [limit for limit in limits.values() if limit is not None]
     shortest = min(finite, default=None)
-    if requested is None or shortest is None:
-        return requested if shortest is None else shortest
+    if shortest is None:
+        return requested
+    if requested is None:
+        return shortest
     if requested > shortest:
         logger.warning(
             "transaction_retention %s is longer than the shortest severity "
