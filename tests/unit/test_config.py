@@ -3,19 +3,30 @@
 from __future__ import annotations
 
 import gc
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Column, Engine, ForeignKey, Table, create_engine
+from sqlalchemy import event as sa_event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    registry,
+    relationship,
+    sessionmaker,
+)
 
-from audit_trail import AuditEvent, AuditTrail, event
+from audit_trail import Audited, AuditEvent, AuditOptions, AuditTrail, event, listener
 from audit_trail.context import bind, context, current_context, set_actor
 from audit_trail.events import EventRegistryError, Severity
 from audit_trail.listener import installed_trail
 from audit_trail.maintenance import PartitionManager
+from audit_trail.relations import pop_relationship_changes
 from audit_trail.serialization import KeyRing, pseudonymize
 
 KEY = b"k" * 32
@@ -163,3 +174,69 @@ def test_install_twice_is_refused(engine: Engine) -> None:
     # A sibling is independent.
     AuditTrail(engine, events=[]).install(BaseOfAppSession)
     assert installed_trail(SubSession()) is audit
+
+
+@dataclass
+class _Tracked:
+    Owner: Any
+    Tag: Any
+    registry: registry
+
+    def records_changes(self) -> bool:
+        owner = self.Owner(id=1)
+        owner.tags.append(self.Tag(id=2))
+        changes = pop_relationship_changes(owner)
+        return changes == {"tags": {"added": ["2"], "removed": []}}
+
+
+def _tracked_model(name: str, track: str = "tags") -> _Tracked:
+    class Base(DeclarativeBase):
+        pass
+
+    association = Table(
+        f"{name}_tags",
+        Base.metadata,
+        Column("owner_id", ForeignKey(f"{name}.id"), primary_key=True),
+        Column("tag_id", ForeignKey(f"{name}_tag.id"), primary_key=True),
+    )
+
+    class Tag(Base):
+        __tablename__ = f"{name}_tag"
+        id: Mapped[int] = mapped_column(primary_key=True)
+
+    class Owner(Base, Audited):
+        __tablename__ = name
+        id: Mapped[int] = mapped_column(primary_key=True)
+        tags: Mapped[list[Tag]] = relationship(secondary=association)
+        __audit__ = AuditOptions(track_relationships={track})
+
+    return _Tracked(Owner, Tag, Base.registry)
+
+
+def test_install_tracks_relationships_before_and_after_configuration(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Start from a process where install() never ran.
+    if listener._tracking_registered:
+        sa_event.remove(Audited, "mapper_configured", listener._track_model)
+    monkeypatch.setattr(listener, "_tracking_registered", False)
+
+    early = _tracked_model("early")
+    early.registry.configure()
+    assert not early.records_changes()
+
+    AuditTrail(engine, events=[]).install(sessionmaker(engine))
+    assert early.records_changes()  # configured before install
+    late = _tracked_model("late")
+    late.registry.configure()
+    assert late.records_changes()  # configured after install
+
+
+def test_track_relationships_must_name_a_relationship(engine: Engine) -> None:
+    AuditTrail(engine, events=[]).install(sessionmaker(engine))
+    broken = _tracked_model("broken", track="missing")
+    try:
+        with pytest.raises(ValueError, match="'missing', which is not a relationship"):
+            broken.registry.configure()
+    finally:
+        broken.registry.dispose()  # a failed mapper breaks later configuration

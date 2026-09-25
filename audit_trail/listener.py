@@ -336,20 +336,7 @@ def write_entries(
 
 def _cached_row(session: Session) -> TransactionRow | None:
     cached: _CachedRow | None = session.info.get(_CACHE_KEY)
-    if cached is None:
-        return None
-    if _root(cached.owner) is not session.get_transaction():
-        # Left over from a transaction that ended without our listeners
-        # seeing it; never reuse a row across transactions.
-        del session.info[_CACHE_KEY]
-        return None
-    return cached.row
-
-
-def _root(transaction: SessionTransaction) -> SessionTransaction:
-    while transaction.parent is not None:
-        transaction = transaction.parent
-    return transaction
+    return None if cached is None else cached.row
 
 
 def _after_commit(session: Session) -> None:

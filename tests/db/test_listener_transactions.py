@@ -75,7 +75,11 @@ def item_names(env: Env, models: Models) -> list[str]:
         return list(conn.scalars(select(models.Item.__table__.c.name)))
 
 
-def test_rollback_writes_nothing(env: Env, models: Models) -> None:
+@pytest.mark.parametrize("on_error", ["log", "raise"])
+def test_rollback_writes_nothing(
+    engine: Engine, schema: str, models: Models, on_error: str
+) -> None:
+    env = make_env(engine, schema, on_error=on_error)
     with env.factory() as session:
         session.add(models.Item(name="a"))
         session.flush()
