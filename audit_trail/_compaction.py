@@ -8,6 +8,7 @@ over rows that were already fetched: no session, no SQL.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Iterable, Sequence
 from datetime import datetime
@@ -17,7 +18,7 @@ from uuid import UUID
 
 from audit_trail._typing import assert_never
 from audit_trail.context import ContextSnapshot
-from audit_trail.diff import REDACTED, UNKNOWN
+from audit_trail.diff import ERASED, REDACTED, UNKNOWN
 from audit_trail.events import Crud
 from audit_trail.relations import RelationshipChange
 from audit_trail.serialization import JSONValue
@@ -110,11 +111,13 @@ def compact_rows(
     dropped; ``entity.created`` and ``entity.deleted`` keep every column, as a
     replay needs the full state. Equality is on the canonical JSON form of the
     stored values (typed comparison already happened when they were written),
-    so ``true`` and ``1`` differ. A ``"***"`` or ``"<unknown>"`` marker on
-    either side is never treated as equal: it hides whether the value changed.
+    so ``true`` and ``1`` differ. A ``"***"``, ``"<unknown>"`` or ``"[erased]"``
+    marker on either side is never treated as equal: it hides whether the
+    value changed.
     Relationship changes merge net: an id added and then removed disappears,
-    and the other way round. A relationship left with no ids is dropped for
-    every verb.
+    and the other way round. An ``"[erased]"`` id never cancels or merges with
+    another: each side keeps one per occurrence, after the real ids. A
+    relationship left with no ids is dropped for every verb.
 
     The merged row takes ``id``, ``created_at``, ``correlation_id`` and the
     output position of the group's lowest-id row; the other rows of the group
@@ -225,13 +228,22 @@ def _merge(group: Sequence[ActivityRow]) -> ActivityRow | None:
     }
 
 
+@dataclasses.dataclass
+class _RelationDelta:
+    # Insertion-ordered dicts used as sets keep the output deterministic.
+    # Erased ids are indistinguishable, so they are only counted.
+    added: dict[str, None] = dataclasses.field(default_factory=dict)
+    removed: dict[str, None] = dataclasses.field(default_factory=dict)
+    erased_added: int = 0
+    erased_removed: int = 0
+
+
 def _merge_changes(
     group: Sequence[ActivityRow], *, drop_unchanged: bool
 ) -> dict[str, FieldChange]:
     order: dict[str, None] = {}
     columns: dict[str, list[JSONValue]] = {}
-    # Insertion-ordered dicts used as sets keep the output deterministic.
-    relations: dict[str, tuple[dict[str, None], dict[str, None]]] = {}
+    relations: dict[str, _RelationDelta] = {}
     for row in group:
         for field, change in row["data"].get("changes", {}).items():
             order[field] = None
@@ -239,14 +251,19 @@ def _merge_changes(
                 old = columns[field][0] if field in columns else change[0]
                 columns[field] = [old, change[1]]
                 continue
-            added, removed = relations.setdefault(field, ({}, {}))
+            delta = relations.setdefault(field, _RelationDelta())
+            added, removed = delta.added, delta.removed
             for item in change["removed"]:
-                if item in added:
+                if item == ERASED:
+                    delta.erased_removed += 1
+                elif item in added:
                     del added[item]
                 else:
                     removed[item] = None
             for item in change["added"]:
-                if item in removed:
+                if item == ERASED:
+                    delta.erased_added += 1
+                elif item in removed:
                     del removed[item]
                 else:
                     added[item] = None
@@ -258,9 +275,11 @@ def _merge_changes(
             if not (drop_unchanged and _unchanged(old, new)):
                 merged[field] = [old, new]
         else:
-            added, removed = relations[field]
-            if added or removed:
-                merged[field] = {"added": list(added), "removed": list(removed)}
+            delta = relations[field]
+            added_ids = [*delta.added, *[ERASED] * delta.erased_added]
+            removed_ids = [*delta.removed, *[ERASED] * delta.erased_removed]
+            if added_ids or removed_ids:
+                merged[field] = {"added": added_ids, "removed": removed_ids}
     return merged
 
 
@@ -271,7 +290,7 @@ def _unchanged(old: JSONValue, new: JSONValue) -> bool:
 
 
 def _is_marker(value: JSONValue) -> bool:
-    return value == REDACTED or value == UNKNOWN
+    return value == REDACTED or value == UNKNOWN or value == ERASED
 
 
 def _canonical(value: JSONValue) -> str:

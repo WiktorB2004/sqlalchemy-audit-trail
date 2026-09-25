@@ -49,6 +49,9 @@ REDACTED = "***"
 UNKNOWN = "<unknown>"
 """Marker stored where a value is not available without SQL."""
 
+ERASED = "[erased]"
+"""Stored by ``scrub`` in place of a non-null value."""
+
 SNAPSHOT_INFO_KEY = "audit_trail.snapshot"
 """``InstanceState.info`` key holding the ``snapshot_on_load`` copies."""
 
