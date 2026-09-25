@@ -3,7 +3,9 @@
 ``install`` registers the listeners on one session class: the class a
 ``sessionmaker`` builds, or a ``Session`` subclass (and so its subclasses).
 Never on the base ``Session``, which would also cover Alembic, other engines
-and every other session in the process.
+and every other session in the process. An ``AsyncSession`` runs a sync
+``Session`` of its ``sync_session_class`` in a greenlet, so an async factory
+is installed through that class, which must be the host's own subclass.
 
 ``after_flush`` turns the flushed ``Audited`` instances into ``entity.*``
 entries and writes them with plain SQL on ``session.connection()``, in the
@@ -37,7 +39,7 @@ import logging
 import sys
 from collections.abc import Iterable, Sequence
 from itertools import chain
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from sqlalchemy import event, inspect
 from sqlalchemy.orm import Session, sessionmaker
@@ -74,6 +76,7 @@ from audit_trail.writer import (
 )
 
 if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
     from sqlalchemy.orm import (
         Mapper,
         ORMExecuteState,
@@ -108,7 +111,10 @@ class _CachedRow(NamedTuple):
 
 
 def install(
-    trail: AuditTrail, session_factory: sessionmaker[Any] | type[Session]
+    trail: AuditTrail,
+    session_factory: type[Session | AsyncSession]
+    | sessionmaker[Any]
+    | async_sessionmaker[Any],
 ) -> None:
     """Register the audit listeners on a session factory's class.
 
@@ -120,14 +126,18 @@ def install(
 
     Args:
         trail: The configuration the listeners write with.
-        session_factory: A ``sessionmaker`` or a ``Session`` subclass.
+        session_factory: A ``sessionmaker`` or a ``Session`` subclass; or
+            an ``async_sessionmaker`` or ``AsyncSession`` subclass whose
+            ``sync_session_class`` is a ``Session`` subclass, e.g.
+            ``async_sessionmaker(engine, sync_session_class=AppSession)``.
 
     Raises:
-        TypeError: ``session_factory`` is not a ``sessionmaker`` or a
-            ``Session`` subclass, or it is asynchronous (not supported yet).
-        ValueError: ``session_factory`` is the base ``Session``, or an
-            ``AuditTrail`` is already installed on its class, a base class or
-            a subclass of it.
+        TypeError: ``session_factory`` is none of these, or its
+            ``sync_session_class`` is not a ``Session`` subclass.
+        ValueError: The session class is the base ``Session`` (for an async
+            factory: no ``sync_session_class`` was given), or an
+            ``AuditTrail`` is already installed on it, a base class or a
+            subclass of it.
     """
     cls = _session_class(session_factory)
     other = next(
@@ -170,11 +180,23 @@ def _session_class(factory: object) -> type[Session]:
     elif isinstance(factory, type) and issubclass(factory, Session):
         cls = factory
     else:
-        if _is_async(factory):
-            raise TypeError("async sessions are not supported yet")
-        raise TypeError(
-            f"install() needs a sessionmaker or a Session subclass, got {factory!r}"
-        )
+        sync_class = _sync_session_class(factory)
+        if sync_class is None:
+            raise TypeError(
+                "install() needs a sessionmaker or a Session subclass (or their "
+                f"async counterparts), got {factory!r}"
+            )
+        if sync_class is Session:
+            raise ValueError(
+                "install() refuses an async factory whose sync_session_class is "
+                "the base Session: its listeners would audit every session in "
+                "the process; pass sync_session_class=<your Session subclass>"
+            )
+        if not (isinstance(sync_class, type) and issubclass(sync_class, Session)):
+            raise TypeError(
+                f"sync_session_class must be a Session subclass, got {sync_class!r}"
+            )
+        cls = sync_class
     if cls is Session:
         raise ValueError(
             "install() refuses the base Session: its listeners would audit "
@@ -184,16 +206,19 @@ def _session_class(factory: object) -> type[Session]:
     return cls
 
 
-def _is_async(factory: object) -> bool:
-    # Checked through sys.modules so sync-only hosts never import asyncio
-    # support (and greenlet) just to be told it is not supported.
+def _sync_session_class(factory: object) -> object | None:
+    # Looked up through sys.modules so sync-only hosts never import asyncio
+    # support (and greenlet): an async factory implies it is loaded already.
+    # Returns None when factory is not an async factory.
     asyncio_module = sys.modules.get("sqlalchemy.ext.asyncio")
     if asyncio_module is None:
-        return False
-    async_types = (asyncio_module.async_sessionmaker, asyncio_module.AsyncSession)
-    return isinstance(factory, async_types) or (
-        isinstance(factory, type) and issubclass(factory, asyncio_module.AsyncSession)
-    )
+        return None
+    if isinstance(factory, asyncio_module.async_sessionmaker):
+        explicit: object = factory.kw.get("sync_session_class")
+        return explicit or factory.class_.sync_session_class
+    if isinstance(factory, type) and issubclass(factory, asyncio_module.AsyncSession):
+        return cast("type[AsyncSession]", factory).sync_session_class
+    return None
 
 
 _tracking_registered = False

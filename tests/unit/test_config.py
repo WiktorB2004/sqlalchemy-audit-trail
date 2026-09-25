@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import logging
 from dataclasses import dataclass
@@ -9,9 +10,14 @@ from enum import IntEnum
 from typing import Any
 
 import pytest
-from sqlalchemy import Column, Engine, ForeignKey, Table, create_engine
+from sqlalchemy import Column, Engine, ForeignKey, QueuePool, Table, create_engine
 from sqlalchemy import event as sa_event
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -21,8 +27,10 @@ from sqlalchemy.orm import (
     relationship,
     sessionmaker,
 )
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from audit_trail import Audited, AuditEvent, AuditOptions, AuditTrail, event, listener
+from audit_trail.config import DURABLE_POOL_SIZE, DURABLE_POOL_TIMEOUT
 from audit_trail.context import bind, context, current_context, set_actor
 from audit_trail.events import EventRegistryError, Severity
 from audit_trail.listener import installed_trail
@@ -144,15 +152,102 @@ def test_install_refuses_other_objects(engine: Engine, factory: Any) -> None:
         AuditTrail(engine, events=[]).install(factory)
 
 
-def test_install_refuses_async_sessions(engine: Engine) -> None:
+def test_install_needs_a_sync_session_class_for_async_factories(
+    engine: Engine,
+) -> None:
     audit = AuditTrail(engine, events=[])
 
     class AppAsyncSession(AsyncSession):
         pass
 
-    for factory in (async_sessionmaker(), AppAsyncSession):
-        with pytest.raises(TypeError, match="async sessions are not supported yet"):
-            audit.install(factory)  # type: ignore[arg-type]
+    for factory in (async_sessionmaker(), AppAsyncSession, AsyncSession):
+        with pytest.raises(ValueError, match="pass sync_session_class="):
+            audit.install(factory)
+    with pytest.raises(TypeError, match="sync_session_class must be a Session"):
+        audit.install(async_sessionmaker(sync_session_class=int))
+
+
+def test_install_accepts_async_factories_through_their_sync_class(
+    engine: Engine,
+) -> None:
+    class AppSession(Session):
+        pass
+
+    class OtherSession(Session):
+        pass
+
+    class OtherAsyncSession(AsyncSession):
+        sync_session_class = OtherSession
+
+    audit = AuditTrail(engine, events=[])
+    factory = async_sessionmaker(sync_session_class=AppSession)
+    audit.install(factory)
+    assert installed_trail(factory().sync_session) is audit
+    assert installed_trail(async_sessionmaker()().sync_session) is None
+    with pytest.raises(ValueError, match="already installed on"):
+        AuditTrail(engine, events=[]).install(sessionmaker(class_=AppSession))
+
+    other = AuditTrail(engine, events=[])
+    other.install(OtherAsyncSession)
+    assert installed_trail(OtherAsyncSession().sync_session) is other
+
+
+def test_default_durable_engine_is_a_small_separate_pool() -> None:
+    url = "postgresql+psycopg://user:secret@db.example/app"
+    engine = create_engine(url)
+    durable = AuditTrail(engine, events=[]).durable_engine
+    assert isinstance(durable, Engine)
+    assert durable is not engine
+    assert durable.url.render_as_string(hide_password=False) == url
+    pool = durable.pool
+    assert isinstance(pool, QueuePool)
+    assert (pool.size(), pool.timeout()) == (DURABLE_POOL_SIZE, DURABLE_POOL_TIMEOUT)
+    # No public accessors for these two.
+    assert (pool._max_overflow, pool._pre_ping) == (0, True)
+
+
+def test_default_durable_engine_is_async_for_an_async_engine() -> None:
+    url = "postgresql+asyncpg://user:secret@db.example/app"
+    durable = AuditTrail(create_async_engine(url), events=[]).durable_engine
+    assert isinstance(durable, AsyncEngine)
+    assert durable.url.render_as_string(hide_password=False) == url
+    assert isinstance(durable.pool, AsyncAdaptedQueuePool)
+    assert durable.pool.size() == DURABLE_POOL_SIZE
+
+
+def test_a_given_durable_engine_is_used_as_is(engine: Engine) -> None:
+    durable = create_engine("postgresql+psycopg://localhost/durable")
+    audit = AuditTrail(engine, durable_engine=durable, events=[])
+    assert audit.durable_engine is durable
+
+
+def test_dispose_only_disposes_the_engine_the_library_built(engine: Engine) -> None:
+    owned = AuditTrail(engine, events=[])
+    pool = owned.durable_engine.pool
+    owned.dispose()
+    assert owned.durable_engine.pool is not pool  # dispose() swaps the pool
+
+    host_engine = create_engine("postgresql+psycopg://localhost/durable")
+    host_pool = host_engine.pool
+    AuditTrail(engine, durable_engine=host_engine, events=[]).dispose()
+    assert host_engine.pool is host_pool
+    with pytest.raises(TypeError, match="use dispose"):
+        asyncio.run(owned.adispose())
+
+
+async def test_adispose_only_disposes_the_engine_the_library_built() -> None:
+    async_engine = create_async_engine("postgresql+asyncpg://localhost/unused")
+    owned = AuditTrail(async_engine, events=[])
+    pool = owned.durable_engine.pool
+    await owned.adispose()
+    assert owned.durable_engine.pool is not pool
+
+    host_engine = create_async_engine("postgresql+asyncpg://localhost/durable")
+    host_pool = host_engine.pool
+    await AuditTrail(async_engine, durable_engine=host_engine, events=[]).adispose()
+    assert host_engine.pool is host_pool
+    with pytest.raises(TypeError, match="use adispose"):
+        owned.dispose()
 
 
 def test_install_twice_is_refused(engine: Engine) -> None:

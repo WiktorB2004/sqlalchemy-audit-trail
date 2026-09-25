@@ -9,7 +9,9 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
-from audit_trail.context import Actor, resolve_context
+from sqlalchemy import Engine, create_engine
+
+from audit_trail.context import Actor, AuditContext, resolve_context
 from audit_trail.context import bind as _bind
 from audit_trail.context import context as _context
 from audit_trail.context import set_actor as _set_actor
@@ -18,6 +20,7 @@ from audit_trail.events import (
     AuditEvent,
     EventRegistry,
     Severity,
+    WriteFlags,
     resolve_write_flags,
     validate_payload,
 )
@@ -28,11 +31,18 @@ from audit_trail.tables import build_tables
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
-    from sqlalchemy.engine import Engine
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
     from sqlalchemy.orm import Session, sessionmaker
 
+    from audit_trail.writer import Entry, TransactionValues
+
 OnError = Literal["log", "raise"]
+
+DURABLE_POOL_SIZE = 5
+"""Connections in the durable engine the library builds."""
+
+DURABLE_POOL_TIMEOUT = 5.0
+"""Seconds a durable write waits for a connection of that engine."""
 
 
 class Target(NamedTuple):
@@ -111,8 +121,14 @@ class AuditTrail:
         events: Event classes to register. ``None`` registers every
             ``AuditEvent`` subclass with members defined when the
             ``AuditTrail`` is created, so import them first or list them here.
-        durable_engine: Engine for durable writes. ``None`` builds a small
-            separate pool from ``engine``'s URL.
+        durable_engine: Engine for durable writes: sync for ``log``, async
+            for ``alog``. Must not be configured for ``AUTOCOMMIT``. ``None``
+            builds one from ``engine``'s URL (only the URL: pass your own
+            engine for ``connect_args`` and similar settings), sync or async
+            like ``engine``, with its own small pool (``DURABLE_POOL_SIZE``
+            connections, no overflow, ``DURABLE_POOL_TIMEOUT``, pre-ping).
+            It connects on the first durable write; ``dispose`` or
+            ``adispose`` closes it.
         on_error: ``"log"`` keeps the business transaction alive when an audit
             write fails; ``"raise"`` propagates. ``fail_closed`` events always
             raise.
@@ -140,6 +156,7 @@ class AuditTrail:
         maintenance: Partition management on ``engine``, for example
             ``audit.maintenance.ensure_partitions()``.
         query: Read queries, for example ``audit.query.list_groups(session)``.
+        durable_engine: The engine durable writes use.
 
     Raises:
         EventRegistryError: An event or a severity setting is invalid.
@@ -182,7 +199,12 @@ class AuditTrail:
             default_severity=default_severity,
             system_severity=system_severity,
         )
-        self.durable_engine = durable_engine
+        self._owns_durable_engine = durable_engine is None
+        self.durable_engine: Engine | AsyncEngine = (
+            _default_durable_engine(engine)
+            if durable_engine is None
+            else durable_engine
+        )
         self.on_error: OnError = on_error
         self.pseudonymize_key = pseudonymize_key
         self.session_provider = session_provider
@@ -200,7 +222,12 @@ class AuditTrail:
 
         self.query = AuditQuery(self.tables, self.severities)
 
-    def install(self, session_factory: sessionmaker[Any] | type[Session]) -> None:
+    def install(
+        self,
+        session_factory: type[Session | AsyncSession]
+        | sessionmaker[Any]
+        | async_sessionmaker[Any],
+    ) -> None:
         """Audit the sessions of a factory.
 
         Registers the listeners on the factory's session class only (for a
@@ -209,15 +236,23 @@ class AuditTrail:
         ``session.info["audit_enabled"] = False`` to switch capture off for
         one session of that class.
 
+        An ``AsyncSession`` runs a sync ``Session`` in a greenlet, and the
+        listeners are registered on that class: give the async factory your
+        own ``Session`` subclass, as in
+        ``async_sessionmaker(engine, sync_session_class=AppSession)`` or as
+        ``sync_session_class`` of an ``AsyncSession`` subclass.
+
         Args:
-            session_factory: A ``sessionmaker`` or a ``Session`` subclass.
+            session_factory: A ``sessionmaker`` or ``Session`` subclass, or
+                an ``async_sessionmaker`` or ``AsyncSession`` subclass.
 
         Raises:
-            TypeError: ``session_factory`` is neither, or is asynchronous
-                (not supported yet).
-            ValueError: ``session_factory`` is the base ``Session``, or an
-                ``AuditTrail`` is already installed on its class, a base
-                class or a subclass of it.
+            TypeError: ``session_factory`` is none of these, or its
+                ``sync_session_class`` is not a ``Session`` subclass.
+            ValueError: The session class is the base ``Session`` (for an
+                async factory: no ``sync_session_class`` was given), or an
+                ``AuditTrail`` is already installed on it, a base class or a
+                subclass of it.
         """
         from audit_trail.listener import install
 
@@ -245,6 +280,33 @@ class AuditTrail:
             value, purpose=purpose, keys=self.keys, json_encoder=self.json_encoder
         )
 
+    def dispose(self) -> None:
+        """Close the pooled connections of a durable engine the library built.
+
+        A ``durable_engine`` passed in is the host's to dispose; this leaves it
+        alone.
+
+        Raises:
+            TypeError: The library's durable engine is async; use ``adispose``.
+        """
+        if not self._owns_durable_engine:
+            return
+        if not isinstance(self.durable_engine, Engine):
+            raise TypeError("the durable engine is async; use adispose")
+        self.durable_engine.dispose()
+
+    async def adispose(self) -> None:
+        """Async ``dispose``, for a durable engine the library built async.
+
+        Raises:
+            TypeError: The library's durable engine is sync; use ``dispose``.
+        """
+        if not self._owns_durable_engine:
+            return
+        if isinstance(self.durable_engine, Engine):
+            raise TypeError("the durable engine is sync; use dispose")
+        await self.durable_engine.dispose()
+
     def log(
         self,
         session: Session,
@@ -256,14 +318,31 @@ class AuditTrail:
         actor: Actor | None = None,
         durable: bool | None = None,
     ) -> None:
-        """Record an explicit event in the session's current transaction.
+        """Record an explicit event.
 
-        The entry is inserted immediately on ``session.connection()``, in the
-        same database transaction as the session's changes: it is committed
-        or rolled back with them, and shares their ``audit_transaction`` row.
-        It is written even when ``session.info["audit_enabled"]`` is
+        A non-durable entry is inserted immediately on
+        ``session.connection()``, in the same database transaction as the
+        session's changes: it is committed or rolled back with them, and
+        shares their ``audit_transaction`` row. Write failures follow
+        ``on_error``.
+
+        A durable entry (the event's ``durable`` or ``fail_closed``, or
+        ``durable=True``) is written on a connection of ``durable_engine`` in
+        a transaction of its own, with its own ``audit_transaction`` row built
+        from the current context, and committed before this returns, so it
+        survives a rollback of the session. A failed write is logged with
+        ``on_error="log"``; with ``on_error="raise"``, and always for a
+        ``fail_closed`` event, it raises ``AuditWriteError``. With
+        ``auto_create_partitions``, a missing partition is created and the
+        write retried once. Creating a partition waits for every open
+        transaction that has written audit rows, including the session's own:
+        if it has, the retry fails after the ``ensure_partitions`` lock
+        timeout (about 5 to 10 seconds) and a ``fail_closed`` event raises
+        ``AuditWriteError``. Run ``ensure_partitions`` ahead of time rather
+        than relying on the retry.
+
+        Either kind is written even when ``session.info["audit_enabled"]`` is
         ``False``, which only switches off the automatic ``entity.*`` entries.
-        Write failures follow ``on_error``.
 
         Args:
             session: A session of a class this ``AuditTrail`` is installed on.
@@ -282,20 +361,146 @@ class AuditTrail:
             actor: The actor of this entry. It sets the entry's ``actor_id``
                 and the actor fields of its ``data.context``; the
                 ``audit_transaction`` row keeps the actor of the context.
+            durable: Overrides the event's ``durable`` setting; ``False``
+                cannot weaken a ``fail_closed`` event.
+
+        Raises:
+            TypeError: The session's class is not installed by this
+                ``AuditTrail``, or the write is durable and
+                ``durable_engine`` is async.
+            ValueError: The event uses a reserved prefix, ``durable=False``
+                is given for a ``fail_closed`` event, ``obj`` or an instance
+                ``target`` has no primary key, or a ``Pseudonymized`` field
+                cannot be pseudonymized.
+            UnknownEventError: The event is not registered.
+            PayloadError: The payload does not match the event's schema, or a
+                ``Pseudonymized`` field already holds a pseudonym token.
+            AuditWriteError: A durable write failed and the policy says to
+                raise.
+        """
+        from audit_trail.listener import write_entries
+        from audit_trail.writer import (
+            DURABLE_WRITE_ERRORS,
+            handle_durable_failure,
+            write_durable,
+        )
+
+        entry = self._prepare(session, event, obj, target, payload, actor, durable)
+        if not entry.flags.durable:
+            write_entries(session, self, [entry.entry], entry.ctx)
+            return
+        engine = self.durable_engine
+        if not isinstance(engine, Engine):
+            raise TypeError(
+                "log() writes durable entries with a sync durable_engine; "
+                "this one is async: use alog()"
+            )
+        values = self._transaction_values(entry.ctx)
+        try:
+            with engine.connect() as conn:
+                write_durable(
+                    conn,
+                    self.tables,
+                    self._severity_values(),
+                    values,
+                    [entry.entry],
+                    auto_create_partitions=self.auto_create_partitions,
+                )
+        except DURABLE_WRITE_ERRORS as exc:
+            handle_durable_failure(exc, self.on_error, entry.flags.fail_closed)
+
+    async def alog(
+        self,
+        session: AsyncSession,
+        event: AuditEvent,
+        *,
+        obj: object | None = None,
+        target: Target | object | None = None,
+        payload: Mapping[str, object] | BaseModel | None = None,
+        actor: Actor | None = None,
+        durable: bool | None = None,
+    ) -> None:
+        """Async ``log``, for an ``AsyncSession`` of an installed factory.
+
+        A non-durable entry is written in the session's transaction, a
+        durable one on the async ``durable_engine``; see ``log``.
+
+        Args:
+            session: An ``AsyncSession`` whose ``sync_session_class`` this
+                ``AuditTrail`` is installed on.
+            event: A registered host event.
+            obj: The object the event is about; see ``log``.
+            target: The parent object; see ``log``.
+            payload: The payload; see ``log``.
+            actor: The actor of this entry; see ``log``.
             durable: Overrides the event's ``durable`` setting.
 
         Raises:
             TypeError: The session's class is not installed by this
-                ``AuditTrail``.
-            ValueError: The event uses a reserved prefix, ``obj`` or an
-                instance ``target`` has no primary key, or a
-                ``Pseudonymized`` field cannot be pseudonymized.
-            NotImplementedError: The write would be durable; durable writes
-                are not supported yet.
+                ``AuditTrail``, or the write is durable and
+                ``durable_engine`` is sync.
+            ValueError: As for ``log``.
             UnknownEventError: The event is not registered.
-            PayloadError: The payload does not match the event's schema, or a
-                ``Pseudonymized`` field already holds a pseudonym token.
+            PayloadError: The payload does not match the event's schema.
+            AuditWriteError: A durable write failed and the policy says to
+                raise.
         """
+        from audit_trail.listener import write_entries
+        from audit_trail.writer import (
+            DURABLE_WRITE_ERRORS,
+            handle_durable_failure,
+            write_durable,
+        )
+
+        entry = self._prepare(
+            session.sync_session, event, obj, target, payload, actor, durable
+        )
+        if not entry.flags.durable:
+            await session.run_sync(
+                lambda sync_session: write_entries(
+                    sync_session, self, [entry.entry], entry.ctx
+                )
+            )
+            return
+        engine = self.durable_engine
+        if isinstance(engine, Engine):
+            raise TypeError(
+                "alog() writes durable entries with an async durable_engine; "
+                "this one is sync: use log()"
+            )
+        values = self._transaction_values(entry.ctx)
+        try:
+            async with engine.connect() as conn:
+                await conn.run_sync(
+                    write_durable,
+                    self.tables,
+                    self._severity_values(),
+                    values,
+                    [entry.entry],
+                    auto_create_partitions=self.auto_create_partitions,
+                )
+        except DURABLE_WRITE_ERRORS as exc:
+            handle_durable_failure(exc, self.on_error, entry.flags.fail_closed)
+
+    def _transaction_values(self, ctx: AuditContext) -> TransactionValues:
+        from audit_trail.writer import transaction_values
+
+        return transaction_values(ctx, self.json_encoder)
+
+    def _severity_values(self) -> list[int]:
+        return [int(member) for member in self.severities]
+
+    def _prepare(
+        self,
+        session: Session,
+        event: AuditEvent,
+        obj: object | None,
+        target: Target | object | None,
+        payload: Mapping[str, object] | BaseModel | None,
+        actor: Actor | None,
+        durable: bool | None,
+    ) -> _PreparedEntry:
+        # Everything of log() before the write; no I/O.
         from audit_trail.diff import (
             USE_CONTEXT,
             format_target,
@@ -305,14 +510,13 @@ class AuditTrail:
             resolve_scope,
             resolve_target,
         )
-        from audit_trail.listener import installed_trail, write_entries
+        from audit_trail.listener import installed_trail
         from audit_trail.writer import ENVELOPE_VERSION, context_data, encode_payload
 
         if str(event).startswith(RESERVED_PREFIXES):
             raise ValueError(f"{event!s} is reserved for the library")
         severity = self.registry.severity_of(event)
-        if resolve_write_flags(event, durable).durable:
-            raise NotImplementedError("durable writes are not supported yet")
+        flags = resolve_write_flags(event, durable)
         if installed_trail(session) is not self:
             raise TypeError(
                 "log() needs a session of a class this AuditTrail is installed on"
@@ -348,29 +552,54 @@ class AuditTrail:
             target_type = object_type_of(target)
             target_id = _required_id(target, "target")
 
-        write_entries(
-            session,
-            self,
-            [
-                {
-                    "verb": event.value,
-                    "severity": int(severity),
-                    "object_type": object_type,
-                    "object_id": object_id,
-                    "object_label": label,
-                    "target_type": target_type,
-                    "target_id": target_id,
-                    "actor_id": entry_ctx.actor_id,
-                    "scope_id": scope_id,
-                    "data": {
-                        "v": ENVELOPE_VERSION,
-                        "payload": encoded,
-                        "context": context_data(entry_ctx, self.json_encoder),
-                    },
-                }
-            ],
+        return _PreparedEntry(
+            {
+                "verb": event.value,
+                "severity": int(severity),
+                "object_type": object_type,
+                "object_id": object_id,
+                "object_label": label,
+                "target_type": target_type,
+                "target_id": target_id,
+                "actor_id": entry_ctx.actor_id,
+                "scope_id": scope_id,
+                "data": {
+                    "v": ENVELOPE_VERSION,
+                    "payload": encoded,
+                    "context": context_data(entry_ctx, self.json_encoder),
+                },
+            },
             ctx,
+            flags,
         )
+
+
+class _PreparedEntry(NamedTuple):
+    entry: Entry
+    ctx: AuditContext
+    flags: WriteFlags
+
+
+def _default_durable_engine(engine: Engine | AsyncEngine) -> Engine | AsyncEngine:
+    # The URL object keeps the password (its string form masks it).
+    if isinstance(engine, Engine):
+        return create_engine(
+            engine.url,
+            pool_size=DURABLE_POOL_SIZE,
+            max_overflow=0,
+            pool_timeout=DURABLE_POOL_TIMEOUT,
+            pool_pre_ping=True,
+        )
+    # An AsyncEngine means the host has loaded asyncio support already.
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    return create_async_engine(
+        engine.url,
+        pool_size=DURABLE_POOL_SIZE,
+        max_overflow=0,
+        pool_timeout=DURABLE_POOL_TIMEOUT,
+        pool_pre_ping=True,
+    )
 
 
 def _required_id(obj: object, name: str) -> str:
