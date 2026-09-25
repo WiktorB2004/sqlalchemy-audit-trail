@@ -1,6 +1,57 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "schedule": ["before 6am on monday"],
+  "osvVulnerabilityAlerts": true,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "pre-commit": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "description": "Delay PyPI releases to reduce compromised-package risk",
+      "matchDatasources": ["pypi"],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "The local Python version follows the CI matrix, not the latest release",
+      "matchManagers": ["pyenv"],
+      "enabled": false
+    },
+    {
+      "description": "Runtime dependency ranges are what users may install: widen them, never raise the lower bound",
+      "matchDepTypes": ["project.dependencies", "project.optional-dependencies"],
+      "rangeStrategy": "widen"
+    },
+    {
+      "groupName": "github-actions",
+      "matchManagers": ["github-actions"]
+    },
+    {
+      "groupName": "pre-commit hooks",
+      "matchManagers": ["pre-commit"]
+    },
+    {
+      "groupName": "ruff",
+      "matchPackageNames": ["ruff", "astral-sh/ruff-pre-commit"]
+    },
+    {
+      "groupName": "python patch and minor",
+      "matchDatasources": ["pypi"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "matchPackageNames": ["!ruff"]
+    },
+    {
+      "description": "Automerge GitHub Action digest-only bumps after CI",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["digest", "pinDigest"],
+      "automerge": true
+    }
   ]
 }

@@ -7,6 +7,10 @@ A write in the caller's transaction is one ``audit_transaction`` row per
 database transaction (inserted by the first entry, then reused) and one
 ``INSERT ... executemany`` of ``audit_activity`` rows per call. Rows are
 never updated afterwards.
+
+A durable write runs on the library's own connection, in its own transaction
+holding one ``audit_transaction`` row and its activity rows, committed at
+once and never through the caller's session.
 """
 
 from __future__ import annotations
@@ -20,11 +24,13 @@ from uuid import UUID
 
 from sqlalchemy import Connection, Table, insert
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from audit_trail._compaction import ActivityData
 from audit_trail._typing import assert_never
 from audit_trail.context import AuditContext, ContextSnapshot, context_snapshot
 from audit_trail.events import PayloadError
+from audit_trail.maintenance import PartitionError, ensure_partitions
 from audit_trail.serialization import (
     JSONValue,
     KeyRing,
@@ -39,6 +45,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
 
     from audit_trail.config import OnError
+    from audit_trail.tables import AuditTables
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +61,16 @@ _NO_PARTITION = "no partition of relation"
 _PSEUDONYM_PREFIX = re.compile(r"audit\.[a-z][a-z0-9_]*\.v[0-9]+:")
 
 _T = TypeVar("_T")
+
+
+class AuditWriteError(Exception):
+    """A durable audit write failed and the write policy says to raise.
+
+    Raised for ``fail_closed`` events, and for other durable writes with
+    ``on_error="raise"``. The original error (a ``DBAPIError``, the pool's
+    ``sqlalchemy.exc.TimeoutError`` or a ``PartitionError``) is the
+    ``__cause__``. Nothing of the entry was committed.
+    """
 
 
 class TransactionRow(NamedTuple):
@@ -338,17 +355,131 @@ def run_isolated(
             assert_never(on_error)
 
 
-def _log_failure(exc: DBAPIError) -> None:
+def is_missing_partition(exc: DBAPIError) -> bool:
+    """Tell whether a database error is a row that fits no partition.
+
+    Args:
+        exc: The error.
+
+    Returns:
+        ``True`` for SQLSTATE ``23514`` with PostgreSQL's "no partition of
+        relation" message.
+    """
     orig = exc.orig
     sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
-    if sqlstate == CHECK_VIOLATION and _NO_PARTITION in str(orig):
+    return sqlstate == CHECK_VIOLATION and _NO_PARTITION in str(orig)
+
+
+def _log_failure(exc: DBAPIError) -> None:
+    if is_missing_partition(exc):
         logger.error(
             "Audit entries were not written: no partition for the row (%s). "
             "Run ensure_partitions; the business transaction continues.",
-            str(orig).strip(),
+            str(exc.orig).strip(),
         )
         return
     logger.error(
         "Audit entries were not written; the business transaction continues.",
         exc_info=exc,
     )
+
+
+def write_durable(
+    connection: Connection,
+    tables: AuditTables,
+    severities: Sequence[int],
+    values: TransactionValues,
+    entries: Sequence[Entry],
+    *,
+    auto_create_partitions: bool,
+) -> TransactionRow:
+    """Write one ``audit_transaction`` row and its entries, and commit.
+
+    Runs its own transactions on ``connection``, which must be idle and not
+    in ``AUTOCOMMIT`` mode. With ``auto_create_partitions``, a row that fits
+    no partition (SQLSTATE ``23514``) makes it create the missing partitions
+    with ``ensure_partitions`` in a separate transaction on the same
+    connection and retry once.
+
+    Args:
+        connection: A connection of the durable engine.
+        tables: The audit tables.
+        severities: Severity values to create partitions for on a retry.
+        values: The ``audit_transaction`` row.
+        entries: The entries.
+        auto_create_partitions: Create missing partitions and retry once.
+
+    Returns:
+        The committed transaction row.
+
+    Raises:
+        DBAPIError: An insert failed (on the retry, when there was one).
+        PartitionError: Creating the partitions failed, for example
+            ``PartitionLockTimeoutError``.
+    """
+
+    def insert_all() -> TransactionRow:
+        with connection.begin():
+            row = insert_transaction(connection, tables.transaction, values)
+            insert_activities(connection, tables.activity, row, entries)
+        return row
+
+    try:
+        return insert_all()
+    except DBAPIError as exc:
+        if not (auto_create_partitions and is_missing_partition(exc)):
+            raise
+    # The partitions are created here, on the connection that already holds
+    # the failed write, rather than through PartitionManager on the main
+    # engine: that needs no second checkout from a pool that may be the
+    # exhausted one, it works whether log() or alog() is writing, and it is
+    # still a transaction of its own, separate from the caller's session
+    # (ensure_partitions refuses AUTOCOMMIT).
+    with connection.begin():
+        created = ensure_partitions(connection, tables, severities)
+    logger.warning(
+        "A durable audit write found no partition for its row; created %s "
+        "and retried once. Run ensure_partitions ahead of time.",
+        ", ".join(created) or "nothing (another process created them)",
+    )
+    return insert_all()
+
+
+DURABLE_WRITE_ERRORS = (DBAPIError, PoolTimeoutError, PartitionError)
+"""Failures of a durable write that the write policy handles."""
+
+
+def handle_durable_failure(
+    exc: DBAPIError | PoolTimeoutError | PartitionError,
+    on_error: OnError,
+    fail_closed: bool,
+) -> None:
+    """Apply the write policy to a failed durable write.
+
+    A ``fail_closed`` write, or any durable write with ``on_error="raise"``,
+    raises ``AuditWriteError``; otherwise the failure is logged.
+
+    Args:
+        exc: The failure, one of ``DURABLE_WRITE_ERRORS``.
+        on_error: The write policy.
+        fail_closed: The entry must not be lost; always raise.
+
+    Raises:
+        AuditWriteError: The policy says to raise; ``exc`` is the cause.
+    """
+    if fail_closed:
+        raise AuditWriteError("a fail_closed audit entry was not written") from exc
+    match on_error:
+        case "raise":
+            raise AuditWriteError("a durable audit entry was not written") from exc
+        case "log":
+            if isinstance(exc, DBAPIError) and is_missing_partition(exc):
+                logger.error(
+                    "A durable audit entry was not written: no partition for "
+                    "the row (%s). Run ensure_partitions.",
+                    str(exc.orig).strip(),
+                )
+            else:
+                logger.error("A durable audit entry was not written.", exc_info=exc)
+        case _:
+            assert_never(on_error)
