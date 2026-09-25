@@ -10,6 +10,7 @@
 - `AuditTrail` gains `default_severity`, `system_severity`, `events` and `global_redact`, and exposes `context()`, `set_actor()`, `bind()`, `pseudonymize()` and `maintenance`
 - Audit options read a column never set on a new instance as `None` instead of falling back as if it were not loaded
 - `AuditTrail.log()`: records an explicit event in the session's transaction, with payload validation, `Pseudonymized` payload fields, a per-entry `actor=` and a `Target` (also returned by the `target` option); `warn_on_bulk` warns about bulk `UPDATE`/`DELETE` statements on audited tables, which bypass the trail
+- `audit.query.list_groups()` / `alist_groups()`: lists audit entries grouped by transaction, newest first, with keyset pagination (`Cursor`), filters, `Visibility` restrictions and read-time compaction of per-flush rows; queries prune partitions and force custom plans
 
 ## 0.1.0a1 - 2026-09-25
 

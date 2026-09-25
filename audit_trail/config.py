@@ -139,6 +139,7 @@ class AuditTrail:
         keys: Key ring built from ``pseudonymize_key``, or ``None``.
         maintenance: Partition management on ``engine``, for example
             ``audit.maintenance.ensure_partitions()``.
+        query: Read queries, for example ``audit.query.list_groups(session)``.
 
     Raises:
         EventRegistryError: An event or a severity setting is invalid.
@@ -195,6 +196,9 @@ class AuditTrail:
         self.keys = None if pseudonymize_key is None else KeyRing(pseudonymize_key)
         self.tables = build_tables(schema=schema, indexes=indexes)
         self.maintenance = PartitionManager(engine, self.tables, self.severities)
+        from audit_trail.query import AuditQuery
+
+        self.query = AuditQuery(self.tables, self.severities)
 
     def install(self, session_factory: sessionmaker[Any] | type[Session]) -> None:
         """Audit the sessions of a factory.
