@@ -19,7 +19,7 @@ the session fires no ``remove`` on that parent.
 from __future__ import annotations
 
 import json
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from sqlalchemy import event, inspect
 from sqlalchemy.orm import (
@@ -37,7 +37,13 @@ __all__ = [
 
 _INFO_KEY = "audit_trail.relations"
 
-_tracked: set[tuple[type[Any], str]] = set()
+
+class _TrackedAttribute(NamedTuple):
+    cls: type[Any]
+    key: str
+
+
+_tracked: set[_TrackedAttribute] = set()
 
 
 class _Delta:
@@ -111,19 +117,19 @@ def track_relationships(*attributes: InstrumentedAttribute[Any]) -> None:
         # Listeners propagate to subclasses, so a key tracked on any class in
         # the MRO already covers this one; registering again would count
         # every change twice.
-        if any((base, key) in _tracked for base in cls.__mro__):
+        if any(_TrackedAttribute(base, key) in _tracked for base in cls.__mro__):
             continue
-        for tracked_cls, tracked_key in _tracked:
-            if tracked_key == key and issubclass(tracked_cls, cls):
+        for tracked in _tracked:
+            if tracked.key == key and issubclass(tracked.cls, cls):
                 raise ValueError(
                     f"cannot track {cls.__name__}.{key}: subclass attribute "
-                    f"{tracked_cls.__name__}.{key} is already tracked and its "
+                    f"{tracked.cls.__name__}.{key} is already tracked and its "
                     "changes would be counted twice"
                 )
         _listen(attr, key)
         if not event.contains(cls, "expire", _on_expire):
             event.listen(cls, "expire", _on_expire, raw=True, propagate=True)
-        _tracked.add((cls, key))
+        _tracked.add(_TrackedAttribute(cls, key))
 
 
 def _listen(attr: InstrumentedAttribute[Any], key: str) -> None:
