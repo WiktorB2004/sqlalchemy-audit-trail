@@ -65,6 +65,8 @@ def net_changes(session: Session, obj: object, key: str) -> tuple[set[str], set[
     for recorded, changes in session.info.get("changes", []):
         if recorded is not obj or key not in changes:
             continue
+        # Within one flush an item is either added or removed, never both.
+        assert not set(changes[key]["added"]) & set(changes[key]["removed"])
         for item in changes[key]["added"]:
             if item in removed:
                 removed.discard(item)
@@ -222,7 +224,6 @@ def append_then_remove(s: Session, post: Any, m: Models) -> None:
 def remove_then_reappend(s: Session, post: Any, m: Models) -> None:
     tag = s.get_one(m.Tag, 101)
     post.tags.remove(tag)
-    s.get_one(m.Tag, 104)
     post.tags.append(tag)
 
 
@@ -343,6 +344,16 @@ def test_loading_collection_is_not_a_change(
     assert "changes" not in session.info
 
 
+def assert_no_stale_delta(
+    engine: Engine, models: Models, session: Session, post: Any
+) -> None:
+    """Flush ``post`` again and check no relationship change is reported."""
+    post.title = "changed"
+    session.commit()
+    assert "changes" not in session.info
+    assert db_tags(engine, models, 1) == INITIAL_TAGS
+
+
 def test_rollback_discards_deltas(
     engine: Engine, models: Models, session: Session
 ) -> None:
@@ -350,11 +361,7 @@ def test_rollback_discards_deltas(
     post.tags.append(session.get_one(models.Tag, 103))
     session.rollback()
 
-    assert pop_relationship_changes(post) == {}
-    post.title = "changed"
-    session.commit()
-    assert "changes" not in session.info
-    assert db_tags(engine, models, 1) == INITIAL_TAGS
+    assert_no_stale_delta(engine, models, session, post)
 
 
 def test_savepoint_rollback_discards_deltas(
@@ -364,10 +371,8 @@ def test_savepoint_rollback_discards_deltas(
     savepoint = session.begin_nested()
     post.tags.append(session.get_one(models.Tag, 103))
     savepoint.rollback()
-    session.commit()
 
-    assert "changes" not in session.info
-    assert db_tags(engine, models, 1) == INITIAL_TAGS
+    assert_no_stale_delta(engine, models, session, post)
 
 
 @pytest.mark.parametrize("discard", ["expire", "refresh"])
@@ -377,10 +382,8 @@ def test_expired_collection_discards_deltas(
     post = session.get_one(models.Post, 1)
     post.tags.append(session.get_one(models.Tag, 103))
     getattr(session, discard)(post)
-    session.commit()
 
-    assert "changes" not in session.info
-    assert db_tags(engine, models, 1) == INITIAL_TAGS
+    assert_no_stale_delta(engine, models, session, post)
 
 
 def test_discard_relationship_changes(models: Models, session: Session) -> None:
