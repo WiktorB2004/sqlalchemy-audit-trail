@@ -2,6 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from audit_trail.checks import ModelIssue, check_models
 from audit_trail.config import AuditOptions, AuditTrail
 from audit_trail.context import Actor, AuditContext
 from audit_trail.diff import AuditOptionError, FieldPolicyError
@@ -23,8 +24,10 @@ __all__ = [
     "AuditTrail",
     "Audited",
     "FieldPolicyError",
+    "ModelIssue",
     "Pseudonymized",
     "Severity",
     "__version__",
+    "check_models",
     "event",
 ]
