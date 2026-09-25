@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from audit_trail.context import (
     Actor,
     AuditContext,
+    ContextSnapshot,
     bind,
     context,
     context_snapshot,
@@ -216,7 +217,11 @@ def test_snapshot_full() -> None:
         extra={"ticket": "T-1"},
     )
 
-    assert context_snapshot(ctx) == {
+    snapshot = context_snapshot(ctx)
+
+    # Keeps the TypedDict and the builder in sync.
+    assert set(snapshot) == set(ContextSnapshot.__annotations__)
+    assert snapshot == {
         "actor_type": "user",
         "actor_label": "a@example.com",
         "remote_addr": "10.0.0.1",
@@ -237,3 +242,27 @@ def test_snapshot_meta_is_a_copy() -> None:
     ctx.extra["ticket"] = "T-2"
 
     assert snapshot["meta"] == {"ticket": "T-1"}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "actor_type",
+        "actor_label",
+        "remote_addr",
+        "user_agent",
+        "method",
+        "path",
+        "channel",
+        "auth_method",
+    ],
+)
+@pytest.mark.parametrize("empty", [None, ""])
+def test_snapshot_omits_each_empty_field(name: str, empty: str | None) -> None:
+    ctx = AuditContext()
+    setattr(ctx, name, "x")
+    assert name in context_snapshot(ctx)
+
+    setattr(ctx, name, empty)
+
+    assert name not in context_snapshot(ctx)

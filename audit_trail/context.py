@@ -16,7 +16,7 @@ from collections.abc import Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -24,18 +24,6 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
 _SESSION_INFO_KEY = "audit_context"
-
-_SNAPSHOT_FIELDS = (
-    "actor_type",
-    "actor_label",
-    "remote_addr",
-    "user_agent",
-    "method",
-    "path",
-    "channel",
-    "auth_method",
-    "request_id",
-)
 
 
 @dataclass(frozen=True)
@@ -268,7 +256,25 @@ def resolve_context(
     return AuditContext()
 
 
-def context_snapshot(ctx: AuditContext) -> dict[str, Any]:
+class ContextSnapshot(TypedDict, total=False):
+    """The ``data.context`` snapshot stored on each audit entry.
+
+    Every key is optional: empty values are left out.
+    """
+
+    actor_type: str
+    actor_label: str
+    remote_addr: str
+    user_agent: str
+    method: str
+    path: str
+    channel: str
+    auth_method: str
+    request_id: str
+    meta: dict[str, object]
+
+
+def context_snapshot(ctx: AuditContext) -> ContextSnapshot:
     """Build the ``data.context`` snapshot stored on each audit entry.
 
     Empty values (``None``, ``""``, an empty ``extra``) are left out.
@@ -278,15 +284,28 @@ def context_snapshot(ctx: AuditContext) -> dict[str, Any]:
         ctx: The context to snapshot.
 
     Returns:
-        A JSON-ready dict; ``request_id`` is a string and ``extra`` is copied
-        as ``meta``.
+        The snapshot; ``request_id`` is a string and ``extra`` is copied as
+        ``meta``. ``meta`` values are encoded to JSON by the writer.
     """
-    snapshot: dict[str, Any] = {}
-    for name in _SNAPSHOT_FIELDS:
-        value = getattr(ctx, name)
-        if value is None or value == "":
-            continue
-        snapshot[name] = str(value) if isinstance(value, UUID) else value
+    snapshot: ContextSnapshot = {}
+    if ctx.actor_type:
+        snapshot["actor_type"] = ctx.actor_type
+    if ctx.actor_label:
+        snapshot["actor_label"] = ctx.actor_label
+    if ctx.remote_addr:
+        snapshot["remote_addr"] = ctx.remote_addr
+    if ctx.user_agent:
+        snapshot["user_agent"] = ctx.user_agent
+    if ctx.method:
+        snapshot["method"] = ctx.method
+    if ctx.path:
+        snapshot["path"] = ctx.path
+    if ctx.channel:
+        snapshot["channel"] = ctx.channel
+    if ctx.auth_method:
+        snapshot["auth_method"] = ctx.auth_method
+    if ctx.request_id is not None:
+        snapshot["request_id"] = str(ctx.request_id)
     if ctx.extra:
         snapshot["meta"] = dict(ctx.extra)
     return snapshot
