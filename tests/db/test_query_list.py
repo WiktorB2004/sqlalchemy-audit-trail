@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -493,8 +492,8 @@ BASE = datetime(2026, 3, 1, 0, 0, 1, tzinfo=timezone.utc)
 
 
 @pytest.fixture
-def collisions(env: Env) -> Iterator[tuple[Env, dict[int, str]]]:
-    """Insert ``ROWS``; yields the env and transaction names by id."""
+def collisions(env: Env) -> tuple[Env, dict[int, str]]:
+    """Insert ``ROWS``; returns the env and transaction names by id."""
     base = BASE
     tables = env.trail.tables
     names: dict[int, str] = {}
@@ -525,7 +524,7 @@ def collisions(env: Env) -> Iterator[tuple[Env, dict[int, str]]]:
                     data={"v": 1, "payload": {}},
                 )
             )
-    yield env, names
+    return env, names
 
 
 WALKS: list[dict[str, Any]] = [

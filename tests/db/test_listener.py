@@ -167,7 +167,8 @@ def test_created_entry(env: Env, models: Models) -> None:
     assert (row["object_type"], row["object_id"]) == ("Post", str(post_id))
     assert row["object_label"] == "Hello"
     assert row["scope_id"] == "t1"
-    assert row["target_type"] is None and row["target_id"] is None
+    assert row["target_type"] is None
+    assert row["target_id"] is None
     assert row["transaction_id"] == transaction["id"]
     assert row["created_at"] == transaction["issued_at"]
     assert row["data"] == {

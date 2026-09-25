@@ -290,7 +290,7 @@ def _unchanged(old: JSONValue, new: JSONValue) -> bool:
 
 
 def _is_marker(value: JSONValue) -> bool:
-    return value == REDACTED or value == UNKNOWN or value == ERASED
+    return value in (REDACTED, UNKNOWN, ERASED)
 
 
 def _canonical(value: JSONValue) -> str:

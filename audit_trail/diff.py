@@ -542,7 +542,7 @@ def resolve_label(obj: object, options: AuditOptions) -> str | None:
     return str(value) if ok and value is not None else None
 
 
-def resolve_scope(obj: object, options: AuditOptions) -> str | None | UseContext:
+def resolve_scope(obj: object, options: AuditOptions) -> str | UseContext | None:
     """Evaluate ``options.scope`` for ``scope_id`` without emitting SQL.
 
     Args:

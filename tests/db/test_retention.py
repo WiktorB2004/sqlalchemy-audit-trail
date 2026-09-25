@@ -411,7 +411,8 @@ def test_reader_of_expired_partition_blocks_with_access_exclusive(
     with engine.connect() as blocker:
         blocker.execute(
             text(
-                f"SELECT count(*) FROM {qualified_name(schema, 'audit_transaction_p2026_06')}"
+                "SELECT count(*) FROM "
+                f"{qualified_name(schema, 'audit_transaction_p2026_06')}"
             )
         )
         try:
@@ -438,7 +439,8 @@ def test_waiting_detach_and_ensure_partitions_do_not_hang(
     with engine.connect() as conn:
         deadlock_timeout: float = conn.execute(
             text(
-                "SELECT setting::float / 1000 FROM pg_settings WHERE name = 'deadlock_timeout'"
+                "SELECT setting::float / 1000 FROM pg_settings "
+                "WHERE name = 'deadlock_timeout'"
             )
         ).scalar_one()
     bound = lock_timeout + deadlock_timeout + 1  # 1 s of slack for the test itself

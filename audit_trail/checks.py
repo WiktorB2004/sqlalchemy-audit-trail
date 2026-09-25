@@ -240,7 +240,7 @@ def _is_mutable(mapper: Mapper[Any], key: str) -> bool:
         obj = mapper.class_manager.new_instance()
         try:
             setattr(obj, key, probe)
-        except Exception:  # noqa: BLE001, S112 - a host validator may reject it; then warn
+        except Exception:  # a host validator may reject it; then warn
             continue
         if isinstance(getattr(obj, key), Mutable):
             return True

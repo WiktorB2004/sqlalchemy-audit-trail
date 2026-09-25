@@ -87,6 +87,11 @@ markers = [
     "db: needs a PostgreSQL server (AUDIT_TEST_DATABASE_URL or Docker for testcontainers)",
 ]
 
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "PIE", "RUF", "PT", "RET"]
+# assert_never for Python 3.10; lets RET503 see it as NoReturn.
+typing-modules = ["audit_trail._typing"]
+
 [tool.mypy]
 python_version = "3.10"
 files = ["audit_trail", "tests"]

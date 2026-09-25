@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from audit_trail.query import AuditQuery, Cursor, LabelResolver, Visibility
 from audit_trail.tables import build_tables
 
-NAIVE = datetime(2026, 9, 1)  # noqa: DTZ001
+NAIVE = datetime(2026, 9, 1)
 AWARE = datetime(2026, 9, 1, tzinfo=timezone.utc)
 CORRELATION = UUID("00000000-0000-0000-0000-00000000000c")
 

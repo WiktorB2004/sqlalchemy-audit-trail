@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from audit_trail.query import AuditQuery, Cursor, Visibility
 from audit_trail.tables import build_tables
 
-NAIVE = datetime(2026, 9, 1)  # noqa: DTZ001
+NAIVE = datetime(2026, 9, 1)
 AT = datetime(2026, 9, 25, 12, 30, 1, 123456, tzinfo=timezone(timedelta(hours=2)))
 
 
@@ -77,8 +77,8 @@ def test_invalid_arguments(
 
 @pytest.mark.parametrize("field", ["severities", "verbs", "scope_ids"])
 def test_str_is_not_a_collection(query: AuditQuery, field: str) -> None:
+    options: dict[str, Any] = {field: "abc"}
     with pytest.raises(TypeError, match=field), Session() as session:
-        options: dict[str, Any] = {field: "abc"}
         query.list_groups(session, **options)
 
 

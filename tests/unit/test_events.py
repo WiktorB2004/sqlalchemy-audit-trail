@@ -117,7 +117,7 @@ def test_registry_discovers_subclasses() -> None:
     registry = EventRegistry(Severity)
 
     assert registry.get("shop.order_placed") is Shop.PLACED
-    assert BUILTIN_VERBS <= set(registry.events)
+    assert set(registry.events) >= BUILTIN_VERBS
 
 
 def test_registry_events_restricts_classes() -> None:
@@ -261,7 +261,7 @@ def test_crud_severity_follows_audit_options() -> None:
 def test_crud_severity_override_must_be_in_enum() -> None:
     registry = EventRegistry(HostSeverity, events=[])
 
-    with pytest.raises(EventRegistryError, match="entity.created"):
+    with pytest.raises(EventRegistryError, match=r"entity\.created"):
         registry.severity_of(Crud.CREATED, AuditOptions(severity=Severity.CRITICAL))
 
 
@@ -272,7 +272,7 @@ def test_severity_of_unknown_event() -> None:
     class Legacy(AuditEvent):
         ORDER = "shop.order_placed", Severity.WARNING
 
-    with pytest.raises(UnknownEventError, match="shop.order_placed"):
+    with pytest.raises(UnknownEventError, match=r"shop\.order_placed"):
         EventRegistry(Severity, events=[]).severity_of("shop.order_placed")
     with pytest.raises(UnknownEventError, match=r"Shop\.PLACED is not registered"):
         EventRegistry(Severity, events=[Legacy]).severity_of(Shop.PLACED)

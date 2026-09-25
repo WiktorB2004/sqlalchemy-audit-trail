@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -230,7 +230,7 @@ async def test_nested_context_wins_over_the_provider(
 @pytest.fixture
 async def concurrent_app(
     engine: Engine, sync_trail: AuditTrail, item_model: Any
-) -> AsyncIterator[FastAPI]:
+) -> FastAPI:
     factory = sessionmaker(engine)
     sync_trail.install(factory)
     get_session = session_dependency(factory)
@@ -251,7 +251,7 @@ async def concurrent_app(
         session.add(item_model(title=user))
         session.commit()
 
-    yield app
+    return app
 
 
 async def test_concurrent_requests_do_not_mix_contexts(

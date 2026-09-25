@@ -56,7 +56,7 @@ def partitions(conn: Connection, schema: str) -> dict[str, str]:
         ),
         {"schema": schema},
     )
-    return {name: bound for name, bound in rows}
+    return dict(rows.all())
 
 
 def ensure(

@@ -52,7 +52,7 @@ def index_defs(conn: Connection, schema: str, table: str) -> dict[str, str]:
         ),
         {"schema": schema, "table": table},
     )
-    return {name: definition for name, definition in rows}
+    return dict(rows.all())
 
 
 def sqlstate(exc: DBAPIError) -> str | None:

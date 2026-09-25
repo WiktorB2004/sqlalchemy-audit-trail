@@ -122,10 +122,10 @@ class Recorder:
 
 
 @pytest.fixture
-def db(engine: Engine, schema: str) -> Iterator[Engine]:
+def db(engine: Engine, schema: str) -> Engine:
     bound = engine.execution_options(schema_translate_map={None: schema})
     Base.metadata.create_all(bound)
-    yield bound
+    return bound
 
 
 @pytest.fixture
@@ -348,7 +348,8 @@ def test_snapshot_taken_on_query_load(
     with Session(db) as other:
         event.listen(other, "after_flush", recorder.after_flush)
         loaded = other.get(Item, 1)
-        assert loaded is not None and loaded.snapped is not None
+        assert loaded is not None
+        assert loaded.snapped is not None
         loaded.snapped["a"] = 2
         other.flush()
     assert recorder.take()[0].changes == {"snapped": [{"a": 1}, {"a": 2}]}

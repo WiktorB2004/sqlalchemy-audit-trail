@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
 
 JSONValue: TypeAlias = (
-    None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
+    bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"] | None
 )
 
 MIN_KEY_LENGTH = 32
