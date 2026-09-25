@@ -20,9 +20,10 @@ from uuid import UUID
 from sqlalchemy import Connection, Table, insert
 from sqlalchemy.exc import DBAPIError
 
+from audit_trail._compaction import ActivityData
 from audit_trail._typing import assert_never
 from audit_trail.context import AuditContext, ContextSnapshot, context_snapshot
-from audit_trail.serialization import JSONValue, encode_value
+from audit_trail.serialization import encode_value
 
 if TYPE_CHECKING:
     import json
@@ -82,14 +83,6 @@ class TransactionValues(_TransactionColumns, total=False):
     meta: dict[str, object]
 
 
-class EntityData(TypedDict):
-    """``data`` of an ``entity.*`` entry (envelope version 1)."""
-
-    v: int
-    changes: dict[str, JSONValue]
-    context: ContextSnapshot
-
-
 class Entry(TypedDict):
     """One activity row before it is attached to a transaction row."""
 
@@ -102,11 +95,11 @@ class Entry(TypedDict):
     target_id: str | None
     actor_id: str | None
     scope_id: str | None
-    data: EntityData
+    data: ActivityData
 
 
 class ActivityValues(Entry):
-    """Column values of an ``audit_activity`` row."""
+    """Column values of an ``audit_activity`` row, without the generated ``id``."""
 
     transaction_id: int
     correlation_id: UUID | None

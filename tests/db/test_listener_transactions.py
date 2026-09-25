@@ -255,3 +255,45 @@ def test_failed_audit_write_aborts_the_commit_with_raise(
             session.commit()
 
     assert item_names(env, models) == []
+
+
+def test_closing_the_session_forgets_the_transaction_row(
+    env: Env, models: Models
+) -> None:
+    session = env.factory()
+    session.add(models.Item(name="discarded"))
+    session.flush()
+    session.close()  # neither commit nor rollback
+    session.add(models.Item(name="kept"))
+    session.commit()
+    session.close()
+
+    assert labels(env) == ["kept"]
+    assert_one_transaction(env)
+
+
+def test_leaving_the_session_block_forgets_the_transaction_row(
+    env: Env, models: Models
+) -> None:
+    with env.factory() as session:
+        session.add(models.Item(name="discarded"))
+        session.flush()
+    session.add(models.Item(name="kept"))
+    session.commit()
+
+    assert labels(env) == ["kept"]
+    assert_one_transaction(env)
+
+
+def test_rolling_back_an_enclosing_savepoint(env: Env, models: Models) -> None:
+    with env.factory() as session:
+        outer = session.begin_nested()
+        with session.begin_nested():
+            session.add(models.Item(name="discarded"))
+            session.flush()  # row inserted in the inner savepoint
+        outer.rollback()  # takes the released inner savepoint with it
+        session.add(models.Item(name="kept"))
+        session.commit()
+
+    assert labels(env) == ["kept"]
+    assert_one_transaction(env)

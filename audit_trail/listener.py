@@ -15,9 +15,10 @@ transaction and cached in ``session.info`` together with the
 
 - rolling back that ``SessionTransaction`` or one of its ancestors
   (``after_soft_rollback``) drops the cache, because the row is gone;
-- ``after_commit`` drops it only for the outermost transaction, since it also
-  fires when a savepoint is released, and the row then lives on in the
-  enclosing transaction;
+- ``after_transaction_end`` drops it when the outermost transaction ends,
+  however it ends: commit, rollback, or ``Session.close()`` (which fires no
+  commit or rollback event). Releasing a savepoint also ends a
+  ``SessionTransaction``, but the row then lives on in the enclosing one;
 - ``after_rollback`` never touches it, since it also fires when a savepoint
   is rolled back, which may leave a row of the enclosing transaction intact.
 
@@ -37,7 +38,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 from sqlalchemy import event, inspect
 from sqlalchemy.orm import Session, sessionmaker
 
-from audit_trail.context import AuditContext, resolve_context
+from audit_trail._compaction import FieldChange
+from audit_trail.context import AuditContext, ContextSnapshot, resolve_context
 from audit_trail.diff import (
     USE_CONTEXT,
     ChangeKind,
@@ -56,7 +58,6 @@ from audit_trail.relations import (
     pop_relationship_changes,
     track_relationships,
 )
-from audit_trail.serialization import JSONValue
 from audit_trail.writer import (
     ENVELOPE_VERSION,
     Entry,
@@ -130,7 +131,7 @@ def install(
         )
     listener = _Listener(trail)
     event.listen(cls, "after_flush", listener.after_flush)
-    event.listen(cls, "after_commit", _after_commit)
+    event.listen(cls, "after_transaction_end", _after_transaction_end)
     event.listen(cls, "after_soft_rollback", _after_soft_rollback)
     event.listen(cls, "after_rollback", _after_rollback)
     _installed[cls] = trail
@@ -249,9 +250,8 @@ class _Listener:
             for obj in objects:
                 if not isinstance(obj, Audited):
                     continue
-                entry = self._entry(obj, kind, ctx)
+                entry = self._entry(obj, kind, ctx, context)
                 if entry is not None:
-                    entry["data"]["context"] = context
                     entries.append(entry)
         # Only now: the snapshots were the old values of this flush's changes.
         for obj in chain(session.new, session.dirty):
@@ -259,9 +259,15 @@ class _Listener:
                 refresh_snapshot(obj)
         return entries
 
-    def _entry(self, obj: Audited, kind: ChangeKind, ctx: AuditContext) -> Entry | None:
+    def _entry(
+        self,
+        obj: Audited,
+        kind: ChangeKind,
+        ctx: AuditContext,
+        context: ContextSnapshot,
+    ) -> Entry | None:
         trail = self.trail
-        changes: dict[str, JSONValue] = {}
+        changes: dict[str, FieldChange] = {}
         changes.update(
             entity_changes(
                 obj,
@@ -275,11 +281,7 @@ class _Listener:
         if kind != "deleted":
             # A deleted instance's memberships end with it; its delta, if
             # any, is dropped.
-            for key, change in relationship_changes.items():
-                changes[key] = {
-                    "added": [*change["added"]],
-                    "removed": [*change["removed"]],
-                }
+            changes.update(relationship_changes)
         if kind == "updated" and not changes:
             return None
         options = options_of(type(obj))
@@ -296,7 +298,7 @@ class _Listener:
             "target_id": None if target is None else target[1],
             "actor_id": ctx.actor_id,
             "scope_id": ctx.scope_id if scope is USE_CONTEXT else scope,
-            "data": {"v": ENVELOPE_VERSION, "changes": changes, "context": {}},
+            "data": {"v": ENVELOPE_VERSION, "changes": changes, "context": context},
         }
 
 
@@ -339,10 +341,12 @@ def _cached_row(session: Session) -> TransactionRow | None:
     return None if cached is None else cached.row
 
 
-def _after_commit(session: Session) -> None:
-    # Also fires when a savepoint is released; the row then belongs to the
-    # enclosing transaction, which is still open.
-    if not session.in_nested_transaction():
+def _after_transaction_end(session: Session, transaction: SessionTransaction) -> None:
+    # Fires for every way a transaction ends, including Session.close()
+    # without commit or rollback, which fires no commit or rollback event.
+    # A released savepoint or a flush's subtransaction is not the end of the
+    # database transaction: the row lives on in the enclosing one.
+    if transaction.parent is None:
         session.info.pop(_CACHE_KEY, None)
 
 
