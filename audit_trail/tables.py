@@ -160,39 +160,47 @@ def _activity_index(table: Table, key: str) -> Index:
     c = table.c
     name = f"{table.name}_{key}_idx"
     newest_first = (c.created_at.desc(), c.id.desc())
-    if key == "severity":
-        return Index(name, c.severity, *newest_first)
-    if key == "actor":
-        return Index(name, c.actor_id, *newest_first)
-    if key == "object":
-        return Index(name, c.object_type, c.object_id, *newest_first)
-    if key == "target":
-        return Index(
-            name,
-            c.target_type,
-            c.target_id,
-            *newest_first,
-            postgresql_where=c.target_type.is_not(None),
-        )
-    if key == "scope":
-        return Index(
-            name, c.scope_id, *newest_first, postgresql_where=c.scope_id.is_not(None)
-        )
-    if key == "transaction":
-        return Index(name, c.transaction_id, c.created_at)
-    if key == "correlation":
-        return Index(
-            name,
-            c.correlation_id,
-            c.created_at,
-            postgresql_where=c.correlation_id.is_not(None),
-        )
-    # changes_gin. Default jsonb_ops, not jsonb_path_ops: only jsonb_ops
-    # supports the key-exists operator ? used by "who changed field X" queries
-    # (data -> 'changes' ? 'x'). Spelled with -> so the planner matches such
-    # queries; SQLAlchemy's data["changes"] renders the subscript data['changes'].
-    changes = c.data.op("->", return_type=JSONB)(literal_column("'changes'"))
-    return Index(name, changes, postgresql_using="gin")
+    match key:
+        case "severity":
+            return Index(name, c.severity, *newest_first)
+        case "actor":
+            return Index(name, c.actor_id, *newest_first)
+        case "object":
+            return Index(name, c.object_type, c.object_id, *newest_first)
+        case "target":
+            return Index(
+                name,
+                c.target_type,
+                c.target_id,
+                *newest_first,
+                postgresql_where=c.target_type.is_not(None),
+            )
+        case "scope":
+            return Index(
+                name,
+                c.scope_id,
+                *newest_first,
+                postgresql_where=c.scope_id.is_not(None),
+            )
+        case "transaction":
+            return Index(name, c.transaction_id, c.created_at)
+        case "correlation":
+            return Index(
+                name,
+                c.correlation_id,
+                c.created_at,
+                postgresql_where=c.correlation_id.is_not(None),
+            )
+        case "changes_gin":
+            # Default jsonb_ops, not jsonb_path_ops: only jsonb_ops supports
+            # the key-exists operator ? used by "who changed field X" queries
+            # (data -> 'changes' ? 'x'). Spelled with -> so the planner matches
+            # such queries; SQLAlchemy's data["changes"] renders the subscript
+            # data['changes'].
+            changes = c.data.op("->", return_type=JSONB)(literal_column("'changes'"))
+            return Index(name, changes, postgresql_using="gin")
+        case _:
+            raise ValueError(f"unknown index key {key!r}")
 
 
 def _check_name(name: str, what: str, reserve: int) -> None:
