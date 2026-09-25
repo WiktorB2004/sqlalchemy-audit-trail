@@ -14,7 +14,9 @@ def test_version_is_set() -> None:
 
 
 def test_audit_trail_keeps_defaults() -> None:
-    audit = AuditTrail(create_engine("postgresql+psycopg://localhost/unused"))
+    audit = AuditTrail(
+        create_engine("postgresql+psycopg://localhost/unused"), events=[]
+    )
     assert audit.schema == "audit"
     assert audit.on_error == "log"
     assert audit.warn_on_bulk is True
