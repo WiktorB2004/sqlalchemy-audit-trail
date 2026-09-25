@@ -15,6 +15,7 @@
 - Durable and `fail_closed` events are written on a separate small pool and committed before `log()`/`alog()` returns, surviving the caller's rollback; a missing partition is created and the write retried once; `fail_closed` failures raise `AuditWriteError`
 - `AuditTrail.dispose()` / `adispose()` close the durable pool the library created
 - `audit_trail.testing`: `assert_audited()` / `assert_not_audited()` (and async variants) that show the closest entries and their differences on failure, table setup helpers, and an opt-in pytest plugin (`pytest_plugins = ["audit_trail.pytest_plugin"]`)
+- `audit_trail.integrations.fastapi`: `AuditMiddleware` fills the request part of the audit context (client IP behind trusted proxies, user agent, method, path, request id), `session_dependency()` yields sessions for sync and async factories, and `set_actor()` records the actor after authentication, also from sync dependencies
 - `audit.query.get()`, `object_history()`, `related()` and `access_summary()` (with async variants): one entry in detail, an object's history, entries of related objects and access counts; `LabelResolver` turns stored ids in changes into display labels
 
 ## 0.1.0a1 - 2026-09-25

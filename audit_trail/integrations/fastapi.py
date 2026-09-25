@@ -35,7 +35,7 @@ from __future__ import annotations
 import ipaddress
 import uuid
 from collections.abc import AsyncGenerator, Callable, Generator, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar, overload
@@ -201,10 +201,8 @@ class AuditMiddleware:
         if self.request_id_header is not None:
             value = _header(headers, self.request_id_header)
             if value is not None:
-                try:
+                with suppress(ValueError):
                     return uuid.UUID(value.strip())
-                except ValueError:
-                    pass
         return uuid.uuid4()
 
 
