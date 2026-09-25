@@ -8,7 +8,7 @@ import sys
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum, IntEnum
-from typing import Any
+from typing import Any, Optional, Union
 from uuid import UUID
 
 import pytest
@@ -158,6 +158,26 @@ def test_encode_value_uses_host_encoder_for_unknown_types() -> None:
 def test_encode_value_host_encoder_fallthrough_raises_with_type_name() -> None:
     with pytest.raises(UnserializableValueError, match="builtins.object"):
         encode_value(object(), json_encoder=MoneyEncoder)
+
+
+def test_encode_value_host_encoder_returning_same_object_raises() -> None:
+    class Echo(json.JSONEncoder):
+        def default(self, o: Any) -> Any:
+            return o
+
+    with pytest.raises(UnserializableValueError, match=r"test_serialization\.Money"):
+        encode_value(Money(1), json_encoder=Echo)
+
+
+def test_encode_value_host_encoder_returning_same_type_raises() -> None:
+    class Rewrap(json.JSONEncoder):
+        def default(self, o: Any) -> Any:
+            if isinstance(o, Money):
+                return Money(o.cents + 1)
+            return super().default(o)
+
+    with pytest.raises(UnserializableValueError, match=r"test_serialization\.Money"):
+        encode_value(Money(1), json_encoder=Rewrap)
 
 
 def test_encode_value_builtins_win_over_host_encoder() -> None:
@@ -380,6 +400,23 @@ def test_pseudonymized_does_not_change_validation_or_schema() -> None:
 
 def test_pseudonymized_fields_lists_marked_fields() -> None:
     assert pseudonymized_fields(LoginFailed) == {"login"}
+
+
+def test_pseudonymized_fields_finds_marker_on_optional_fields() -> None:
+    class Payload(BaseModel):
+        pipe_optional: Pseudonymized[str] | None = None
+        typing_optional: Optional[Pseudonymized[str]] = None  # noqa: UP045
+        inner_optional: Pseudonymized[str | None] = None
+        in_union: Union[int, Pseudonymized[str]] = 0  # noqa: UP007
+        plain_optional: str | None = None
+        unmarked_list: list[str] = []
+
+    assert pseudonymized_fields(Payload) == {
+        "pipe_optional",
+        "typing_optional",
+        "inner_optional",
+        "in_union",
+    }
 
 
 def test_serialization_imports_without_pydantic() -> None:

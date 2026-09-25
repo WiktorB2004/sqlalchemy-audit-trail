@@ -15,11 +15,20 @@ import hmac
 import json
 import math
 import re
+import types
 from collections.abc import Mapping
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
-from typing import TYPE_CHECKING, Annotated, TypeAlias, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    TypeAlias,
+    TypeVar,
+    Union,
+    get_args,
+    get_origin,
+)
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -77,7 +86,8 @@ def encode_value(
       ``1`` into ``"1"``.
 
     Anything else, including ``set``/``frozenset`` (no stable order), goes to
-    ``json_encoder().default()`` and the result is encoded again. The built-in
+    ``json_encoder().default()`` and the result is encoded again; a result of
+    the same type as the input raises instead of recursing. The built-in
     rules always win: the host encoder only sees types they do not cover.
 
     Args:
@@ -124,6 +134,11 @@ def encode_value(
             raise UnserializableValueError(
                 f"cannot encode value of type {_type_name(value)}"
             ) from exc
+        if type(substitute) is type(value):
+            raise UnserializableValueError(
+                f"json_encoder returned {_type_name(value)} unchanged; "
+                "cannot encode value of that type"
+            )
         return encode_value(substitute, json_encoder=json_encoder)
     raise UnserializableValueError(f"cannot encode value of type {_type_name(value)}")
 
@@ -347,10 +362,25 @@ need pydantic.
 """
 
 
+def _is_pseudonymized(annotation: object) -> bool:
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        inner, *metadata = get_args(annotation)
+        return any(item is _PSEUDONYMIZED for item in metadata) or _is_pseudonymized(
+            inner
+        )
+    if origin is Union or origin is types.UnionType:
+        return any(_is_pseudonymized(arg) for arg in get_args(annotation))
+    return False
+
+
 def pseudonymized_fields(schema: type[BaseModel]) -> frozenset[str]:
     """Return the names of top-level fields annotated with ``Pseudonymized``.
 
-    Fields of nested models are not included.
+    The marker is found on the field itself (``Pseudonymized[str | None]``)
+    and inside a union (``Pseudonymized[str] | None``,
+    ``Optional[Pseudonymized[str]]``). Fields of nested models and items of
+    containers are not included.
 
     Args:
         schema: A pydantic model class.
@@ -362,4 +392,5 @@ def pseudonymized_fields(schema: type[BaseModel]) -> frozenset[str]:
         name
         for name, field in schema.model_fields.items()
         if any(item is _PSEUDONYMIZED for item in field.metadata)
+        or _is_pseudonymized(field.annotation)
     )
