@@ -4,6 +4,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from audit_trail.config import AuditOptions, AuditTrail
 from audit_trail.context import Actor, AuditContext
+from audit_trail.events import AuditEvent, Severity, event
 from audit_trail.serialization import Pseudonymized
 
 try:
@@ -14,8 +15,11 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
 __all__ = [
     "Actor",
     "AuditContext",
+    "AuditEvent",
     "AuditOptions",
     "AuditTrail",
     "Pseudonymized",
+    "Severity",
     "__version__",
+    "event",
 ]
