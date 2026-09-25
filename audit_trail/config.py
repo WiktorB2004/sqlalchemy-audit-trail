@@ -19,6 +19,15 @@ OnError = Literal["log", "raise"]
 class AuditOptions:
     """Audit settings for one model, set as ``__audit__`` on the class.
 
+    ``label``, ``scope`` and ``target`` run while the session flushes and get
+    a read-only view of the instance instead of the instance itself. They may
+    read only attributes already loaded on it: reading an expired or unloaded
+    attribute emits no SQL, logs a warning on ``audit_trail.diff`` (once per
+    model, attribute and option) and the option falls back (``label`` and
+    ``target`` to ``None``, ``scope`` to the context). Reading a
+    ``functools.cached_property`` raises ``AuditOptionError``. Any other
+    exception they raise propagates and aborts the flush.
+
     Attributes:
         severity: Severity of the model's ``entity.*`` entries. ``None`` uses
             the configured default.
@@ -30,8 +39,13 @@ class AuditOptions:
             in-place mutation still has an old value.
         object_type: Name stored in ``object_type``. Defaults to the class name.
         label: Returns the object's label, stored in ``object_label``.
-        scope: Returns the scope id, stored in ``scope_id``.
-        target: Returns ``(type, id)`` of the parent object, or ``None``.
+        scope: Returns the scope id, stored in ``scope_id``. Returning
+            ``None`` means "no scope"; the scope comes from the context only
+            when this option is not set or it read an attribute that is not
+            loaded.
+        target: Returns ``(type, id)`` of the parent object, or ``None``. An
+            id of ``None`` also means no target; a tuple id is formatted as a
+            composite ``object_id``.
     """
 
     severity: IntEnum | None = None

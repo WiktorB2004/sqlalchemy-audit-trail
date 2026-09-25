@@ -1,6 +1,6 @@
 [project]
 name = "sqlalchemy-audit-trail"
-version = "0.0.1"
+version = "0.1.0a1"
 description = "Audit trail for SQLAlchemy on PostgreSQL: entity change diffs and domain events in one partitioned log"
 readme = "README.md"
 license = "MIT"
