@@ -8,7 +8,18 @@ from audit_trail.context import Actor, AuditContext
 from audit_trail.diff import AuditOptionError, FieldPolicyError
 from audit_trail.events import AuditEvent, Severity, event
 from audit_trail.mixin import Audited
-from audit_trail.query import Cursor, Group, Page, TransactionHeader, Visibility
+from audit_trail.query import (
+    AccessCount,
+    ActivityDetail,
+    Cursor,
+    FieldLabels,
+    Group,
+    LabelResolver,
+    Page,
+    RelationshipLabels,
+    TransactionHeader,
+    Visibility,
+)
 from audit_trail.serialization import Pseudonymized
 from audit_trail.writer import AuditWriteError
 
@@ -18,6 +29,8 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
     __version__ = "0.0.0"
 
 __all__ = [
+    "AccessCount",
+    "ActivityDetail",
     "Actor",
     "AuditContext",
     "AuditEvent",
@@ -27,11 +40,14 @@ __all__ = [
     "AuditWriteError",
     "Audited",
     "Cursor",
+    "FieldLabels",
     "FieldPolicyError",
     "Group",
+    "LabelResolver",
     "ModelIssue",
     "Page",
     "Pseudonymized",
+    "RelationshipLabels",
     "Severity",
     "Target",
     "TransactionHeader",

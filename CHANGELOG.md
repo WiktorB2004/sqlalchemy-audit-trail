@@ -14,6 +14,7 @@
 - Async sessions: `AuditTrail.install()` accepts an `async_sessionmaker` or `AsyncSession` subclass with a `sync_session_class`, and `AuditTrail.alog()` records explicit events from async code
 - Durable and `fail_closed` events are written on a separate small pool and committed before `log()`/`alog()` returns, surviving the caller's rollback; a missing partition is created and the write retried once; `fail_closed` failures raise `AuditWriteError`
 - `AuditTrail.dispose()` / `adispose()` close the durable pool the library created
+- `audit.query.get()`, `object_history()`, `related()` and `access_summary()` (with async variants): one entry in detail, an object's history, entries of related objects and access counts; `LabelResolver` turns stored ids in changes into display labels
 
 ## 0.1.0a1 - 2026-09-25
 
