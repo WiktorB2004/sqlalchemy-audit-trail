@@ -26,6 +26,7 @@ def create_trail(
     schema: str,
     *,
     partitions: list[int] | None = None,
+    severities: type[IntEnum] = Sev,
     **options: Any,
 ) -> AuditTrail:
     """Build an ``AuditTrail`` for ``schema`` and create its tables.
@@ -35,14 +36,16 @@ def create_trail(
         schema: Schema for the audit tables.
         partitions: Severities to create partitions for (all by default);
             ``[]`` creates none, so every audit write fails with 23514.
+        severities: The severity enum.
         **options: Further ``AuditTrail`` arguments.
     """
-    trail = AuditTrail(engine, schema=schema, severities=Sev, events=[], **options)
+    options.setdefault("events", [])
+    trail = AuditTrail(engine, schema=schema, severities=severities, **options)
     with engine.begin() as conn:
-        create_audit_tables(conn, trail.tables, Sev)
-        severities = list(Sev) if partitions is None else partitions
-        if severities:
-            ensure_partitions(conn, trail.tables, severities, months_ahead=0)
+        create_audit_tables(conn, trail.tables, severities)
+        values = list(severities) if partitions is None else partitions
+        if values:
+            ensure_partitions(conn, trail.tables, values, months_ahead=0)
     return trail
 
 

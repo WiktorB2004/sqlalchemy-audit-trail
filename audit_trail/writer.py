@@ -12,6 +12,7 @@ never updated afterwards.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, TypeVar
@@ -23,10 +24,19 @@ from sqlalchemy.exc import DBAPIError
 from audit_trail._compaction import ActivityData
 from audit_trail._typing import assert_never
 from audit_trail.context import AuditContext, ContextSnapshot, context_snapshot
-from audit_trail.serialization import encode_value
+from audit_trail.events import PayloadError
+from audit_trail.serialization import (
+    JSONValue,
+    KeyRing,
+    encode_value,
+    pseudonymize,
+    pseudonymized_fields,
+)
 
 if TYPE_CHECKING:
     import json
+
+    from pydantic import BaseModel
 
     from audit_trail.config import OnError
 
@@ -39,6 +49,9 @@ ENVELOPE_VERSION = 1
 """Value of ``data["v"]``."""
 
 _NO_PARTITION = "no partition of relation"
+
+# The prefix of a pseudonym token, for any purpose and key version.
+_PSEUDONYM_PREFIX = re.compile(r"audit\.[a-z][a-z0-9_]*\.v[0-9]+:")
 
 _T = TypeVar("_T")
 
@@ -147,6 +160,62 @@ def context_data(
     if "meta" in snapshot:
         snapshot["meta"] = encode_meta(snapshot["meta"], json_encoder)
     return snapshot
+
+
+def encode_payload(
+    payload: dict[str, object] | BaseModel | None,
+    *,
+    keys: KeyRing | None,
+    json_encoder: type[json.JSONEncoder] | None,
+) -> dict[str, JSONValue]:
+    """Encode a validated event payload for ``data["payload"]``.
+
+    A pydantic model is dumped (Python mode) and its ``Pseudonymized`` fields
+    are replaced with ``pseudonymize(value, purpose=<field name>)``; ``None``
+    stays ``None``.
+
+    Args:
+        payload: The result of ``validate_payload``.
+        keys: Key ring for ``Pseudonymized`` fields.
+        json_encoder: Host encoder for types ``encode_value`` does not handle.
+
+    Returns:
+        JSON-native data; ``{}`` for no payload.
+
+    Raises:
+        PayloadError: A ``Pseudonymized`` field already holds a pseudonym
+            token, which would be pseudonymized twice.
+        ValueError: A ``Pseudonymized`` field has a value and no
+            ``pseudonymize_key`` is configured, or its name is not a valid
+            purpose (snake_case).
+        UnserializableValueError: A value cannot be encoded.
+    """
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        values = payload
+    else:
+        values = payload.model_dump(mode="python")
+        for name in sorted(pseudonymized_fields(type(payload))):
+            value = values.get(name)
+            if value is None:
+                continue
+            if isinstance(value, str) and _PSEUDONYM_PREFIX.match(value):
+                raise PayloadError(
+                    f"{type(payload).__name__}.{name} is Pseudonymized but already "
+                    "holds a pseudonym token; pass the raw value"
+                )
+            if keys is None:
+                raise ValueError(
+                    f"{type(payload).__name__}.{name} is Pseudonymized; "
+                    "configure pseudonymize_key"
+                )
+            values[name] = pseudonymize(
+                value, purpose=name, keys=keys, json_encoder=json_encoder
+            )
+    encoded = encode_value(values, json_encoder=json_encoder)
+    assert isinstance(encoded, dict)  # a dict with str keys encodes to a dict
+    return encoded
 
 
 def transaction_values(
