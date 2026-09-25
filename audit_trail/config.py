@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from audit_trail.context import Actor, resolve_context
 from audit_trail.context import bind as _bind
@@ -33,6 +33,22 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session, sessionmaker
 
 OnError = Literal["log", "raise"]
+
+
+class Target(NamedTuple):
+    """A parent object referred to by type name and primary key.
+
+    Returned by the ``target`` option and accepted by ``AuditTrail.log``.
+    A plain ``(type, id)`` tuple works too.
+
+    Attributes:
+        type: Name stored in ``target_type``.
+        id: The primary key; a tuple for a composite key. ``None`` means no
+            target.
+    """
+
+    type: str
+    id: object
 
 
 @dataclass(frozen=True)
@@ -65,9 +81,9 @@ class AuditOptions:
             ``None`` means "no scope"; the scope comes from the context only
             when this option is not set or it read an attribute that is not
             loaded.
-        target: Returns ``(type, id)`` of the parent object, or ``None``. An
-            id of ``None`` also means no target; a tuple id is formatted as a
-            composite ``object_id``.
+        target: Returns the parent object as a ``Target`` (or a plain
+            ``(type, id)`` tuple), or ``None``. An id of ``None`` also means
+            no target; a tuple id is formatted as a composite ``object_id``.
     """
 
     severity: IntEnum | None = None
@@ -77,7 +93,7 @@ class AuditOptions:
     object_type: str | None = None
     label: Callable[[Any], str | None] | None = None
     scope: Callable[[Any], object] | None = None
-    target: Callable[[Any], tuple[str, object] | None] | None = None
+    target: Callable[[Any], Target | tuple[str, object] | None] | None = None
 
 
 class AuditTrail:
@@ -231,8 +247,8 @@ class AuditTrail:
         event: AuditEvent,
         *,
         obj: object | None = None,
-        target: object | tuple[str, object] | None = None,
-        payload: Mapping[str, Any] | BaseModel | None = None,
+        target: Target | object | None = None,
+        payload: Mapping[str, object] | BaseModel | None = None,
         actor: Actor | None = None,
         durable: bool | None = None,
     ) -> None:
@@ -252,10 +268,10 @@ class AuditTrail:
                 ``object_id``, ``object_label`` and, through its options,
                 ``scope_id`` and the default target. It must have a primary
                 key: flush a new object first.
-            target: The parent object, as an instance or ``(type, id)``. A
-                tuple id is formatted as a composite ``object_id``; an id of
-                ``None`` means no target. Defaults to the ``target`` option
-                of ``obj``.
+            target: The parent object, as an instance or a ``Target`` (a
+                plain ``(type, id)`` tuple works too). A tuple id is formatted
+                as a composite ``object_id``; an id of ``None`` means no
+                target. Defaults to the ``target`` option of ``obj``.
             payload: The payload, validated against the event's schema.
                 ``Pseudonymized`` fields of a schema are pseudonymized with
                 their field name as the purpose.
@@ -323,7 +339,7 @@ class AuditTrail:
                 scope_id = scope
             target_type, target_id = resolve_target(obj, options) or (None, None)
         if isinstance(target, tuple):
-            target_type, target_id = format_target(target) or (None, None)
+            target_type, target_id = format_target(Target(*target)) or (None, None)
         elif target is not None:
             target_type = object_type_of(target)
             target_id = _required_id(target, "target")

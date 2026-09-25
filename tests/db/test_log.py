@@ -21,6 +21,7 @@ from audit_trail import (
     AuditTrail,
     Pseudonymized,
     Severity,
+    Target,
     event,
 )
 from audit_trail.events import Crud, PayloadError, UnknownEventError
@@ -177,7 +178,7 @@ def test_targets_and_context_scope(env: Env, models: Models) -> None:
         session.flush()
         env.trail.log(session, LogEvent.VIEWED, target=folder)
         env.trail.log(session, LogEvent.VIEWED, target=("Order", ("a", 1)))
-        env.trail.log(session, LogEvent.VIEWED, target=("Order", 7))
+        env.trail.log(session, LogEvent.VIEWED, target=Target("Order", 7))
         env.trail.log(session, LogEvent.VIEWED, target=("Order", None))
         session.commit()
 

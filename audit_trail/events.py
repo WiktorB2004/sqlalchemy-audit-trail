@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from enum import Enum, IntEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
@@ -327,8 +327,8 @@ class EventRegistry:
 
 
 def validate_payload(
-    event: AuditEvent, payload: Mapping[str, Any] | BaseModel | None
-) -> dict[str, Any] | BaseModel | None:
+    event: AuditEvent, payload: Mapping[str, object] | BaseModel | None
+) -> dict[str, object] | BaseModel | None:
     """Check a payload against its event's schema.
 
     Args:

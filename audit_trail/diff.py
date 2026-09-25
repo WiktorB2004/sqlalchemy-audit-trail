@@ -18,7 +18,7 @@ import logging
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
 
 from sqlalchemy import Column, inspect
 from sqlalchemy.orm import ColumnProperty
@@ -26,7 +26,7 @@ from sqlalchemy.orm.attributes import instance_state
 from sqlalchemy.orm.base import NO_VALUE
 
 from audit_trail._typing import assert_never
-from audit_trail.config import AuditOptions
+from audit_trail.config import AuditOptions, Target
 from audit_trail.serialization import JSONValue, KeyRing, encode_value, hash_value
 
 if TYPE_CHECKING:
@@ -564,7 +564,15 @@ def resolve_scope(obj: object, options: AuditOptions) -> str | None | UseContext
     return None if value is None else str(value)
 
 
-def resolve_target(obj: object, options: AuditOptions) -> tuple[str, str] | None:
+class ResolvedTarget(NamedTuple):
+    """A target as stored in ``target_type`` and ``target_id``."""
+
+    type: str
+    id: str
+    """Formatted like an ``object_id``."""
+
+
+def resolve_target(obj: object, options: AuditOptions) -> ResolvedTarget | None:
     """Evaluate ``options.target`` for ``target_type``/``target_id``.
 
     Never emits SQL. The id is formatted like ``object_id``: a tuple becomes
@@ -575,7 +583,7 @@ def resolve_target(obj: object, options: AuditOptions) -> tuple[str, str] | None
         options: The model's options.
 
     Returns:
-        ``(target_type, target_id)``, or ``None`` when there is no ``target``
+        The stored target, or ``None`` when there is no ``target``
         option, it returns ``None`` or an id of ``None``, or it read an
         attribute that is not loaded (then logged once per model, attribute
         and option on the ``audit_trail.diff`` logger).
@@ -588,21 +596,19 @@ def resolve_target(obj: object, options: AuditOptions) -> tuple[str, str] | None
     ok, value = _call_option(obj, "target", options.target)
     if not ok or value is None:
         return None
-    return format_target(value)
+    return format_target(Target(*value))
 
 
-def format_target(target: tuple[str, object]) -> tuple[str, str] | None:
-    """Format a ``(type, id)`` pair as stored in ``target_type``/``target_id``.
+def format_target(target: Target) -> ResolvedTarget | None:
+    """Format a target as stored in ``target_type`` and ``target_id``.
 
     Args:
         target: The type name and the id; a tuple id is a composite key.
 
     Returns:
-        ``(target_type, target_id)`` with the id formatted like an
-        ``object_id``, or ``None`` when the id is ``None``.
+        The stored target, or ``None`` when the id is ``None``.
     """
-    target_type, target_id = target
-    if target_id is None:
+    if target.id is None:
         return None
-    ids = target_id if isinstance(target_id, tuple) else (target_id,)
-    return str(target_type), _format_identity(ids)
+    ids = target.id if isinstance(target.id, tuple) else (target.id,)
+    return ResolvedTarget(str(target.type), _format_identity(ids))

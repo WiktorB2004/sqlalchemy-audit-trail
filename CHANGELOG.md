@@ -9,7 +9,7 @@
 - `AuditTrail.install()`: the session listener writes one `entity.created`/`updated`/`deleted` row per flush and object, with a lazily created `audit_transaction` row per database transaction, inside the business transaction; `on_error="log"` isolates audit write failures in a savepoint
 - `AuditTrail` gains `default_severity`, `system_severity`, `events` and `global_redact`, and exposes `context()`, `set_actor()`, `bind()`, `pseudonymize()` and `maintenance`
 - Audit options read a column never set on a new instance as `None` instead of falling back as if it were not loaded
-- `AuditTrail.log()`: records an explicit event in the session's transaction, with payload validation, `Pseudonymized` payload fields and a per-entry `actor=`; `warn_on_bulk` warns about bulk `UPDATE`/`DELETE` statements on audited tables, which bypass the trail
+- `AuditTrail.log()`: records an explicit event in the session's transaction, with payload validation, `Pseudonymized` payload fields, a per-entry `actor=` and a `Target` (also returned by the `target` option); `warn_on_bulk` warns about bulk `UPDATE`/`DELETE` statements on audited tables, which bypass the trail
 
 ## 0.1.0a1 - 2026-09-25
 
