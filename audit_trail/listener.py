@@ -8,16 +8,18 @@ and every other session in the process. An ``AsyncSession`` runs a sync
 is installed through that class, which must be the host's own subclass.
 
 ``after_flush`` turns the flushed ``Audited`` instances into ``entity.*``
-entries and writes them with plain SQL on ``session.connection()``, in the
-same database transaction as the changes, so a rollback undoes both.
+entries and writes them with plain SQL on the session's connection for each
+object (resolved like the flush does), in the same database transaction as
+the changes, so a rollback undoes both.
 
 The ``audit_transaction`` row is inserted by the first entry of a database
-transaction and cached in ``session.info`` together with the
-``SessionTransaction`` (root or savepoint) it was inserted in:
+transaction on each connection and cached in ``session.info``, per
+connection, together with the ``SessionTransaction`` (root or savepoint) it
+was inserted in:
 
 - rolling back that ``SessionTransaction`` or one of its ancestors
-  (``after_soft_rollback``) drops the cache, because the row is gone;
-- ``after_transaction_end`` drops it when the outermost transaction ends,
+  (``after_soft_rollback``) drops the cached row, because it is gone;
+- ``after_transaction_end`` drops the cache when the outermost transaction ends,
   however it ends: commit, rollback, or ``Session.close()`` (which fires no
   commit or rollback event). Releasing a savepoint also ends a
   ``SessionTransaction``, but the row then lives on in the enclosing one;
@@ -64,6 +66,7 @@ from audit_trail.relations import (
     pop_relationship_changes,
     track_relationships,
 )
+from audit_trail.tables import audit_connection
 from audit_trail.writer import (
     ENVELOPE_VERSION,
     Entry,
@@ -76,6 +79,7 @@ from audit_trail.writer import (
 )
 
 if TYPE_CHECKING:
+    from sqlalchemy import Connection
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
     from sqlalchemy.orm import (
         Mapper,
@@ -108,6 +112,13 @@ _installed: dict[type[Session], AuditTrail] = {}
 class _CachedRow(NamedTuple):
     owner: SessionTransaction
     row: TransactionRow
+
+
+class PendingEntry(NamedTuple):
+    """An entry to write and the object it is about, if any."""
+
+    entry: Entry
+    obj: object | None
 
 
 def install(
@@ -304,7 +315,7 @@ class _Listener:
                 model.__qualname__,
             )
 
-    def _entries(self, session: Session, ctx: AuditContext) -> list[Entry]:
+    def _entries(self, session: Session, ctx: AuditContext) -> list[PendingEntry]:
         trail = self.trail
         context = context_data(ctx, trail.json_encoder)
         batches: tuple[tuple[ChangeKind, Iterable[object]], ...] = (
@@ -312,14 +323,14 @@ class _Listener:
             ("updated", session.dirty),
             ("deleted", session.deleted),
         )
-        entries: list[Entry] = []
+        entries: list[PendingEntry] = []
         for kind, objects in batches:
             for obj in objects:
                 if not isinstance(obj, Audited):
                     continue
                 entry = self._entry(obj, kind, ctx, context)
                 if entry is not None:
-                    entries.append(entry)
+                    entries.append(PendingEntry(entry, obj))
         # Only now: the snapshots were the old values of this flush's changes.
         for obj in chain(session.new, session.dirty):
             if isinstance(obj, Audited):
@@ -380,22 +391,73 @@ def _audited_model(state: ORMExecuteState) -> type[Any] | None:
 
 
 def write_entries(
-    session: Session, trail: AuditTrail, entries: Sequence[Entry], ctx: AuditContext
+    session: Session,
+    trail: AuditTrail,
+    entries: Sequence[PendingEntry],
+    ctx: AuditContext,
 ) -> None:
     """Write entries in the session's current database transaction.
 
-    Inserts the ``audit_transaction`` row first when the transaction has
-    none yet, then all entries with one ``executemany``, following
-    ``trail.on_error``. Uses only ``session.connection()``, never the ORM.
+    Each entry goes on the connection its object's rows were flushed on:
+    ``session.connection()`` with the base mapper of the object, as the flush
+    resolves it (mapper binds, then its table's, then the default bind). An
+    entry without an object uses the audit tables as the clause (their binds,
+    then the default bind). A ``get_bind`` override is honoured.
+
+    Per connection, inserts the ``audit_transaction`` row first when that
+    connection's transaction has none yet, then its entries with one
+    ``executemany``, following ``trail.on_error``. Uses only the connections,
+    never the ORM.
 
     Args:
         session: A session of an installed class.
         trail: The configuration to write with.
-        entries: The entries.
-        ctx: The context, used when the transaction row is created.
+        entries: The entries, with the objects they are about.
+        ctx: The context, used when a transaction row is created.
+
+    Raises:
+        UnboundExecutionError: An entry without an object, and the session
+            has no bind for the audit tables.
     """
-    connection = session.connection()
-    cached = _cached_row(session)
+    by_mapper: dict[Mapper[Any] | None, Connection] = {}
+    groups: dict[Connection, list[Entry]] = {}
+    for pending in entries:
+        mapper = _base_mapper(pending.obj)
+        connection = by_mapper.get(mapper)
+        if connection is None:
+            connection = by_mapper[mapper] = _connection_for(session, trail, mapper)
+        groups.setdefault(connection, []).append(pending.entry)
+    for connection, group in groups.items():
+        _write_group(session, trail, connection, group, ctx)
+
+
+def _base_mapper(obj: object | None) -> Mapper[Any] | None:
+    # The flush resolves an object's connection from its base mapper.
+    state = None if obj is None else inspect(obj, raiseerr=False)
+    mapper: Mapper[Any] | None = getattr(state, "mapper", None)
+    return None if mapper is None else mapper.base_mapper
+
+
+def _connection_for(
+    session: Session, trail: AuditTrail, mapper: Mapper[Any] | None
+) -> Connection:
+    if mapper is not None:
+        return session.connection(bind_arguments={"mapper": mapper})
+    return audit_connection(
+        session,
+        trail.tables,
+        " log() and alog() with obj= use the bind of the object instead.",
+    )
+
+
+def _write_group(
+    session: Session,
+    trail: AuditTrail,
+    connection: Connection,
+    entries: Sequence[Entry],
+    ctx: AuditContext,
+) -> None:
+    cached = _cached_row(session, connection)
 
     def work() -> TransactionRow:
         row = cached or insert_transaction(
@@ -410,11 +472,13 @@ def write_entries(
     if row is not None and cached is None:
         owner = session.get_nested_transaction() or session.get_transaction()
         assert owner is not None  # session.connection() began one
-        session.info[_CACHE_KEY] = _CachedRow(owner, row)
+        rows: dict[Connection, _CachedRow] = session.info.setdefault(_CACHE_KEY, {})
+        rows[connection] = _CachedRow(owner, row)
 
 
-def _cached_row(session: Session) -> TransactionRow | None:
-    cached: _CachedRow | None = session.info.get(_CACHE_KEY)
+def _cached_row(session: Session, connection: Connection) -> TransactionRow | None:
+    rows: dict[Connection, _CachedRow] = session.info.get(_CACHE_KEY, {})
+    cached = rows.get(connection)
     return None if cached is None else cached.row
 
 
@@ -422,7 +486,7 @@ def _after_transaction_end(session: Session, transaction: SessionTransaction) ->
     # Fires for every way a transaction ends, including Session.close()
     # without commit or rollback, which fires no commit or rollback event.
     # A released savepoint or a flush's subtransaction is not the end of the
-    # database transaction: the row lives on in the enclosing one.
+    # database transaction: the rows live on in the enclosing one.
     if transaction.parent is None:
         session.info.pop(_CACHE_KEY, None)
 
@@ -430,15 +494,23 @@ def _after_transaction_end(session: Session, transaction: SessionTransaction) ->
 def _after_soft_rollback(
     session: Session, previous_transaction: SessionTransaction
 ) -> None:
-    cached: _CachedRow | None = session.info.get(_CACHE_KEY)
-    if cached is None:
+    rows: dict[Connection, _CachedRow] | None = session.info.get(_CACHE_KEY)
+    if not rows:
         return
-    transaction: SessionTransaction | None = cached.owner
-    while transaction is not None:
-        if transaction is previous_transaction:
-            session.info.pop(_CACHE_KEY, None)
-            return
-        transaction = transaction.parent
+    # A savepoint spans every connection of the session, so its rollback
+    # removes the rows it holds on each.
+    for connection, cached in list(rows.items()):
+        if _within(cached.owner, previous_transaction):
+            del rows[connection]
+
+
+def _within(transaction: SessionTransaction, ancestor: SessionTransaction) -> bool:
+    current: SessionTransaction | None = transaction
+    while current is not None:
+        if current is ancestor:
+            return True
+        current = current.parent
+    return False
 
 
 def _after_rollback(session: Session) -> None:

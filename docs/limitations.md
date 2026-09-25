@@ -12,6 +12,10 @@ The library records what passes through SQLAlchemy's unit of work, in Python. Th
 
 Statements run on a plain `Connection` or another engine are not seen at all.
 
+## Sessions with binds
+
+A session without a default bind needs the audit tables in its `binds` for `log()` without `obj` and for queries; see [Sessions with binds](guides/models.md#sessions-with-binds).
+
 ## Database-side cascades
 
 Rows deleted by the database, through `ForeignKey(..., ondelete="CASCADE")` with `passive_deletes=True`, never pass through the session, so they get no `entity.deleted` entry. The same goes for triggers and anything else the database changes on its own. Let SQLAlchemy cascade the delete (`cascade="all, delete-orphan"` without `passive_deletes`) for models whose deletion must be audited.
