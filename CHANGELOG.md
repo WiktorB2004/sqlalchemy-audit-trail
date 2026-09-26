@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- With asyncpg, a durable engine that cannot connect (refused, unresolvable host, timeout, or on SQLAlchemy 2.0 a missing database or bad password) now follows the durable write policy: `fail_closed` raises `AuditWriteError` and `on_error="log"` logs, instead of a raw driver error escaping `alog()`
+
 ## 0.1.0 - 2026-09-26
 
 First release with the full audit trail: the flush listener, domain events, durable writes, async sessions, the read API, erasure, retention, the FastAPI integration and testing helpers. The API may still change before 1.0.
