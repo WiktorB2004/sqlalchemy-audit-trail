@@ -94,7 +94,7 @@ typing-modules = ["audit_trail._typing"]
 
 [tool.mypy]
 python_version = "3.10"
-files = ["audit_trail", "tests"]
+files = ["audit_trail", "benchmark", "tests"]
 strict = true
 warn_unreachable = true
 show_error_codes = true
