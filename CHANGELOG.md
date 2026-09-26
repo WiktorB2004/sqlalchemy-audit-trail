@@ -21,6 +21,7 @@
 - `log()` / `alog()` accept just the event and take the session from `AuditTrail(session_provider=...)`; a missing session or one of the wrong kind raises a clear error
 - `AuditTrail(default_query_window=...)`: `list_groups()` without `since` reads only that window; `since=ALL_HISTORY` reads the whole log, the cursor keeps the first page's bound, and `Page.since` tells where the window started
 - Under `AsyncSession`, loading an expired column of an `Audited` model (for example assigning to it after a commit) or an unloaded tracked collection raises `AsyncLoadError`, a `MissingGreenlet` subclass that names the attribute and the fix
+- Sessions without a default bind work: audit rows go on the connection the flush used for the object (per mapper or table `binds`, or an overridden `get_bind`), one `audit_transaction` row per database; `log()` without `obj` and the query API use a bind of the audit tables, otherwise raise a clear `UnboundExecutionError`
 
 ## 0.1.0a1 - 2026-09-25
 
