@@ -57,7 +57,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import NoReferenceError
 
-from audit_trail._compaction import ActivityRow, FieldChange, compact_rows
+from audit_trail._compaction import ActivityData, ActivityRow, FieldChange, compact_rows
 from audit_trail._typing import assert_never
 from audit_trail.checks import _registry_of
 from audit_trail.diff import REDACTED, UNKNOWN, field_policy, options_of
@@ -72,11 +72,13 @@ if TYPE_CHECKING:
 __all__ = [
     "ALL_HISTORY",
     "AccessCount",
+    "ActivityData",
     "ActivityDetail",
     "ActivityRow",
     "AllHistory",
     "AuditQuery",
     "Cursor",
+    "FieldChange",
     "FieldLabels",
     "Group",
     "LabelResolver",

@@ -13,9 +13,11 @@ from audit_trail.privacy import ScrubNotAllowedError, ScrubResult
 from audit_trail.query import (
     ALL_HISTORY,
     AccessCount,
+    ActivityData,
     ActivityDetail,
     AllHistory,
     Cursor,
+    FieldChange,
     FieldLabels,
     Group,
     LabelResolver,
@@ -35,6 +37,7 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
 __all__ = [
     "ALL_HISTORY",
     "AccessCount",
+    "ActivityData",
     "ActivityDetail",
     "Actor",
     "AllHistory",
@@ -47,6 +50,7 @@ __all__ = [
     "AuditWriteError",
     "Audited",
     "Cursor",
+    "FieldChange",
     "FieldLabels",
     "FieldPolicyError",
     "Group",

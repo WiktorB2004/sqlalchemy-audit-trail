@@ -80,6 +80,7 @@ def make_entry(
     label: str | None = None,
     target: tuple[str, str] | None = None,
     actor_id: str | None = None,
+    scope_id: str | None = None,
 ) -> Entry:
     return {
         "verb": verb,
@@ -90,7 +91,7 @@ def make_entry(
         "target_type": None if target is None else target[0],
         "target_id": None if target is None else target[1],
         "actor_id": actor_id,
-        "scope_id": None,
+        "scope_id": scope_id,
         "data": cast("ActivityData", {"v": 1, **data}),
     }
 
@@ -327,6 +328,7 @@ def test_scrub_records_what_without_erased_values(
             "object_id": "1",
             "include_targets": True,
             "since": "2026-03-01T00:00:00+00:00",
+            "scope_ids": None,
             "activity_rows": 1,
         },
         "context": {
@@ -608,6 +610,7 @@ def test_scrub_actor_clears_context_and_meta(
         "payload": {
             "operation": "scrub_actor",
             "actor_id": "u1",
+            "scope_ids": None,
             "transaction_rows": 1,
             "activity_rows": 1,
         },
@@ -689,6 +692,191 @@ def test_compaction_keeps_scrubbed_updates(
     (merged,) = compact_rows(rows)
     assert merged["verb"] == UPDATED
     assert merged["data"]["changes"] == {"title": ["[erased]", "[erased]"]}
+
+
+# Scope restriction
+
+
+def test_scrub_with_scope_ids_leaves_other_and_unscoped_entries(
+    engine: Engine, trail: AuditTrail
+) -> None:
+    with engine.begin() as conn:
+        ids = {
+            scope: add(
+                conn,
+                trail.tables,
+                make_entry(
+                    "Doc",
+                    "1",
+                    {"changes": {"title": ["a", "b"]}},
+                    label="Doc One",
+                    scope_id=scope,
+                ),
+                at=JAN,
+            )
+            for scope in ("t1", "t2", None)
+        }
+    before = activities(engine, trail.tables)
+
+    with trail.context(ADMIN):
+        result = trail.scrub("Doc", "1", scope_ids=["t3", "t1"])
+
+    assert result == ScrubResult(activity_rows=1, transaction_rows=0)
+    after = activities(engine, trail.tables)
+    assert after[ids["t1"]]["data"]["changes"] == {"title": ["[erased]", "[erased]"]}
+    assert after[ids["t1"]]["object_label"] is None
+    assert after[ids["t2"]] == before[ids["t2"]]
+    assert after[ids[None]] == before[ids[None]]
+    (record,) = scrubbed_entries(engine, trail.tables)
+    assert record["data"]["payload"]["scope_ids"] == ["t1", "t3"]
+
+
+def test_scrub_with_empty_scope_ids_erases_nothing_and_records_it(
+    engine: Engine, trail: AuditTrail
+) -> None:
+    seed(engine, trail.tables)
+    before = activities(engine, trail.tables)
+
+    with trail.context(ADMIN):
+        assert trail.scrub("Doc", "1", scope_ids=[]) == ScrubResult(0, 0)
+
+    after = activities(engine, trail.tables)
+    assert {k: v for k, v in after.items() if k in before} == before
+    (record,) = scrubbed_entries(engine, trail.tables)
+    assert record["data"]["payload"]["scope_ids"] == []
+    assert record["data"]["payload"]["activity_rows"] == 0
+
+
+def test_str_scope_ids_are_refused_before_any_statement(
+    engine: Engine, trail: AuditTrail
+) -> None:
+    with record_statements(engine) as log:
+        log.recording = True
+        with pytest.raises(TypeError, match="scope_ids"):
+            trail.scrub("Doc", "1", scope_ids="t1")
+        with pytest.raises(TypeError, match="scope_ids"):
+            trail.scrub_actor("u1", scope_ids="t1")
+        log.recording = False
+
+    assert log.statements == []
+
+
+ACTOR_CONTEXT = {"actor_type": "user", "actor_label": "ann@example.com"}
+ACTOR_TRANSACTION = {"actor_label": "ann@example.com", "user_agent": "Firefox"}
+
+
+def add_request(
+    conn: Connection, tables: AuditTables, scopes: list[str | None]
+) -> tuple[int, list[int]]:
+    """Insert one transaction of actor ``u1`` with one entry per scope."""
+    transaction_id: int = conn.execute(
+        insert(tables.transaction)
+        .values(issued_at=JAN, actor_type="user", actor_id="u1", **ACTOR_TRANSACTION)
+        .returning(tables.transaction.c.id)
+    ).scalar_one()
+    activity_ids: list[int] = [
+        conn.execute(
+            insert(tables.activity)
+            .values(
+                **make_entry(
+                    "Doc",
+                    str(n),
+                    {"changes": {}, "context": ACTOR_CONTEXT},
+                    label="Doc",
+                    actor_id="u1",
+                    scope_id=scope,
+                ),
+                transaction_id=transaction_id,
+                created_at=JAN,
+            )
+            .returning(tables.activity.c.id)
+        ).scalar_one()
+        for n, scope in enumerate(scopes)
+    ]
+    return transaction_id, activity_ids
+
+
+@dataclass
+class Requests:
+    """Transaction and activity ids of the requests of actor ``u1``."""
+
+    in_scope: tuple[int, list[int]]
+    mixed: tuple[int, list[int]]
+    unscoped: tuple[int, list[int]]
+    other: tuple[int, list[int]]
+    orphan: int
+
+
+def seed_requests(engine: Engine, tables: AuditTables) -> Requests:
+    with engine.begin() as conn:
+        return Requests(
+            in_scope=add_request(conn, tables, ["t1", "t1"]),
+            mixed=add_request(conn, tables, ["t1", "t2"]),
+            unscoped=add_request(conn, tables, ["t1", None]),
+            other=add_request(conn, tables, ["t2"]),
+            orphan=add_request(conn, tables, [])[0],
+        )
+
+
+def test_scrub_actor_with_scope_ids_clears_only_transactions_wholly_in_scope(
+    engine: Engine, trail: AuditTrail
+) -> None:
+    requests = seed_requests(engine, trail.tables)
+    tx_before = transactions(engine, trail.tables)
+    before = activities(engine, trail.tables)
+
+    with trail.context(ADMIN):
+        result = trail.scrub_actor("u1", scope_ids=["t1"])
+
+    assert result == ScrubResult(activity_rows=4, transaction_rows=1)
+    tx_after = transactions(engine, trail.tables)
+    in_scope_tx, in_scope_rows = requests.in_scope
+    assert tx_after[in_scope_tx] == {
+        **tx_before[in_scope_tx],
+        "actor_label": None,
+        "user_agent": None,
+    }
+    kept = [requests.mixed[0], requests.unscoped[0], requests.other[0]]
+    for transaction_id in [*kept, requests.orphan]:
+        assert tx_after[transaction_id] == tx_before[transaction_id]
+
+    after = activities(engine, trail.tables)
+    stripped = [*in_scope_rows, requests.mixed[1][0], requests.unscoped[1][0]]
+    untouched = [requests.mixed[1][1], requests.unscoped[1][1], *requests.other[1]]
+    for row_id in stripped:
+        assert after[row_id]["data"]["context"] == {"actor_type": "user"}
+    for row_id in untouched:
+        assert after[row_id] == before[row_id]
+
+    (record,) = scrubbed_entries(engine, trail.tables)
+    assert record["data"]["payload"] == {
+        "operation": "scrub_actor",
+        "actor_id": "u1",
+        "scope_ids": ["t1"],
+        "transaction_rows": 1,
+        "activity_rows": 4,
+    }
+
+    # The operator's unrestricted run clears what the restricted one kept.
+    assert trail.scrub_actor("u1") == ScrubResult(activity_rows=3, transaction_rows=4)
+
+
+def test_scrub_actor_with_empty_scope_ids_changes_nothing(
+    engine: Engine, trail: AuditTrail
+) -> None:
+    seed_requests(engine, trail.tables)
+    tx_before = transactions(engine, trail.tables)
+    before = activities(engine, trail.tables)
+
+    with trail.context(ADMIN):
+        assert trail.scrub_actor("u1", scope_ids=set()) == ScrubResult(0, 0)
+
+    tx_after = transactions(engine, trail.tables)
+    assert {k: v for k, v in tx_after.items() if k in tx_before} == tx_before
+    after = activities(engine, trail.tables)
+    assert {k: v for k, v in after.items() if k in before} == before
+    (record,) = scrubbed_entries(engine, trail.tables)
+    assert record["data"]["payload"]["scope_ids"] == []
 
 
 # Async
@@ -785,3 +973,24 @@ async def test_async_methods_refuse_a_sync_engine(trail: AuditTrail) -> None:
         await trail.ascrub("Doc", "1")
     with pytest.raises(TypeError, match="use scrub_actor"):
         await trail.ascrub_actor("u1")
+
+
+async def test_async_scrubs_pass_scope_ids(
+    engine: Engine, async_trail: AuditTrail
+) -> None:
+    requests = seed_requests(engine, async_trail.tables)
+    before = activities(engine, async_trail.tables)
+
+    erased = await async_trail.ascrub("Doc", "1", scope_ids=["t2"])
+    cleared = await async_trail.ascrub_actor("u1", scope_ids=["t1"])
+
+    assert erased == ScrubResult(activity_rows=1, transaction_rows=0)
+    (mixed_t2,) = [
+        row_id for row_id in requests.mixed[1] if before[row_id]["scope_id"] == "t2"
+    ]
+    assert activities(engine, async_trail.tables)[mixed_t2]["object_label"] is None
+    assert cleared == ScrubResult(activity_rows=4, transaction_rows=1)
+    payloads = [
+        r["data"]["payload"] for r in scrubbed_entries(engine, async_trail.tables)
+    ]
+    assert [p["scope_ids"] for p in payloads] == [["t2"], ["t1"]]

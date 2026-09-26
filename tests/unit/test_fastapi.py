@@ -292,7 +292,9 @@ def test_set_actor_updates_the_request_context_not_a_nested_one() -> None:
 
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         with context(actor_type="system") as nested:
-            updated = set_actor(Actor("user", "7", "ann"), auth_method="bearer")
+            updated = set_actor(
+                Actor("user", "7", "ann"), auth_method="bearer", scope_id="t1"
+            )
         results.append((updated, nested))
 
     run(AuditMiddleware(app), http_scope())
@@ -303,15 +305,19 @@ def test_set_actor_updates_the_request_context_not_a_nested_one() -> None:
         "ann",
     )
     assert updated.auth_method == "bearer"
+    assert updated.scope_id == "t1"
     assert nested.actor_type == "system"
+    assert nested.scope_id is None
 
 
-def test_set_actor_keeps_auth_method_when_not_given() -> None:
+def test_set_actor_keeps_auth_method_and_scope_when_not_given() -> None:
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         ctx = request_context()
         assert ctx is not None
         ctx.auth_method = "cookie"
-        assert set_actor(Actor("user", "1")).auth_method == "cookie"
+        ctx.scope_id = "t1"
+        updated = set_actor(Actor("user", "1"))
+        assert (updated.auth_method, updated.scope_id) == ("cookie", "t1")
 
     run(AuditMiddleware(app), http_scope())
 

@@ -603,6 +603,7 @@ class AuditTrail:
         *,
         include_targets: bool = True,
         since: datetime | None = None,
+        scope_ids: Collection[str] | None = None,
     ) -> ScrubResult:
         """Erase the values the entries of one object hold.
 
@@ -623,6 +624,11 @@ class AuditTrail:
                 such as changes of its children.
             since: Only entries created at or after this aware datetime,
                 which also limits the partitions scanned. ``None`` for all.
+            scope_ids: Only entries whose ``scope_id`` is one of these, such
+                as the tenants of an admin. ``None`` for no restriction; an
+                empty collection erases nothing, and an entry without a
+                scope never matches a restriction. Recorded in the
+                ``audit.scrubbed`` entry.
 
         Returns:
             A ``ScrubResult``: ``activity_rows`` is the number of entries
@@ -631,7 +637,8 @@ class AuditTrail:
 
         Raises:
             ScrubNotAllowedError: ``allow_scrub`` is ``False``.
-            TypeError: ``engine`` is async; use ``ascrub``.
+            TypeError: ``engine`` is async; use ``ascrub``; or
+                ``scope_ids`` is a ``str``.
             ValueError: ``since`` is naive, or ``engine`` is in
                 ``AUTOCOMMIT`` mode.
         """
@@ -642,6 +649,7 @@ class AuditTrail:
         if not isinstance(engine, Engine):
             raise TypeError("the engine is async; use ascrub")
         privacy.check_since(since)
+        privacy.check_scope_ids(scope_ids)
         record = self._scrubbed_record()
         if self.auto_create_partitions:
             self.maintenance.ensure_partitions(months_ahead=0)
@@ -653,6 +661,7 @@ class AuditTrail:
                 object_id,
                 include_targets=include_targets,
                 since=since,
+                scope_ids=scope_ids,
                 record=record,
             )
 
@@ -663,6 +672,7 @@ class AuditTrail:
         *,
         include_targets: bool = True,
         since: datetime | None = None,
+        scope_ids: Collection[str] | None = None,
     ) -> ScrubResult:
         """Async ``scrub``, for an ``AuditTrail`` built with an ``AsyncEngine``.
 
@@ -671,13 +681,16 @@ class AuditTrail:
             object_id: Stored ``object_id`` of the object.
             include_targets: Also erase entries whose target is the object.
             since: Only entries created at or after this aware datetime.
+            scope_ids: Only entries with one of these ``scope_id`` values;
+                see ``scrub``.
 
         Returns:
             A ``ScrubResult``; see ``scrub``.
 
         Raises:
             ScrubNotAllowedError: ``allow_scrub`` is ``False``.
-            TypeError: ``engine`` is sync; use ``scrub``.
+            TypeError: ``engine`` is sync; use ``scrub``; or ``scope_ids``
+                is a ``str``.
             ValueError: As for ``scrub``.
         """
         from audit_trail import privacy
@@ -687,6 +700,7 @@ class AuditTrail:
         if isinstance(engine, Engine):
             raise TypeError("the engine is sync; use scrub")
         privacy.check_since(since)
+        privacy.check_scope_ids(scope_ids)
         record = self._scrubbed_record()
         if self.auto_create_partitions:
             await self.maintenance.aensure_partitions(months_ahead=0)
@@ -699,11 +713,14 @@ class AuditTrail:
                     object_id,
                     include_targets=include_targets,
                     since=since,
+                    scope_ids=scope_ids,
                     record=record,
                 )
             )
 
-    def scrub_actor(self, actor_id: str) -> ScrubResult:
+    def scrub_actor(
+        self, actor_id: str, *, scope_ids: Collection[str] | None = None
+    ) -> ScrubResult:
         """Clear the personal context stored for one actor.
 
         ``audit_transaction`` rows created with this ``actor_id`` get
@@ -715,8 +732,20 @@ class AuditTrail:
         and user agent on that row. Runs in one transaction on ``engine``
         with an ``audit.scrubbed`` entry, as ``scrub`` does.
 
+        With ``scope_ids``, only entries whose ``scope_id`` is one of them
+        lose the keys, and a transaction row is cleared only when it has
+        entries and all of them, whoever their actor, are in those scopes:
+        its fields are shared by all its entries, so a request that also
+        wrote entries of another scope or without one keeps them, as does a
+        transaction row without entries. Clearing an actor completely
+        across scopes takes a run without ``scope_ids``.
+
         Args:
             actor_id: The actor's ``actor_id``.
+            scope_ids: The scopes the scrub is restricted to, such as the
+                tenants of an admin. ``None`` for no restriction; an empty
+                collection changes nothing. Recorded in the
+                ``audit.scrubbed`` entry.
 
         Returns:
             A ``ScrubResult`` with the numbers of activity and transaction
@@ -724,7 +753,8 @@ class AuditTrail:
 
         Raises:
             ScrubNotAllowedError: ``allow_scrub`` is ``False``.
-            TypeError: ``engine`` is async; use ``ascrub_actor``.
+            TypeError: ``engine`` is async; use ``ascrub_actor``; or
+                ``scope_ids`` is a ``str``.
             ValueError: ``engine`` is in ``AUTOCOMMIT`` mode.
         """
         from audit_trail import privacy
@@ -733,17 +763,24 @@ class AuditTrail:
         engine = self.engine
         if not isinstance(engine, Engine):
             raise TypeError("the engine is async; use ascrub_actor")
+        privacy.check_scope_ids(scope_ids)
         record = self._scrubbed_record()
         if self.auto_create_partitions:
             self.maintenance.ensure_partitions(months_ahead=0)
         with engine.begin() as conn:
-            return privacy.scrub_actor(conn, self.tables, actor_id, record=record)
+            return privacy.scrub_actor(
+                conn, self.tables, actor_id, scope_ids=scope_ids, record=record
+            )
 
-    async def ascrub_actor(self, actor_id: str) -> ScrubResult:
+    async def ascrub_actor(
+        self, actor_id: str, *, scope_ids: Collection[str] | None = None
+    ) -> ScrubResult:
         """Async ``scrub_actor``, for an ``AuditTrail`` built with an ``AsyncEngine``.
 
         Args:
             actor_id: The actor's ``actor_id``.
+            scope_ids: The scopes the scrub is restricted to; see
+                ``scrub_actor``.
 
         Returns:
             A ``ScrubResult`` with the numbers of activity and transaction
@@ -751,7 +788,8 @@ class AuditTrail:
 
         Raises:
             ScrubNotAllowedError: ``allow_scrub`` is ``False``.
-            TypeError: ``engine`` is sync; use ``scrub_actor``.
+            TypeError: ``engine`` is sync; use ``scrub_actor``; or
+                ``scope_ids`` is a ``str``.
             ValueError: ``engine`` is in ``AUTOCOMMIT`` mode.
         """
         from audit_trail import privacy
@@ -760,13 +798,18 @@ class AuditTrail:
         engine = self.engine
         if isinstance(engine, Engine):
             raise TypeError("the engine is sync; use scrub_actor")
+        privacy.check_scope_ids(scope_ids)
         record = self._scrubbed_record()
         if self.auto_create_partitions:
             await self.maintenance.aensure_partitions(months_ahead=0)
         async with engine.begin() as conn:
             return await conn.run_sync(
                 lambda sync_conn: privacy.scrub_actor(
-                    sync_conn, self.tables, actor_id, record=record
+                    sync_conn,
+                    self.tables,
+                    actor_id,
+                    scope_ids=scope_ids,
+                    record=record,
                 )
             )
 

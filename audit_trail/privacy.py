@@ -11,18 +11,21 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import datetime
 from typing import TYPE_CHECKING, NamedTuple
 
 from sqlalchemy import (
+    ColumnElement,
     Connection,
     Text,
     Update,
     and_,
+    exists,
     false,
     func,
     literal_column,
+    not_,
     null,
     or_,
     update,
@@ -32,6 +35,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from audit_trail.context import AuditContext, current_context
 from audit_trail.diff import ERASED
 from audit_trail.events import AuditSystem
+from audit_trail.query import _check_collection, _member_of
 from audit_trail.writer import (
     ENVELOPE_VERSION,
     Entry,
@@ -163,6 +167,18 @@ def check_since(since: datetime | None) -> None:
         raise ValueError("since must be timezone-aware")
 
 
+def check_scope_ids(scope_ids: Collection[str] | None) -> None:
+    """Refuse a ``str`` as ``scope_ids``, which would be read as its letters.
+
+    Args:
+        scope_ids: The scope restriction, or ``None``.
+
+    Raises:
+        TypeError: ``scope_ids`` is a ``str``.
+    """
+    _check_collection(scope_ids, "scope_ids")
+
+
 def scrub_context(
     context_provider: Callable[[], AuditContext | None] | None,
 ) -> AuditContext:
@@ -190,6 +206,7 @@ def scrub_statement(
     *,
     include_targets: bool,
     since: datetime | None,
+    scope_ids: Collection[str] | None = None,
 ) -> Update:
     """Build the ``UPDATE`` that erases the entries of one object.
 
@@ -199,6 +216,9 @@ def scrub_statement(
         object_id: Stored ``object_id`` of the object.
         include_targets: Also erase entries whose target is the object.
         since: Only entries with ``created_at >= since``; ``None`` for all.
+        scope_ids: Only entries whose ``scope_id`` is one of these; ``None``
+            for all, empty for none. Entries without a scope never match a
+            restriction.
 
     Returns:
         The statement; its rowcount is the number of rows erased.
@@ -211,6 +231,9 @@ def scrub_statement(
     conditions = [match, c.verb.not_in(_LIBRARY_VERBS)]
     if since is not None:
         conditions.append(c.created_at >= since)
+    in_scope = _member_of(c.scope_id, scope_ids)
+    if in_scope is not None:
+        conditions.append(in_scope)
     # Rows already erased are left alone, so a repeated scrub changes nothing.
     conditions.append(or_(c.object_label.is_not(None), c.data.is_distinct_from(erased)))
     return (
@@ -228,6 +251,7 @@ def scrub(
     *,
     include_targets: bool,
     since: datetime | None,
+    scope_ids: Collection[str] | None,
     record: ScrubbedRecord,
 ) -> ScrubResult:
     """Erase the values an object's entries hold, and record it.
@@ -241,6 +265,10 @@ def scrub(
     erased; a payload value is erased whole, including anything nested in
     it. ``data.context`` is left to ``scrub_actor``.
 
+    With ``scope_ids``, only entries whose ``scope_id`` is one of them are
+    erased: an empty collection erases nothing, and an entry without a scope
+    never matches. The ``audit.scrubbed`` entry records the restriction.
+
     Runs in the connection's current transaction; the caller commits.
 
     Args:
@@ -251,6 +279,8 @@ def scrub(
         include_targets: Also erase entries whose target is the object, such
             as changes of its children.
         since: Only entries with ``created_at >= since``; ``None`` for all.
+        scope_ids: Only entries with one of these ``scope_id`` values;
+            ``None`` for no restriction.
         record: Builds the ``audit.scrubbed`` entry.
 
     Returns:
@@ -266,6 +296,7 @@ def scrub(
         object_id,
         include_targets=include_targets,
         since=since,
+        scope_ids=scope_ids,
     )
     erased = connection.execute(statement).rowcount
     _write_record(
@@ -281,6 +312,7 @@ def scrub(
             "object_id": object_id,
             "include_targets": include_targets,
             "since": None if since is None else since.isoformat(),
+            "scope_ids": _recorded(scope_ids),
             "activity_rows": erased,
         },
     )
@@ -292,6 +324,7 @@ def scrub_actor(
     tables: AuditTables,
     actor_id: str,
     *,
+    scope_ids: Collection[str] | None,
     record: ScrubbedRecord,
 ) -> ScrubResult:
     """Clear an actor's personal context, and record it.
@@ -305,6 +338,14 @@ def scrub_actor(
     that wrote its first entry anonymously and then called ``set_actor``
     keeps its address and user agent on that anonymous row.
 
+    With ``scope_ids``, only activity rows whose ``scope_id`` is one of them
+    are changed, and a transaction row only when it has activity rows and
+    every one of them, whoever its actor, is in those scopes: its fields are
+    shared by all its entries, so a request that also wrote entries of
+    another scope, or without a scope, keeps them, as does a transaction row
+    without entries. An empty collection changes nothing. Clearing an
+    actor completely across scopes takes a run without ``scope_ids``.
+
     When the actor scrubs themself, the ``audit.scrubbed`` entry is written
     without those fields too.
 
@@ -314,6 +355,8 @@ def scrub_actor(
         connection: Connection whose role may update the audit tables.
         tables: The audit tables.
         actor_id: The actor's ``actor_id``.
+        scope_ids: The scopes the scrub is restricted to; ``None`` for no
+            restriction.
         record: Builds the ``audit.scrubbed`` entry.
 
     Returns:
@@ -324,21 +367,27 @@ def scrub_actor(
     """
     _check_transaction(connection)
     transaction = tables.transaction
+    activity = tables.activity
+    in_scope = _member_of(activity.c.scope_id, scope_ids)
+    tx_conditions = [
+        transaction.c.actor_id == actor_id,
+        or_(*(transaction.c[name].is_not(None) for name in ACTOR_FIELDS)),
+    ]
+    activity_conditions = [activity.c.actor_id == actor_id]
+    if in_scope is not None:
+        tx_conditions.append(_all_entries_match(tables, in_scope))
+        activity_conditions.append(in_scope)
     cleared = connection.execute(
         update(transaction)
-        .where(
-            transaction.c.actor_id == actor_id,
-            or_(*(transaction.c[name].is_not(None) for name in ACTOR_FIELDS)),
-        )
+        .where(*tx_conditions)
         .values({name: null() for name in ACTOR_FIELDS})
     ).rowcount
 
-    activity = tables.activity
     keys = literal_column(_ACTOR_KEYS, ARRAY(Text))
     context = activity.c.data["context"]
     stripped = connection.execute(
         update(activity)
-        .where(activity.c.actor_id == actor_id, context.has_any(keys))
+        .where(*activity_conditions, context.has_any(keys))
         .values(
             data=func.jsonb_set(
                 activity.c.data,
@@ -365,11 +414,31 @@ def scrub_actor(
         payload={
             "operation": "scrub_actor",
             "actor_id": actor_id,
+            "scope_ids": _recorded(scope_ids),
             "transaction_rows": cleared,
             "activity_rows": stripped,
         },
     )
     return ScrubResult(activity_rows=stripped, transaction_rows=cleared)
+
+
+def _all_entries_match(
+    tables: AuditTables, in_scope: ColumnElement[bool]
+) -> ColumnElement[bool]:
+    # A transaction row has entries, and none of them fails in_scope. A NULL
+    # scope_id makes in_scope NULL rather than false, so it is excluded
+    # explicitly.
+    activity = tables.activity
+    of_row = activity.c.transaction_id == tables.transaction.c.id
+    outside = or_(activity.c.scope_id.is_(None), not_(in_scope))
+    return and_(exists().where(of_row), ~exists().where(of_row, outside))
+
+
+def _recorded(scope_ids: Collection[str] | None) -> JSONValue:
+    if scope_ids is None:
+        return None
+    recorded: list[JSONValue] = [*sorted(scope_ids)]
+    return recorded
 
 
 def _check_transaction(connection: Connection) -> None:
