@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `scrub()` / `scrub_actor()` (and async variants) take `scope_ids=` to erase only one tenant's entries, failing closed like `Visibility`; the FastAPI `set_actor()` takes `scope_id=`; `ActivityData` and `FieldChange` are exported for typing API responses
 ## 0.1.0 - 2026-09-26
 
 First release with the full audit trail: the flush listener, domain events, durable writes, async sessions, the read API, erasure, retention, the FastAPI integration and testing helpers. The API may still change before 1.0.
