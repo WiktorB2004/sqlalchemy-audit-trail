@@ -554,7 +554,7 @@ class AuditTrail:
 
         from audit_trail.listener import PendingEntry, write_entries
         from audit_trail.writer import (
-            DURABLE_WRITE_ERRORS,
+            async_durable_write_errors,
             handle_durable_failure,
             write_durable,
         )
@@ -593,7 +593,7 @@ class AuditTrail:
                     [entry.entry],
                     auto_create_partitions=self.auto_create_partitions,
                 )
-        except DURABLE_WRITE_ERRORS as exc:
+        except async_durable_write_errors() as exc:
             handle_durable_failure(exc, self.on_error, entry.flags.fail_closed)
 
     def scrub(

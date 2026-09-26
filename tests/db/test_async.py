@@ -58,6 +58,7 @@ from audit_trail import (
 from audit_trail.listener import AsyncLoadError
 from audit_trail.writer import AuditWriteError
 from tests.db.listener_support import create_trail, logged_error, record_statements
+from tests.db.outage_support import OUTAGES, outage
 
 CAP = 15
 """Seconds after which a test that should not block fails instead of hanging."""
@@ -317,6 +318,46 @@ async def test_exhausted_async_durable_pool_times_out(
     finally:
         await held.close()
         await durable.dispose()
+    assert env.activities() == []
+
+
+@pytest.mark.parametrize("name", OUTAGES)
+@pytest.mark.parametrize(
+    ("verb", "raises"),
+    [(AsyncEvent.LOCKED, True), (AsyncEvent.DENIED, False)],
+    ids=["fail_closed", "durable"],
+)
+async def test_async_durable_engine_outage_follows_the_policy(
+    database_url: str,
+    async_engine: AsyncEngine,
+    make: EnvMaker,
+    name: str,
+    verb: AsyncEvent,
+    raises: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    driver = async_engine.url.get_driver_name()
+    cause: BaseException | None
+    with outage(database_url, name, driver) as broken:
+        durable = create_async_engine(broken.url, connect_args=broken.connect_args)
+        env = make(durable_engine=durable, on_error="log")
+        try:
+            with caplog.at_level(logging.ERROR, logger="audit_trail"):
+                async with env.factory() as session:
+                    write = asyncio.wait_for(env.trail.alog(session, verb), CAP)
+                    if raises:
+                        with pytest.raises(
+                            AuditWriteError, match="fail_closed"
+                        ) as raised:
+                            await write
+                        cause = raised.value.__cause__
+                    else:
+                        await write
+                        cause = logged_error(caplog)
+        finally:
+            await durable.dispose()
+    assert isinstance(cause, Exception)
+    assert not isinstance(cause, AuditWriteError)
     assert env.activities() == []
 
 

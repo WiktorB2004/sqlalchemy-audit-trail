@@ -15,6 +15,8 @@ once and never through the caller's session.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -68,7 +70,8 @@ class AuditWriteError(Exception):
 
     Raised for ``fail_closed`` events, and for other durable writes with
     ``on_error="raise"``. The original error (a ``DBAPIError``, the pool's
-    ``sqlalchemy.exc.TimeoutError`` or a ``PartitionError``) is the
+    ``sqlalchemy.exc.TimeoutError``, a ``PartitionError`` or, from ``alog``,
+    a connection error the async driver raised unwrapped) is the
     ``__cause__``. Nothing of the entry was committed.
     """
 
@@ -449,8 +452,39 @@ DURABLE_WRITE_ERRORS = (DBAPIError, PoolTimeoutError, PartitionError)
 """Failures of a durable write that the write policy handles."""
 
 
+@functools.cache
+def async_durable_write_errors() -> tuple[type[Exception], ...]:
+    """Failures of an async durable write that the write policy handles.
+
+    ``DURABLE_WRITE_ERRORS`` plus what asyncpg raises unwrapped when it
+    cannot connect; psycopg (sync and async) wraps all of these in a
+    ``DBAPIError``. Each extra type is needed:
+
+    - ``OSError``: asyncpg, SQLAlchemy 2.0 and 2.1: an unreachable server
+      (``ConnectionRefusedError``), an unresolvable host
+      (``socket.gaierror``), no route to host, TLS failures, and the connect
+      timeout on Python 3.11+ (``TimeoutError``).
+    - ``asyncio.TimeoutError``: asyncpg, SQLAlchemy 2.0 on Python 3.10 (2.1
+      needs 3.11): its connect timeout, which is not an ``OSError`` there.
+    - ``asyncpg.PostgresError``: asyncpg, SQLAlchemy 2.0 only: the server
+      refusing the connection (missing database, bad password, too many
+      connections, closed during the handshake); 2.1 wraps it.
+
+    Returns:
+        The exception types; ``asyncpg.PostgresError`` only when asyncpg is
+        installed.
+    """
+    # asyncio.TimeoutError, not TimeoutError: a different class on 3.10.
+    errors = (*DURABLE_WRITE_ERRORS, OSError, asyncio.TimeoutError)
+    try:
+        from asyncpg import PostgresError  # type: ignore[import-untyped]
+    except ImportError:  # asyncpg is an optional driver
+        return errors
+    return (*errors, PostgresError)
+
+
 def handle_durable_failure(
-    exc: DBAPIError | PoolTimeoutError | PartitionError,
+    exc: Exception,
     on_error: OnError,
     fail_closed: bool,
 ) -> None:
@@ -460,7 +494,8 @@ def handle_durable_failure(
     raises ``AuditWriteError``; otherwise the failure is logged.
 
     Args:
-        exc: The failure, one of ``DURABLE_WRITE_ERRORS``.
+        exc: The failure, one of ``DURABLE_WRITE_ERRORS`` or, from ``alog``,
+            ``async_durable_write_errors()``.
         on_error: The write policy.
         fail_closed: The entry must not be lost; always raise.
 
