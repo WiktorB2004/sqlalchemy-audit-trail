@@ -21,6 +21,7 @@ from audit_trail import AuditContext, Audited, AuditEvent, Severity, event
 from audit_trail.maintenance import PartitionLockTimeoutError, ensure_partitions
 from audit_trail.writer import AuditWriteError
 from tests.db.listener_support import Env, logged_error, make_env
+from tests.db.outage_support import OUTAGES, outage
 
 CAP = 15
 """Seconds after which a test that should not block fails instead of hanging."""
@@ -319,6 +320,43 @@ def test_exhausted_durable_pool_times_out(
                 held.close()  # also releases a hung attempt
     finally:
         durable.dispose()
+    assert env.activities() == []
+
+
+@pytest.mark.parametrize("name", OUTAGES)
+@pytest.mark.parametrize(
+    ("verb", "raises"),
+    [(DurableEvent.LOCKED, True), (DurableEvent.DENIED, False)],
+    ids=["fail_closed", "durable"],
+)
+def test_durable_engine_outage_follows_the_policy(
+    database_url: str,
+    make: EnvMaker,
+    name: str,
+    verb: DurableEvent,
+    raises: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cause: BaseException | None
+    with outage(database_url, name, "psycopg") as broken:
+        durable = create_engine(broken.url, connect_args=broken.connect_args)
+        env = make(durable_engine=durable, on_error="log")
+        try:
+            with (
+                caplog.at_level(logging.ERROR, logger="audit_trail"),
+                env.factory() as session,
+            ):
+                if raises:
+                    with pytest.raises(AuditWriteError, match="fail_closed") as raised:
+                        env.trail.log(session, verb)
+                    cause = raised.value.__cause__
+                else:
+                    env.trail.log(session, verb)
+                    cause = logged_error(caplog)
+        finally:
+            durable.dispose()
+    assert isinstance(cause, Exception)
+    assert not isinstance(cause, AuditWriteError)
     assert env.activities() == []
 
 
