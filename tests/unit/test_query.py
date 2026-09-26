@@ -100,12 +100,15 @@ def test_invalid_default_window(window: object, error: type[Exception]) -> None:
 def test_trail_passes_the_default_window() -> None:
     window = timedelta(days=30)
     trail = AuditTrail(
-        create_engine("postgresql+psycopg://"), default_query_window=window
+        create_engine("postgresql+psycopg://"), events=[], default_query_window=window
     )
 
     assert trail.query.default_window == window
     assert (
-        AuditTrail(create_engine("postgresql+psycopg://")).query.default_window is None
+        AuditTrail(
+            create_engine("postgresql+psycopg://"), events=[]
+        ).query.default_window
+        is None
     )
 
 

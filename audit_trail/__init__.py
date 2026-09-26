@@ -7,6 +7,7 @@ from audit_trail.config import AuditOptions, AuditTrail, Target
 from audit_trail.context import Actor, AuditContext
 from audit_trail.diff import AuditOptionError, FieldPolicyError
 from audit_trail.events import AuditEvent, Severity, event
+from audit_trail.listener import AsyncLoadError
 from audit_trail.mixin import Audited
 from audit_trail.privacy import ScrubNotAllowedError, ScrubResult
 from audit_trail.query import (
@@ -37,6 +38,7 @@ __all__ = [
     "ActivityDetail",
     "Actor",
     "AllHistory",
+    "AsyncLoadError",
     "AuditContext",
     "AuditEvent",
     "AuditOptionError",

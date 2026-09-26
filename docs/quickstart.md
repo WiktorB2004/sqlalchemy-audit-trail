@@ -90,7 +90,7 @@ This example also tracks a relationship and points each task at its project as t
 ```
 <!-- fmt: on -->
 
-`AsyncSession` cannot lazy-load, so load a tracked collection (here with `selectinload`) before you change it; see [limitations](limitations.md#tracked-collections-under-asyncsession).
+`AsyncSession` cannot lazy-load, so load a tracked collection (here with `selectinload`) before you change it, and refresh an object expired by a commit before assigning to it; otherwise you get an `AsyncLoadError` naming the attribute. See [limitations](limitations.md#unloaded-attributes-under-asyncsession).
 
 Every query has an `a`-prefixed async variant:
 

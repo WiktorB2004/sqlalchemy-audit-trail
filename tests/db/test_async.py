@@ -2,8 +2,9 @@
 
 The ``entity.*`` capture tests of ``test_listener*.py`` run under
 ``AsyncSession`` too (see ``listener_support``); these cover what only the
-async API has: context variables set in coroutines, ``alog`` and the async
-durable writer. ``async_engine`` runs each test on asyncpg and psycopg.
+async API has: context variables set in coroutines, ``alog``, the async
+durable writer and ``AsyncLoadError`` for loads outside the greenlet.
+``async_engine`` runs each test on asyncpg and psycopg.
 """
 
 from __future__ import annotations
@@ -36,10 +37,12 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
+    ORMExecuteState,
     Session,
     mapped_column,
     relationship,
     selectinload,
+    sessionmaker,
 )
 
 from audit_trail import (
@@ -50,9 +53,11 @@ from audit_trail import (
     AuditTrail,
     Severity,
     event,
+    listener,
 )
+from audit_trail.listener import AsyncLoadError
 from audit_trail.writer import AuditWriteError
-from tests.db.listener_support import create_trail, logged_error
+from tests.db.listener_support import create_trail, logged_error, record_statements
 
 CAP = 15
 """Seconds after which a test that should not block fails instead of hanging."""
@@ -68,6 +73,7 @@ class AsyncEvent(AuditEvent):
 class Models:
     Tag: Any
     Post: Any
+    Comment: Any
 
 
 @pytest.fixture
@@ -91,11 +97,17 @@ def models(engine: Engine, schema: str) -> Models:
         id: Mapped[int] = mapped_column(primary_key=True)
         title: Mapped[str] = mapped_column(default="")
         tags: Mapped[list[Tag]] = relationship(secondary=post_tags)
+        comments: Mapped[list[Comment]] = relationship()  # not tracked
 
         __audit__ = AuditOptions(track_relationships={"tags"})
 
+    class Comment(Base):
+        __tablename__ = "comment"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        post_id: Mapped[int] = mapped_column(ForeignKey("post.id"))
+
     Base.metadata.create_all(engine)
-    return Models(Tag, Post)
+    return Models(Tag, Post, Comment)
 
 
 @dataclass
@@ -318,26 +330,41 @@ async def test_alog_refuses_a_sync_durable_engine(
     assert env.activities() == []
 
 
-async def test_unloaded_tracked_collection_is_a_host_error(
+def missing_greenlet(exc: BaseException | None) -> bool:
+    """``MissingGreenlet`` as raised by asyncpg, or wrapped by psycopg."""
+    if isinstance(exc, StatementError) and not isinstance(exc, MissingGreenlet):
+        exc = exc.orig
+    return isinstance(exc, MissingGreenlet) and not isinstance(exc, AsyncLoadError)
+
+
+async def seed(env: AsyncEnv, models: Models) -> None:
+    async with env.factory() as session:
+        session.add_all([models.Post(id=1, title="p"), models.Tag(id=1)])
+        session.add(models.Comment(id=1, post_id=1))
+        await session.commit()
+
+
+async def test_unloaded_tracked_collection_is_explained(
     make: EnvMaker, models: Models
 ) -> None:
     # Appending to an unloaded collection loads it first, which is I/O
-    # outside the greenlet: SQLAlchemy raises MissingGreenlet in the host's
-    # code, before any flush. Hosts load tracked collections eagerly.
+    # outside the greenlet, in the host's code before any flush. The error
+    # names the tracked collection and how to load it.
     env = make()
-    async with env.factory() as session:
-        session.add_all([models.Post(id=1, title="p"), models.Tag(id=1)])
-        await session.commit()
+    await seed(env, models)
 
     async with env.factory() as session:
         post = await session.get(models.Post, 1)
         tag = await session.get(models.Tag, 1)
         assert post is not None
-        # asyncpg raises it as is, psycopg wrapped in a StatementError.
-        with pytest.raises(
-            (MissingGreenlet, StatementError), match="greenlet_spawn has not been"
-        ):
+        with pytest.raises(AsyncLoadError) as raised:
             post.tags.append(tag)
+    message = str(raised.value)
+    assert "Post.tags is not loaded" in message
+    assert "selectinload(models.<locals>.Post.tags)" in message
+    assert 'lazy="selectin"' in message
+    assert isinstance(raised.value, MissingGreenlet)
+    assert missing_greenlet(raised.value.__cause__)
     assert env.verbs() == ["entity.created"]
 
     async with env.factory() as session:
@@ -349,3 +376,146 @@ async def test_unloaded_tracked_collection_is_a_host_error(
         await session.commit()
     updated = env.activities()[-1]
     assert updated["data"]["changes"] == {"tags": {"added": ["1"], "removed": []}}
+
+
+async def test_expired_audited_column_is_explained(
+    make: EnvMaker, models: Models
+) -> None:
+    # Audited keeps the old value of an assigned column (active_history), so
+    # assigning an expired column loads it: outside the greenlet that fails.
+    env = make()
+    await seed(env, models)
+
+    async with env.factory() as session:
+        post = await session.get(models.Post, 1)
+        assert post is not None
+        await session.commit()  # expires post
+        with pytest.raises(AsyncLoadError) as assigned:
+            post.title = "changed"
+        with pytest.raises(AsyncLoadError) as read:
+            _ = post.title
+        for raised in (assigned, read):
+            message = str(raised.value)
+            assert "Post.id, models.<locals>.Post.title are not loaded" in message
+            assert "await session.refresh(obj)" in message
+            assert "expire_on_commit=False" in message
+            assert missing_greenlet(raised.value.__cause__)
+
+        await session.refresh(post)
+        post.title = "changed"
+        await session.commit()
+    assert env.activities()[-1]["data"]["changes"] == {"title": ["p", "changed"]}
+
+
+async def test_expired_column_without_the_instance_names_the_model(
+    make: EnvMaker, models: Models, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The instance of a column load comes from a private SQLAlchemy option;
+    # should it disappear, the error still is AsyncLoadError.
+    monkeypatch.setattr(listener, "_REFRESH_STATE", "_no_such_option")
+    env = make()
+    await seed(env, models)
+    async with env.factory() as session:
+        post = await session.get(models.Post, 1)
+        assert post is not None
+        await session.commit()
+        with pytest.raises(AsyncLoadError) as raised:
+            post.title = "changed"
+    assert "an attribute of models.<locals>.Post is not loaded" in str(raised.value)
+    assert missing_greenlet(raised.value.__cause__)
+
+
+async def test_loads_the_library_does_not_cause_keep_their_error(
+    make: EnvMaker, models: Models
+) -> None:
+    env = make()
+    await seed(env, models)
+
+    async with env.factory() as session:
+        post = await session.get(models.Post, 1)
+        tag = await session.get(models.Tag, 1)
+        assert post is not None
+        assert tag is not None
+        with pytest.raises((MissingGreenlet, StatementError)) as untracked:
+            _ = post.comments  # a relationship not in track_relationships
+        await session.commit()  # expires tag, which is not Audited
+        with pytest.raises((MissingGreenlet, StatementError)) as unaudited:
+            _ = tag.id
+    for raised in (untracked, unaudited):
+        assert missing_greenlet(raised.value), raised.value
+
+
+async def test_audit_flush_emits_no_select(
+    make: EnvMaker, models: Models, async_engine: AsyncEngine
+) -> None:
+    # Under AsyncSession the flush runs in the greenlet, where a lazy load
+    # would succeed silently: only the statements show that none happens.
+    env = make()
+    await seed(env, models)
+    async with env.factory() as session:
+        post = await session.get(models.Post, 1)
+        tag = await session.get(models.Tag, 1)
+        assert post is not None
+        await session.refresh(post, ["tags"])
+        with record_statements(async_engine.sync_engine) as log:
+            log.recording = True
+            post.title = "changed"
+            post.tags.append(tag)
+            await session.commit()
+    assert log.statements
+    assert [s for s in log.statements if s.lstrip().upper().startswith("SELECT")] == []
+
+
+@pytest.mark.parametrize("per_mapper", [False, True], ids=["bind", "binds"])
+def test_sync_loads_skip_the_async_translation(
+    engine: Engine,
+    schema: str,
+    models: Models,
+    monkeypatch: pytest.MonkeyPatch,
+    per_mapper: bool,
+) -> None:
+    trail = create_trail(engine, schema)
+    session_class: type[Session] = type("AuditedSyncSession", (Session,), {})
+    factory = sessionmaker(class_=session_class)
+    trail.install(factory)
+    with factory(bind=engine) as session:
+        session.add_all([models.Post(id=1, title="p"), models.Tag(id=1)])
+        session.commit()
+
+    invoked: list[ORMExecuteState] = []
+    invoke = ORMExecuteState.invoke_statement
+
+    def spy(self: ORMExecuteState, *args: Any, **kwargs: Any) -> Any:
+        invoked.append(self)
+        return invoke(self, *args, **kwargs)
+
+    monkeypatch.setattr(ORMExecuteState, "invoke_statement", spy)
+    if per_mapper:
+        session = factory(binds={models.Post: engine, models.Tag: engine})
+    else:
+        session = factory(bind=engine)
+    with session:
+        post = session.get(models.Post, 1)
+        assert post is not None
+        session.expire(post)
+        assert post.tags == []  # tracked collection lazy load
+        post.title = "changed"  # expired column load
+        assert len(invoked) == 0
+        session.rollback()
+
+
+async def test_async_session_bound_per_mapper_is_explained(
+    make: EnvMaker, models: Models, async_engine: AsyncEngine
+) -> None:
+    env = make()
+    await seed(env, models)
+    factory = async_sessionmaker(
+        binds={models.Post: async_engine},
+        sync_session_class=env.factory.kw["sync_session_class"],
+    )
+    async with factory() as session:
+        post = await session.get(models.Post, 1)
+        assert post is not None
+        session.expire(post)
+        with pytest.raises(AsyncLoadError, match=r"Post\.title are not loaded"):
+            post.title = "changed"
