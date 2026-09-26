@@ -75,12 +75,14 @@ from audit_trail.integrations.fastapi import set_actor
 def current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> User:
     user = authenticate(token)
     set_actor(
-        Actor(type="user", id=str(user.id), label=user.email), auth_method="bearer"
+        Actor(type="user", id=str(user.id), label=user.email),
+        auth_method="bearer",
+        scope_id=str(user.tenant_id),
     )
     return user
 ```
 
-`set_actor(actor, *, auth_method=None)` updates the request's context in place, so it works from a synchronous dependency running in the thread pool, and it works when the session was opened before the user was known: the listener reads the context when the session flushes. It raises `RuntimeError` outside a request handled by `AuditMiddleware`.
+`set_actor(actor, *, auth_method=None, scope_id=None)` updates the request's context in place, so it works from a synchronous dependency running in the thread pool, and it works when the session was opened before the user was known: the listener reads the context when the session flushes. `auth_method` and `scope_id` are stored when given and left unchanged when `None`; `scope_id` is the scope (such as the tenant) the request's entries are filed under, which `Visibility(scope_ids=...)` and `scrub(..., scope_ids=...)` restrict on. It raises `RuntimeError` outside a request handled by `AuditMiddleware`.
 
 Unlike `audit.set_actor()`, it always updates the request's own context, even inside a nested `audit.context(...)` block.
 

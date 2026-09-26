@@ -260,7 +260,9 @@ def session_provider() -> Session | AsyncSession | None:
     return None if state is None else state.session
 
 
-def set_actor(actor: Actor, *, auth_method: str | None = None) -> AuditContext:
+def set_actor(
+    actor: Actor, *, auth_method: str | None = None, scope_id: str | None = None
+) -> AuditContext:
     """Set the actor of the current request, after authentication.
 
     Updates the request's context (the one ``AuditMiddleware`` activated) in
@@ -271,6 +273,8 @@ def set_actor(actor: Actor, *, auth_method: str | None = None) -> AuditContext:
     Args:
         actor: The actor. All three actor fields are overwritten.
         auth_method: How the actor authenticated, stored when given.
+        scope_id: Scope (such as the tenant) of the request's entries,
+            stored when given; ``None`` keeps the current one.
 
     Returns:
         The request's context.
@@ -288,6 +292,8 @@ def set_actor(actor: Actor, *, auth_method: str | None = None) -> AuditContext:
     ctx.actor_label = actor.label
     if auth_method is not None:
         ctx.auth_method = auth_method
+    if scope_id is not None:
+        ctx.scope_id = scope_id
     return ctx
 
 

@@ -113,6 +113,40 @@ The window applies to `list_groups()` and `alist_groups()` only. `object_history
 
 `Group.change_count` is the number of entries and `Group.max_severity` the highest severity among them.
 
+### Typing API responses
+
+`audit_trail.query` also exports the types of an entry's `data`: `ActivityData` for the envelope and `FieldChange` for one value of `data["changes"]` (a column change `[old, new]` or a relationship change `{"added": [...], "removed": [...]}`). Use them to type the code that reads entries.
+
+They are `TypedDict`s over a recursive JSON alias, which pydantic cannot use as field types: it rejects `typing.TypedDict` on Python below 3.12, and it cannot build the recursive alias on any version. For a pydantic (or FastAPI) response model, describe the values with `pydantic.JsonValue` and convert each `ActivityRow`:
+
+```python
+from datetime import datetime
+
+from pydantic import BaseModel, JsonValue
+
+from audit_trail.query import ActivityData, ActivityRow, FieldChange
+
+
+class EntryOut(BaseModel):
+    id: int
+    verb: str
+    object_type: str | None
+    object_id: str | None
+    object_label: str | None
+    actor_id: str | None
+    created_at: datetime
+    changes: dict[str, list[JsonValue] | dict[str, list[str]]]
+    payload: dict[str, JsonValue]
+
+
+def entry_out(activity: ActivityRow) -> EntryOut:
+    data: ActivityData = activity["data"]
+    changes: dict[str, FieldChange] = data.get("changes", {})
+    return EntryOut.model_validate(
+        {**activity, "changes": changes, "payload": data.get("payload", {})}
+    )
+```
+
 ### Compaction
 
 The library writes one row per object and flush, so one transaction can hold several rows for the same object. By default (`compact=True`) they are merged into the net change of the transaction:

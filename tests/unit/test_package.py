@@ -28,3 +28,11 @@ def test_import_does_not_need_greenlet() -> None:
     # pull in sqlalchemy.ext.asyncio.
     code = "import sys, audit_trail; sys.exit('sqlalchemy.ext.asyncio' in sys.modules)"
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_query_exports_the_entry_data_types() -> None:
+    from audit_trail import _compaction, query
+
+    assert {"ActivityData", "ActivityRow", "FieldChange"} <= set(query.__all__)
+    assert query.ActivityData is _compaction.ActivityData
+    assert query.FieldChange is _compaction.FieldChange

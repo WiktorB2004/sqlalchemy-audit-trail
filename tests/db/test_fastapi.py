@@ -96,7 +96,11 @@ def proxied_headers(**extra: str) -> dict[str, str]:
 
 def authenticate(user_id: str = "42") -> None:
     # Runs in the thread pool, after the session dependency.
-    set_actor(Actor("user", user_id, f"{user_id}@example.com"), auth_method="bearer")
+    set_actor(
+        Actor("user", user_id, f"{user_id}@example.com"),
+        auth_method="bearer",
+        scope_id=f"tenant-{user_id}",
+    )
 
 
 def assert_request_context(rows: Rows) -> None:
@@ -112,6 +116,7 @@ def assert_request_context(rows: Rows) -> None:
 
     (activity,) = rows.activities()
     assert activity["actor_id"] == "42"
+    assert activity["scope_id"] == "tenant-42"
     snapshot = activity["data"]["context"]
     assert snapshot["remote_addr"] == CLIENT
     assert snapshot["user_agent"] == "pytest-agent/1"
