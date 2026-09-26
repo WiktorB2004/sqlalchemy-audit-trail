@@ -12,8 +12,8 @@ authors:
 repository-code: https://github.com/WiktorB2004/sqlalchemy-audit-trail
 url: https://wiktorb2004.github.io/sqlalchemy-audit-trail/
 license: MIT
-version: "0.1.0a1"
-date-released: "2026-09-25"
+version: "0.1.0"
+date-released: "2026-09-26"
 keywords:
   - sqlalchemy
   - audit

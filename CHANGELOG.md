@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.0 - 2026-09-26
+
+First release with the full audit trail: the flush listener, domain events, durable writes, async sessions, the read API, erasure, retention, the FastAPI integration and testing helpers. The API may still change before 1.0.
+
 - `PartitionManager.drop_expired()`: drops monthly partitions past their per-severity retention with `DETACH ... CONCURRENTLY`, finishing interrupted detaches; `PartitionManager.health()` reports partition coverage ahead, pending detaches and orphaned tables
 - `ensure_partitions()` works with tables declared without a schema and returns schema-qualified names
 - Renovate opens pull requests for dependency and GitHub Actions updates
