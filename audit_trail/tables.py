@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from dataclasses import dataclass
-from typing import Literal, get_args
+from typing import TYPE_CHECKING, Literal, get_args
 
 from sqlalchemy import (
     BigInteger,
@@ -35,8 +35,13 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
+from sqlalchemy.exc import UnboundExecutionError
 
 from audit_trail._typing import assert_never
+
+if TYPE_CHECKING:
+    from sqlalchemy import Connection
+    from sqlalchemy.orm import Session
 
 MAX_IDENTIFIER_LENGTH = 63
 """PostgreSQL's limit on identifier length in bytes; longer names are truncated."""
@@ -81,6 +86,33 @@ class AuditTables:
     metadata: MetaData
     transaction: Table
     activity: Table
+
+
+def audit_connection(
+    session: Session, tables: AuditTables, hint: str = ""
+) -> Connection:
+    """The session's connection for the audit tables.
+
+    Resolved by ``Session.get_bind`` with the ``audit_activity`` table as the
+    clause: a bind of that table in ``Session(binds=...)``, else the default
+    bind. A ``get_bind`` override is honoured.
+
+    Args:
+        session: The session.
+        tables: The audit tables.
+        hint: Appended to the error message.
+
+    Raises:
+        UnboundExecutionError: Neither resolves, chained to SQLAlchemy's error.
+    """
+    try:
+        return session.connection(bind_arguments={"clause": tables.activity})
+    except UnboundExecutionError as exc:
+        raise UnboundExecutionError(
+            "The session has no bind for the audit tables: bind "
+            f"{tables.activity.fullname} and {tables.transaction.fullname} in "
+            f"Session(binds=...), or give the session a default bind.{hint}"
+        ) from exc
 
 
 def build_tables(

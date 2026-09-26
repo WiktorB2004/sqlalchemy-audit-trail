@@ -22,6 +22,9 @@ that foreign-key and relationship changes refer to.
 Every query runs after ``SET LOCAL plan_cache_mode = 'force_custom_plan'``:
 a generic plan of a prepared statement (asyncpg, psycopg after a few
 executions) cannot prune partitions by the query's parameters at plan time.
+The setting and the query run on one connection of the session: the one for
+the audit tables, that is their bind in ``Session(binds=...)``, else the
+session's default bind; with neither, ``UnboundExecutionError`` is raised.
 """
 
 from __future__ import annotations
@@ -59,10 +62,10 @@ from audit_trail._typing import assert_never
 from audit_trail.checks import _registry_of
 from audit_trail.diff import REDACTED, UNKNOWN, field_policy, options_of
 from audit_trail.serialization import JSONValue
-from audit_trail.tables import AuditTables
+from audit_trail.tables import AuditTables, audit_connection
 
 if TYPE_CHECKING:
-    from sqlalchemy import ColumnClause, Table
+    from sqlalchemy import ColumnClause, Connection, Table
     from sqlalchemy.ext.asyncio import AsyncSession
     from sqlalchemy.orm import Mapper, Session, registry
 
@@ -466,10 +469,11 @@ class AuditQuery:
         reports the bound: pass it as ``until`` to read the window before.
 
         Statements run in the session's current transaction (one is begun if
-        needed) after ``SET LOCAL plan_cache_mode = 'force_custom_plan'``,
-        which stays in effect until that transaction ends. On an
-        ``AUTOCOMMIT`` connection the setting has no effect, so prepared
-        statements may fall back to generic plans that read every partition.
+        needed), on its connection for the audit tables, after
+        ``SET LOCAL plan_cache_mode = 'force_custom_plan'``, which stays in
+        effect until that transaction ends. On an ``AUTOCOMMIT`` connection
+        the setting has no effect, so prepared statements may fall back to
+        generic plans that read every partition.
 
         Args:
             session: The session to query with.
@@ -506,6 +510,8 @@ class AuditQuery:
                 datetime of the cursor is not timezone-aware.
             TypeError: A collection filter is a ``str``, or ``since`` is
                 neither a datetime, ``ALL_HISTORY`` nor ``None``.
+            UnboundExecutionError: The session has neither a bind for the
+                audit tables nor a default bind.
         """
         _check_page(since, until, cursor, limit)
         bound = self._bound(since, until, cursor, self.default_window)
@@ -658,13 +664,14 @@ class AuditQuery:
             conditions.append(a.c.severity == severity)
         if visibility is not None:
             conditions.append(visibility.predicate(a))
-        session.execute(_CUSTOM_PLAN)
-        row = session.execute(select(a).where(*conditions)).mappings().first()
+        connection = audit_connection(session, self.tables)
+        connection.execute(_CUSTOM_PLAN)
+        row = connection.execute(select(a).where(*conditions)).mappings().first()
         if row is None:
             return None
         activity = _activity(row)
         header = (
-            session.execute(
+            connection.execute(
                 select(t).where(
                     t.c.id == activity["transaction_id"],
                     t.c.issued_at == activity["created_at"],
@@ -977,8 +984,9 @@ class AuditQuery:
             .group_by(a.c.actor_id)
             .order_by(last_at.desc(), a.c.actor_id)
         )
-        session.execute(_CUSTOM_PLAN)
-        return [AccessCount(*row) for row in session.execute(statement)]
+        connection = audit_connection(session, self.tables)
+        connection.execute(_CUSTOM_PLAN)
+        return [AccessCount(*row) for row in connection.execute(statement)]
 
     async def aaccess_summary(
         self,
@@ -1074,11 +1082,12 @@ class AuditQuery:
         # matches the rows of all streams together; `scope` narrows the rows
         # a group shows (None: every visible row of the transaction); `bound`
         # is recorded in the next cursor.
-        session.execute(_CUSTOM_PLAN)
-        shown = self._shown(session, boundary, cursor)
-        selection = self._select(session, streams, cursor, shown, limit)
+        connection = audit_connection(session, self.tables)
+        connection.execute(_CUSTOM_PLAN)
+        shown = self._shown(connection, boundary, cursor)
+        selection = self._select(connection, streams, cursor, shown, limit)
         groups = self._groups(
-            session, selection.transactions, visibility, compact, scope
+            connection, selection.transactions, visibility, compact, scope
         )
         next_cursor = selection.next_cursor
         if next_cursor is not None:
@@ -1087,7 +1096,7 @@ class AuditQuery:
 
     def _shown(
         self,
-        session: Session,
+        connection: Connection,
         conditions: list[ColumnElement[bool]],
         cursor: Cursor | None,
     ) -> frozenset[int]:
@@ -1106,18 +1115,18 @@ class AuditQuery:
                 a.c.id >= cursor.id,
             )
         )
-        return frozenset(session.scalars(statement))
+        return frozenset(connection.scalars(statement))
 
     def _select(
         self,
-        session: Session,
+        connection: Connection,
         streams: list[list[ColumnElement[bool]]],
         cursor: Cursor | None,
         shown: frozenset[int],
         limit: int,
     ) -> _Selection:
         merged = heapq.merge(
-            *(self._hits(session, stream, cursor, limit + 1) for stream in streams),
+            *(self._hits(connection, stream, cursor, limit + 1) for stream in streams),
             key=lambda hit: (hit.created_at, hit.id),
             reverse=True,
         )
@@ -1140,7 +1149,7 @@ class AuditQuery:
 
     def _hits(
         self,
-        session: Session,
+        connection: Connection,
         conditions: list[ColumnElement[bool]],
         cursor: Cursor | None,
         batch: int,
@@ -1163,7 +1172,7 @@ class AuditQuery:
                 .order_by(a.c.created_at.desc(), a.c.id.desc())
                 .limit(batch)
             )
-            hits = [_Hit(*row) for row in session.execute(statement)]
+            hits = [_Hit(*row) for row in connection.execute(statement)]
             yield from hits
             if len(hits) < batch:
                 return
@@ -1171,7 +1180,7 @@ class AuditQuery:
 
     def _groups(
         self,
-        session: Session,
+        connection: Connection,
         transactions: dict[int, datetime],
         visibility: Visibility | None,
         compact: bool,
@@ -1195,12 +1204,12 @@ class AuditQuery:
             conditions.append(scope)
         rows: dict[int, list[ActivityRow]] = {}
         statement = select(a).where(*conditions).order_by(a.c.transaction_id, a.c.id)
-        for mapping in session.execute(statement).mappings():
+        for mapping in connection.execute(statement).mappings():
             activity = _activity(mapping)
             rows.setdefault(activity["transaction_id"], []).append(activity)
         headers = {
             mapping["id"]: mapping
-            for mapping in session.execute(
+            for mapping in connection.execute(
                 select(t).where(t.c.id.in_(ids), t.c.issued_at.between(low, high))
             ).mappings()
         }
@@ -1403,10 +1412,11 @@ class LabelResolver:
             latest.c.id,
             latest.c.object_label,
         ).select_from(references.join(latest, true()))
-        session.execute(_CUSTOM_PLAN)
+        connection = audit_connection(session, self.tables)
+        connection.execute(_CUSTOM_PLAN)
         return {
             _Reference(object_type, object_id): _Label(created_at, row_id, label)
-            for object_type, object_id, created_at, row_id, label in session.execute(
+            for object_type, object_id, created_at, row_id, label in connection.execute(
                 statement
             )
         }

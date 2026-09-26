@@ -367,11 +367,13 @@ class AuditTrail:
         ``None``), the entry goes to the session ``session_provider()``
         returns.
 
-        A non-durable entry is inserted immediately on
-        ``session.connection()``, in the same database transaction as the
-        session's changes: it is committed or rolled back with them, and
-        shares their ``audit_transaction`` row. Write failures follow
-        ``on_error``.
+        A non-durable entry is inserted immediately on the session's
+        connection, in the same database transaction as the session's changes:
+        it is committed or rolled back with them, and shares their
+        ``audit_transaction`` row. Write failures follow ``on_error``. With
+        ``obj``, the connection is the one ``obj`` is flushed on; without, the
+        one for the audit tables: their bind in ``Session(binds=...)``, else
+        the session's default bind.
 
         A durable entry (the event's ``durable`` or ``fail_closed``, or
         ``durable=True``) is written on a connection of ``durable_engine`` in
@@ -430,10 +432,13 @@ class AuditTrail:
                 ``Pseudonymized`` field already holds a pseudonym token.
             AuditWriteError: A durable write failed and the policy says to
                 raise.
+            UnboundExecutionError: A non-durable entry without ``obj``, and
+                the session has neither a bind for the audit tables nor a
+                default bind.
         """
         from sqlalchemy.orm import Session
 
-        from audit_trail.listener import write_entries
+        from audit_trail.listener import PendingEntry, write_entries
         from audit_trail.writer import (
             DURABLE_WRITE_ERRORS,
             handle_durable_failure,
@@ -449,7 +454,7 @@ class AuditTrail:
             )
         entry = self._prepare(session, call.event, obj, target, payload, actor, durable)
         if not entry.flags.durable:
-            write_entries(session, self, [entry.entry], entry.ctx)
+            write_entries(session, self, [PendingEntry(entry.entry, obj)], entry.ctx)
             return
         engine = self.durable_engine
         if not isinstance(engine, Engine):
@@ -543,10 +548,11 @@ class AuditTrail:
             PayloadError: The payload does not match the event's schema.
             AuditWriteError: A durable write failed and the policy says to
                 raise.
+            UnboundExecutionError: As for ``log``.
         """
         from sqlalchemy.ext.asyncio import AsyncSession
 
-        from audit_trail.listener import write_entries
+        from audit_trail.listener import PendingEntry, write_entries
         from audit_trail.writer import (
             DURABLE_WRITE_ERRORS,
             handle_durable_failure,
@@ -566,7 +572,7 @@ class AuditTrail:
         if not entry.flags.durable:
             await session.run_sync(
                 lambda sync_session: write_entries(
-                    sync_session, self, [entry.entry], entry.ctx
+                    sync_session, self, [PendingEntry(entry.entry, obj)], entry.ctx
                 )
             )
             return

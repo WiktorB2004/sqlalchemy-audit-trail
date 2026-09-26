@@ -154,3 +154,26 @@ def test_audited_models() -> None:
 | `json-in-place` | warning | a JSON column is neither `Mutable` nor in `snapshot_on_load` |
 
 A column whose name only looks sensitive can be allowed with `check_models(Base, allow_names={"Invoice.token_count"})`.
+
+## Sessions with binds
+
+A session without a default bind, configured with `binds` per model or table, works as SQLAlchemy resolves it (`Session.get_bind`, including an override of it in a `Session` subclass):
+
+- An `entity.*` entry, and a `log(obj=...)` entry, go on the connection the object is flushed on, resolved from its base mapper: in the same database transaction as the object's rows.
+- `log()` without `obj`, and the queries of `trail.query`, use the connection for the audit tables: their bind in `binds`, else the session's default bind. With neither, they raise `UnboundExecutionError`.
+
+```python
+from sqlalchemy.orm import sessionmaker
+
+tables = trail.tables
+Session = sessionmaker(
+    binds={
+        Base: engine,
+        tables.activity: engine,  # for log() without obj and trail.query
+        tables.transaction: engine,
+    }
+)
+trail.install(Session)
+```
+
+When one flush writes objects bound to different databases, each database gets its entries and an `audit_transaction` row of its own, in its transaction there, so one commit has one `transaction_id` per database. The audit tables must exist in each of them. Horizontal sharding (`ShardedSession`) is not supported.
