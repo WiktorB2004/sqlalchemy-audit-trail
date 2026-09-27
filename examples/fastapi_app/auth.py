@@ -51,12 +51,12 @@ def issue_token(user: User) -> str:
 
 def record_user(user: User, auth_method: str) -> None:
     """Make `user` the actor, and their tenant the scope, of this request."""
-    context = set_actor(
-        Actor(type="user", id=user.id, label=user.email), auth_method=auth_method
+    # Entries without a model scope (auth.login) get the tenant from here.
+    set_actor(
+        Actor(type="user", id=user.id, label=user.email),
+        auth_method=auth_method,
+        scope_id=user.tenant_id,
     )
-    # AuditContext is mutable on purpose: entries without a model scope
-    # (auth.login) get the tenant from here.
-    context.scope_id = user.tenant_id
 
 
 def current_user(
