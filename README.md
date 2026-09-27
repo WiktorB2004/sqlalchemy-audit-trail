@@ -88,9 +88,21 @@ audit = AuditTrail(engine, events=[AuthEvent])
 audit.log(session, AuthEvent.LOGIN_FAILED, payload={"reason": "bad password"})
 ```
 
-Docs: [wiktorb2004.github.io/sqlalchemy-audit-trail](https://wiktorb2004.github.io/sqlalchemy-audit-trail/). Runnable, tested quickstarts for sync, async and FastAPI: [`examples/`](examples/).
+Docs: [wiktorb2004.github.io/sqlalchemy-audit-trail](https://wiktorb2004.github.io/sqlalchemy-audit-trail/). Runnable, tested quickstarts for sync, async and FastAPI: [`examples/`](https://github.com/WiktorB2004/sqlalchemy-audit-trail/tree/main/examples). A complete multi-tenant FastAPI app with login events, history, an activity feed and GDPR erasure, with a curl walkthrough: [`examples/fastapi_app`](https://github.com/WiktorB2004/sqlalchemy-audit-trail/blob/main/examples/fastapi_app/README.md).
 
 Audit rows are written **in your transaction**: roll back and they are gone with the change. A failed audit write does not fail your transaction by default (`on_error="log"`). `durable` events are committed on their own connection and survive a rollback; `fail_closed` events raise `AuditWriteError` when they cannot be written.
+
+## Results
+
+Measured on a laptop: PostgreSQL 18 in Docker with stock settings, one connection, synthetic data. Protocol, environment and limits: [`benchmark/README.md`](https://github.com/WiktorB2004/sqlalchemy-audit-trail/blob/main/benchmark/README.md).
+
+| What | Plain | Audited | Added |
+| --- | ---: | ---: | ---: |
+| flush of 1 object (p50) | 3.4 ms | 5.8 ms | **+2.4 ms** (+1.5 ms with `on_error="raise"`) |
+| flush of 100 objects (p50) | 8.0 ms | 19.4 ms | **+11.4 ms**, about 114 µs per object |
+| durable `log()` (p50) | | | +6.7 ms |
+
+Reads on 5M entries in 80 partitions: the first page of `list_groups` takes **18.5 ms** at p50 (15.1 ms with a 30-day window), of which PostgreSQL spends under 1 ms; a next page reads **5 of 80** partitions. Queries with no time bound (`object_history`, `access_summary`, by `actor_id`) read every monthly partition and take 10 to 22 ms here.
 
 ## Why this instead of sqlalchemy-continuum, triggers or pgaudit
 
@@ -148,6 +160,14 @@ uv run mkdocs serve
 ```
 
 Published at [wiktorb2004.github.io/sqlalchemy-audit-trail](https://wiktorb2004.github.io/sqlalchemy-audit-trail/).
+
+## Benchmark
+
+The numbers above come from [`benchmark/`](https://github.com/WiktorB2004/sqlalchemy-audit-trail/tree/main/benchmark). It needs Docker (or `--database-url`) and takes about 12 minutes:
+
+```bash
+uv run python -m benchmark.run_benchmark
+```
 
 ## Contributing
 
