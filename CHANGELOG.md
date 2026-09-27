@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-09-27
+
+- Repository: a reproducible benchmark (`benchmark/`) and an example multi-tenant FastAPI application (`examples/fastapi_app/`), neither part of the package
 - `scrub()` / `scrub_actor()` (and async variants) take `scope_ids=` to erase only one tenant's entries, failing closed like `Visibility`; the FastAPI `set_actor()` takes `scope_id=`; `ActivityData` and `FieldChange` are exported for typing API responses
 - With asyncpg, a durable engine that cannot connect (refused, unresolvable host, timeout, or on SQLAlchemy 2.0 a missing database or bad password) now follows the durable write policy: `fail_closed` raises `AuditWriteError` and `on_error="log"` logs, instead of a raw driver error escaping `alog()`
 
