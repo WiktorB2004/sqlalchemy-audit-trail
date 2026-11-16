@@ -30,8 +30,8 @@ Nothing is recorded until `AuditTrail.install()` has been called on the session 
 
 | Verb | `data["changes"]` |
 |---|---|
-| `entity.created` | every audited column as `[null, value]`, empty ones too |
-| `entity.updated` | only the columns whose value really changed, as `[old, new]` |
+| `entity.created` | every audited column as `[null, value]`, empty ones too; `"<unknown>"` for a value SQL wrote and did not fetch back |
+| `entity.updated` | the columns whose value really changed, as `[old, new]`, plus columns the UPDATE set by SQL (see below) |
 | `entity.deleted` | every audited column as `[value, null]` |
 
 An update that changes nothing (for example `Decimal("1.5")` to `Decimal("1.50")`, compared with the column type) writes no entry. One entry is written per object and flush; when you read the log, the rows of one object within one transaction are merged into its net change (see [querying](querying.md#compaction)).
@@ -120,6 +120,18 @@ A JSON column changed in place (`obj.settings["theme"] = "dark"`) is a special c
 - `MutableDict` plus `snapshot_on_load={"settings"}`: the library deep-copies the column whenever the instance is loaded or refreshed, and the entry has the real old value. The copy costs memory and time on every load of the model.
 
 Assigning a new object (`obj.settings = {**obj.settings, "theme": "dark"}`) always records both values.
+
+### Timestamps and other columns set by SQL
+
+A column the UPDATE sets on its own goes into an `entity.updated` entry only next to another change of the same object. That covers `onupdate`, `server_onupdate`, `Computed` and the mapper's `version_id_col`. A change of only such columns, or of only excluded columns, writes no entry.
+
+- `onupdate=func.now()` is a SQL expression. SQLAlchemy does not fetch the new value back unless the mapper sets `eager_defaults=True`; the default `"auto"` fetches on INSERT only. Without it the entry stores `[old, "<unknown>"]`.
+- `onupdate=datetime.now` (a Python callable) and the version counter are in memory, so the entry stores `[old, new]`.
+- `server_onupdate`, triggers and `Computed` are recorded only with `eager_defaults=True`, and only when the value changed.
+
+For real `updated_at` values in the log, use `eager_defaults=True` or a Python callable. To keep a timestamp out of the log, give it `info={"audit": "exclude"}`; that also leaves it out of `entity.created`.
+
+Assigning a SQL expression yourself (`order.placed_at = func.now()`) is a change on its own: the entry stores `[old, "<unknown>"]`, since the new value is never fetched back. See [limitations](../limitations.md#columns-set-by-sql).
 
 ## Object ids
 

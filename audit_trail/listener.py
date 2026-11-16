@@ -60,6 +60,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from audit_trail._compaction import FieldChange
 from audit_trail.context import AuditContext, ContextSnapshot, resolve_context
 from audit_trail.diff import (
+    _FLUSH_CAPTURE_KEY,
     USE_CONTEXT,
     ChangeKind,
     entity_changes,
@@ -191,7 +192,9 @@ def install(
             f"installing on {cls.__qualname__} would audit its sessions twice"
         )
     listener = _Listener(trail)
+    event.listen(cls, "before_flush", _before_flush)
     event.listen(cls, "after_flush", listener.after_flush)
+    event.listen(cls, "after_flush_postexec", _after_flush_postexec)
     event.listen(cls, "do_orm_execute", listener.do_orm_execute)
     event.listen(cls, "do_orm_execute", _explain_async_load)
     event.listen(cls, "after_transaction_end", _after_transaction_end)
@@ -618,11 +621,31 @@ def _cached_row(session: Session, connection: Connection) -> TransactionRow | No
     return None if cached is None else cached.row
 
 
+def _before_flush(
+    session: Session, flush_context: UOWTransaction, instances: object
+) -> None:
+    # A fresh capture per flush, filled by Audited's before_update listener
+    # and read by entity_changes in after_flush. Without it (another session
+    # class, or capture switched off) before_update keeps nothing.
+    if session.info.get(AUDIT_ENABLED_KEY) is False:
+        session.info.pop(_FLUSH_CAPTURE_KEY, None)
+    else:
+        session.info[_FLUSH_CAPTURE_KEY] = {}
+
+
+def _after_flush_postexec(session: Session, flush_context: UOWTransaction) -> None:
+    session.info.pop(_FLUSH_CAPTURE_KEY, None)
+
+
 def _after_transaction_end(session: Session, transaction: SessionTransaction) -> None:
     # Fires for every way a transaction ends, including Session.close()
     # without commit or rollback, which fires no commit or rollback event.
     # A released savepoint or a flush's subtransaction is not the end of the
     # database transaction: the rows live on in the enclosing one.
+    # A failed flush never reaches after_flush_postexec: drop its capture.
+    # A nested end is a host savepoint opened inside the flush: keep it.
+    if not transaction.nested:
+        session.info.pop(_FLUSH_CAPTURE_KEY, None)
     if transaction.parent is None:
         session.info.pop(_CACHE_KEY, None)
 
