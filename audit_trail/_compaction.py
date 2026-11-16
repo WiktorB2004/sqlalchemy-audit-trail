@@ -13,10 +13,9 @@ import json
 from collections.abc import Iterable, Sequence
 from datetime import datetime
 from itertools import pairwise
-from typing import TypeAlias, TypedDict
+from typing import TypeAlias, TypedDict, assert_never
 from uuid import UUID
 
-from audit_trail._typing import assert_never
 from audit_trail.context import ContextSnapshot
 from audit_trail.diff import ERASED, REDACTED, UNKNOWN
 from audit_trail.events import Crud

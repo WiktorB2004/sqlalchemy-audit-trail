@@ -1,6 +1,6 @@
 # Development
 
-Python 3.10+ and [uv](https://docs.astral.sh/uv/).
+Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync

@@ -19,7 +19,15 @@ import weakref
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NamedTuple,
+    TypeAlias,
+    assert_never,
+    cast,
+)
 
 from sqlalchemy import Column, inspect
 from sqlalchemy.orm import ColumnProperty
@@ -27,7 +35,6 @@ from sqlalchemy.orm.attributes import instance_state
 from sqlalchemy.orm.base import NO_VALUE
 from sqlalchemy.sql import ClauseElement
 
-from audit_trail._typing import assert_never
 from audit_trail.config import AuditOptions, Target
 from audit_trail.serialization import JSONValue, KeyRing, encode_value, hash_value
 

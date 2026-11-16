@@ -15,13 +15,12 @@ once and never through the caller's session.
 
 from __future__ import annotations
 
-import asyncio
 import functools
 import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
-from typing import TYPE_CHECKING, NamedTuple, TypedDict, TypeVar
+from typing import TYPE_CHECKING, NamedTuple, TypedDict, TypeVar, assert_never
 from uuid import UUID
 
 from sqlalchemy import Connection, Table, insert
@@ -29,7 +28,6 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from audit_trail._compaction import ActivityData
-from audit_trail._typing import assert_never
 from audit_trail.context import AuditContext, ContextSnapshot, context_snapshot
 from audit_trail.events import PayloadError
 from audit_trail.maintenance import PartitionError, ensure_partitions
@@ -463,9 +461,7 @@ def async_durable_write_errors() -> tuple[type[Exception], ...]:
     - ``OSError``: asyncpg, SQLAlchemy 2.0 and 2.1: an unreachable server
       (``ConnectionRefusedError``), an unresolvable host
       (``socket.gaierror``), no route to host, TLS failures, and the connect
-      timeout on Python 3.11+ (``TimeoutError``).
-    - ``asyncio.TimeoutError``: asyncpg, SQLAlchemy 2.0 on Python 3.10 (2.1
-      needs 3.11): its connect timeout, which is not an ``OSError`` there.
+      timeout (``TimeoutError``; ``asyncio.TimeoutError`` is the same class).
     - ``asyncpg.PostgresError``: asyncpg, SQLAlchemy 2.0 only: the server
       refusing the connection (missing database, bad password, too many
       connections, closed during the handshake); 2.1 wraps it.
@@ -474,8 +470,7 @@ def async_durable_write_errors() -> tuple[type[Exception], ...]:
         The exception types; ``asyncpg.PostgresError`` only when asyncpg is
         installed.
     """
-    # asyncio.TimeoutError, not TimeoutError: a different class on 3.10.
-    errors = (*DURABLE_WRITE_ERRORS, OSError, asyncio.TimeoutError)
+    errors = (*DURABLE_WRITE_ERRORS, OSError)
     try:
         from asyncpg import PostgresError  # type: ignore[import-untyped]
     except ImportError:  # asyncpg is an optional driver

@@ -24,7 +24,7 @@ Do **not** open a public issue for a vulnerability. See [SECURITY.md](https://gi
 
 ## Setup
 
-Python 3.10+ and [uv](https://docs.astral.sh/uv/).
+Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync --frozen
@@ -63,7 +63,7 @@ AUDIT_TEST_PG_IMAGE=postgres:14 uv run pytest
 
 To use a server you already have instead of Docker, set `AUDIT_TEST_DATABASE_URL`, for example `postgresql+psycopg://postgres:postgres@localhost:5432/postgres`.
 
-CI runs the suite on PostgreSQL 14, 16, 17 and 18, SQLAlchemy 2.0 and 2.1, and Python 3.10 to 3.13. On Python 3.11+ `uv.lock` pins SQLAlchemy 2.1; to test against 2.0 locally:
+CI runs the suite on PostgreSQL 14, 16, 17 and 18, SQLAlchemy 2.0 and 2.1, and Python 3.11 to 3.13. `uv.lock` pins SQLAlchemy 2.1; to test against 2.0 locally:
 
 ```bash
 uv pip install "sqlalchemy[asyncio]==2.0.*"

@@ -14,14 +14,13 @@ from __future__ import annotations
 import re
 from collections.abc import Collection, Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
 from sqlalchemy import Column
 from sqlalchemy.ext.mutable import Mutable
 from sqlalchemy.orm import registry
 from sqlalchemy.types import JSON, TypeDecorator
 
-from audit_trail._typing import assert_never
 from audit_trail.config import AuditOptions
 from audit_trail.diff import field_policy, options_of
 from audit_trail.mixin import Audited
