@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -44,7 +44,7 @@ def log(engine: Engine, schema: str) -> Log:
     trail = create_trail(engine, schema, default_query_window=WINDOW)
     t = trail.tables.transaction
     a = trail.tables.activity
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         ensure_partitions(
             conn, trail.tables, list(Sev), months_ahead=3, now=now - timedelta(days=60)
@@ -81,10 +81,10 @@ def names(page: Page) -> list[str | None]:
 
 
 def test_window_applies_without_since(log: Log) -> None:
-    before = datetime.now(timezone.utc)
+    before = datetime.now(UTC)
     with Session(log.engine) as session:
         page = log.trail.query.list_groups(session)
-    after = datetime.now(timezone.utc)
+    after = datetime.now(UTC)
 
     assert names(page) == ["a", "b", "c"]
     assert page.since is not None

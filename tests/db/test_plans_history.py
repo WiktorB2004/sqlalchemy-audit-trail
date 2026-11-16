@@ -6,7 +6,7 @@ See ``plan_support`` for how the plans are captured.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -36,12 +36,12 @@ from tests.db.plan_support import (
 # (HIGH) and another board (LOW).
 MONTHS = 4
 PER_MONTH = 1000
-CURSOR = Cursor(datetime(2026, 2, 20, tzinfo=timezone.utc) - timedelta(minutes=100), 0)
+CURSOR = Cursor(datetime(2026, 2, 20, tzinfo=UTC) - timedelta(minutes=100), 0)
 LIMIT = 5
 
 # The Board 1 row of the transaction ten minutes before February 20th.
 ENTRY_ID = 2 * 100000 + 10
-ENTRY_AT = datetime(2026, 2, 20, tzinfo=timezone.utc) - timedelta(minutes=10)
+ENTRY_AT = datetime(2026, 2, 20, tzinfo=UTC) - timedelta(minutes=10)
 
 FEBRUARY = {"audit_activity_10_p2026_02", "audit_activity_40_p2026_02"}
 UP_TO_FEBRUARY = FEBRUARY | {
@@ -61,7 +61,7 @@ def query(engine: Engine, schema: str) -> AuditQuery:
             tables,
             list(Sev),
             months_ahead=MONTHS - 1,
-            now=datetime(2026, 1, 15, tzinfo=timezone.utc),
+            now=datetime(2026, 1, 15, tzinfo=UTC),
         )
         months = ", ".join(
             f"({index}, timestamptz '2026-{index:02d}-20 00:00+00')"

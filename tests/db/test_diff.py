@@ -12,7 +12,7 @@ import logging
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -209,7 +209,7 @@ def test_update_without_net_change_writes_nothing(
     compares with ``column.type.compare_values``; the snapshot test below is
     the one that exercises the comparison in ``entity_changes`` itself.
     """
-    moment = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+    moment = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
     naive = moment.replace(tzinfo=None)
     item = add_item(
         session,

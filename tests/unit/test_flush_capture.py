@@ -8,7 +8,7 @@ the listener stores is tested in ``tests/db/test_sql_written_columns.py``.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -30,7 +30,7 @@ T1 = datetime(2026, 1, 2)
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):

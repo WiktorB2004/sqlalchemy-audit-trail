@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -22,7 +22,7 @@ AT = datetime(2026, 9, 25, 12, 30, 1, 123456, tzinfo=timezone(timedelta(hours=2)
     "cursor",
     [
         Cursor(AT, 42),
-        Cursor(AT.astimezone(timezone.utc), 1),
+        Cursor(AT.astimezone(UTC), 1),
         Cursor(AT, 2**62),
         Cursor(AT, 7, AT - timedelta(days=30)),
         Cursor(AT, 7, ALL_HISTORY),

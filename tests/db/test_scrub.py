@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
@@ -29,9 +29,9 @@ from audit_trail.tables import AuditTables
 from audit_trail.writer import Entry
 from tests.db.listener_support import Sev, create_trail, record_statements
 
-JAN = datetime(2026, 1, 10, 12, tzinfo=timezone.utc)
-MAR = datetime(2026, 3, 10, 12, tzinfo=timezone.utc)
-MARCH_1 = datetime(2026, 3, 1, tzinfo=timezone.utc)
+JAN = datetime(2026, 1, 10, 12, tzinfo=UTC)
+MAR = datetime(2026, 3, 10, 12, tzinfo=UTC)
+MARCH_1 = datetime(2026, 3, 1, tzinfo=UTC)
 UPDATED = "entity.updated"
 SCRUBBED = "audit.scrubbed"
 
@@ -67,7 +67,7 @@ def add_months(engine: Engine, tables: AuditTables) -> None:
             tables,
             list(Sev),
             months_ahead=2,
-            now=datetime(2026, 1, 15, tzinfo=timezone.utc),
+            now=datetime(2026, 1, 15, tzinfo=UTC),
         )
 
 

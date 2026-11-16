@@ -13,7 +13,7 @@ import re
 import sys
 import uuid
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 
@@ -288,7 +288,7 @@ def test_roles_sql_grants_what_each_operation_needs(
         for statement in sql_section("grants", names):
             conn.execute(text(statement))
     assert maintenance.maintenance.ensure_partitions()
-    old = datetime(2020, 1, 15, tzinfo=timezone.utc)
+    old = datetime(2020, 1, 15, tzinfo=UTC)
     with maintenance_engine.begin() as conn:
         ensure_partitions(conn, maintenance.tables, Severity, months_ahead=0, now=old)
 

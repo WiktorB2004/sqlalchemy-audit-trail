@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -15,7 +15,7 @@ from audit_trail.query import AuditQuery, Cursor, LabelResolver, Visibility
 from audit_trail.tables import build_tables
 
 NAIVE = datetime(2026, 9, 1)
-AWARE = datetime(2026, 9, 1, tzinfo=timezone.utc)
+AWARE = datetime(2026, 9, 1, tzinfo=UTC)
 CORRELATION = UUID("00000000-0000-0000-0000-00000000000c")
 
 Call = Callable[[AuditQuery, Session, dict[str, Any]], object]

@@ -6,7 +6,7 @@ See ``plan_support`` for how the plans are captured.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -34,7 +34,7 @@ from tests.db.plan_support import (
 # back from the 20th of January to April 2026.
 MONTHS = ["2026_01", "2026_02", "2026_03", "2026_04"]
 PER_MONTH = 2000
-CURSOR = Cursor(datetime(2026, 2, 20, tzinfo=timezone.utc) - timedelta(minutes=100), 0)
+CURSOR = Cursor(datetime(2026, 2, 20, tzinfo=UTC) - timedelta(minutes=100), 0)
 LIMIT = 5
 # A window ending at the cursor's time starts in February too.
 WINDOW = timedelta(days=10)
@@ -51,7 +51,7 @@ def query(engine: Engine, schema: str) -> AuditQuery:
             tables,
             list(Sev),
             months_ahead=len(MONTHS) - 1,
-            now=datetime(2026, 1, 15, tzinfo=timezone.utc),
+            now=datetime(2026, 1, 15, tzinfo=UTC),
         )
         months = ", ".join(
             f"({index}, timestamptz '2026-{index:02d}-20 00:00+00')"

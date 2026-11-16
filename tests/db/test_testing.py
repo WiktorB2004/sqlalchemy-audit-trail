@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import ANY
 
@@ -373,7 +373,7 @@ async def test_async_failures(
 
 # Test table helpers ------------------------------------------------------
 
-JAN_2030 = datetime(2030, 1, 15, tzinfo=timezone.utc)
+JAN_2030 = datetime(2030, 1, 15, tzinfo=UTC)
 
 
 def insert_entry(connection: Any, trail: AuditTrail, created_at: datetime) -> None:
@@ -393,7 +393,7 @@ def test_create_clear_and_drop_test_tables(engine: Engine, schema: str) -> None:
         create_test_tables(trail, connection, now=JAN_2030)
     with engine.begin() as connection:
         # months_ahead=1: January and February 2030 exist.
-        insert_entry(connection, trail, datetime(2030, 2, 28, tzinfo=timezone.utc))
+        insert_entry(connection, trail, datetime(2030, 2, 28, tzinfo=UTC))
     assert_audited(trail, engine, verb="testing_test.viewed")
 
     with engine.begin() as connection:
@@ -413,4 +413,4 @@ def test_create_test_tables_covers_months_ahead_only(
         create_test_tables(trail, connection, now=JAN_2030, months_ahead=0)
 
     with pytest.raises(IntegrityError), engine.begin() as connection:
-        insert_entry(connection, trail, datetime(2030, 2, 1, tzinfo=timezone.utc))
+        insert_entry(connection, trail, datetime(2030, 2, 1, tzinfo=UTC))

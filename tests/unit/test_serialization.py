@@ -5,7 +5,7 @@ import hmac
 import json
 import subprocess
 import sys
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum, IntEnum
 from typing import Any, Optional, Union
@@ -75,7 +75,7 @@ class MoneyEncoder(json.JSONEncoder):
         (date(2026, 9, 25), "2026-09-25"),
         (time(8, 30, 5), "08:30:05"),
         (
-            datetime(2026, 9, 25, 8, 30, tzinfo=timezone.utc),
+            datetime(2026, 9, 25, 8, 30, tzinfo=UTC),
             "2026-09-25T08:30:00+00:00",
         ),
         (

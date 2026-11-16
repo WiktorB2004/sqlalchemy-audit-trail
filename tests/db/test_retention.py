@@ -6,7 +6,7 @@ import logging
 import time
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 from typing import Any, TypeVar
 
@@ -40,7 +40,7 @@ class Sev(IntEnum):
     CRITICAL = 40
 
 
-NOW = datetime(2026, 9, 10, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 10, 12, tzinfo=UTC)
 DAY = timedelta(days=1)
 # Watchdog for tests that block on locks: a regression fails instead of hanging.
 CAP = 15
@@ -55,7 +55,7 @@ def tables(engine: Engine, schema: str) -> AuditTables:
     with engine.begin() as conn:
         create_audit_tables(conn, t, Sev)
         ensure_partitions(
-            conn, t, Sev, months_ahead=3, now=datetime(2026, 6, 5, tzinfo=timezone.utc)
+            conn, t, Sev, months_ahead=3, now=datetime(2026, 6, 5, tzinfo=UTC)
         )
     return t
 
@@ -182,7 +182,7 @@ def test_info_window_drops_transactions_too(
     engine: Engine, tables: AuditTables, schema: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     with engine.begin() as conn:
-        add_rows(conn, tables, datetime(2026, 6, 15, tzinfo=timezone.utc))
+        add_rows(conn, tables, datetime(2026, 6, 15, tzinfo=UTC))
     retention = {Sev.INFO: 30 * DAY, Sev.NOTICE: None, Sev.CRITICAL: None}
 
     dropped = drop(engine, tables, retention)
@@ -284,7 +284,7 @@ def test_empty_retention_drops_nothing_and_warns_for_each(
 def test_partition_ending_exactly_at_cutoff_is_kept(
     engine: Engine, tables: AuditTables, schema: str
 ) -> None:
-    july_end = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    july_end = datetime(2026, 8, 1, tzinfo=UTC)
     retention = {Sev.INFO: 30 * DAY, Sev.NOTICE: None, Sev.CRITICAL: None}
 
     at_cutoff = drop(engine, tables, retention, now=july_end + 30 * DAY)
@@ -318,7 +318,7 @@ def test_multi_value_severity_partition_keeps_longest_retention(
             tables,
             [10, 20],
             months_ahead=3,
-            now=datetime(2026, 6, 5, tzinfo=timezone.utc),
+            now=datetime(2026, 6, 5, tzinfo=UTC),
         )
 
     dropped = drop(engine, tables, {10: 30 * DAY, 20: 60 * DAY})
@@ -615,7 +615,7 @@ def test_drop_expired_names_without_schema(
             unqualified_tables,
             [Sev.INFO],
             months_ahead=1,
-            now=datetime(2026, 7, 5, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 5, tzinfo=UTC),
         )
 
     dropped = drop(search_path_engine, unqualified_tables, {Sev.INFO: 30 * DAY})
@@ -671,7 +671,7 @@ def test_health_reports_coverage(
         ensure_partitions(conn, tables, Sev, months_ahead=2, now=NOW)
     with engine.connect() as conn:
         report = health(conn, tables, Sev, now=NOW)
-        later = health(conn, tables, Sev, now=datetime(2027, 1, 1, tzinfo=timezone.utc))
+        later = health(conn, tables, Sev, now=datetime(2027, 1, 1, tzinfo=UTC))
 
     assert report.transaction.months_ahead == 2
     assert all(h.months_ahead == 2 for h in report.activity.values())
@@ -719,7 +719,7 @@ def old_tables(engine: Engine, schema: str) -> AuditTables:
     with engine.begin() as conn:
         create_audit_tables(conn, t, Sev)
         ensure_partitions(
-            conn, t, Sev, months_ahead=1, now=datetime(2020, 1, 5, tzinfo=timezone.utc)
+            conn, t, Sev, months_ahead=1, now=datetime(2020, 1, 5, tzinfo=UTC)
         )
     return t
 

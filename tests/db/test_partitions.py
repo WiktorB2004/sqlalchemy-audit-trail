@@ -7,7 +7,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import IntEnum
 
 import pytest
@@ -29,7 +29,7 @@ class Sev(IntEnum):
     NOTICE = 20
 
 
-SEPT = datetime(2026, 9, 10, 12, tzinfo=timezone.utc)
+SEPT = datetime(2026, 9, 10, 12, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -87,7 +87,7 @@ def test_creates_named_partitions_across_year_end(
     engine: Engine, tables: AuditTables, schema: str
 ) -> None:
     created = ensure(
-        engine, tables, months_ahead=2, now=datetime(2026, 11, 30, tzinfo=timezone.utc)
+        engine, tables, months_ahead=2, now=datetime(2026, 11, 30, tzinfo=UTC)
     )
 
     months = ["p2026_11", "p2026_12", "p2027_01"]
@@ -233,11 +233,11 @@ def test_row_at_month_start_lands_in_that_month(
         engine,
         tables,
         months_ahead=1,
-        now=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 5, tzinfo=UTC),
         time_zone=time_zone,
     )
-    first_instant = datetime(2026, 9, 1, tzinfo=timezone.utc)
-    last_instant = datetime(2026, 8, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    first_instant = datetime(2026, 9, 1, tzinfo=UTC)
+    last_instant = datetime(2026, 8, 31, 23, 59, 59, 999999, tzinfo=UTC)
 
     with engine.begin() as conn:
         conn.execute(
