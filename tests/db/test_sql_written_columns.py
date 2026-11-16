@@ -33,12 +33,13 @@ from sqlalchemy.orm import (
     Session,
     UOWTransaction,
     mapped_column,
+    object_session,
     relationship,
 )
 from sqlalchemy.sql import ColumnElement
 
 from audit_trail import Audited
-from audit_trail.diff import FLUSH_CAPTURE_KEY, REDACTED, UNKNOWN, entity_changes
+from audit_trail.diff import _FLUSH_CAPTURE_KEY, REDACTED, UNKNOWN, entity_changes
 from audit_trail.serialization import encode_value
 from tests.db.listener_support import (
     Env,
@@ -363,16 +364,59 @@ def test_failed_flush_leaves_no_capture_behind(env: Env, models: Models) -> None
         order.placed_at = func.now()
         with pytest.raises(Exception, match="null value"):
             session.flush()
-        assert FLUSH_CAPTURE_KEY not in session.info
+        assert _FLUSH_CAPTURE_KEY not in session.info
         session.rollback()
-        assert FLUSH_CAPTURE_KEY not in session.info
+        assert _FLUSH_CAPTURE_KEY not in session.info
         order.status = "PLACED"
         session.commit()
-        assert FLUSH_CAPTURE_KEY not in session.info
+        assert _FLUSH_CAPTURE_KEY not in session.info
 
     (changes,) = updates(env)
     assert changes["status"] == ["DRAFT", "PLACED"]
     assert "placed_at" not in changes
+
+
+@pytest.mark.parametrize("eager", [False], ids=["eager=False"])
+@pytest.mark.parametrize(
+    "placement", ["before_flush", "mapper_before_update", "after_flush_first"]
+)
+def test_savepoint_released_inside_flush_keeps_capture(
+    env: Env, models: Models, placement: str
+) -> None:
+    order_id = place_order(env, models)
+
+    def savepoint(session: Session | None) -> None:
+        assert session is not None
+        # begin_nested flushes, which would fire this listener again.
+        if session.info.get("test.in_savepoint"):
+            return
+        session.info["test.in_savepoint"] = True
+        try:
+            with session.begin_nested():
+                pass
+        finally:
+            session.info["test.in_savepoint"] = False
+
+    if placement == "before_flush":
+        event.listen(env.factory, "before_flush", lambda s, *_: savepoint(s))
+    elif placement == "mapper_before_update":
+        event.listen(
+            models.Order,
+            "before_update",
+            lambda mapper, connection, target: savepoint(object_session(target)),
+        )
+    else:
+        event.listen(env.factory, "after_flush", lambda s, _: savepoint(s), insert=True)
+
+    with env.factory() as session:
+        order = session.get_one(models.Order, order_id)
+        order.status = "PLACED"
+        order.placed_at = func.now()
+        session.commit()
+
+    (changes,) = updates(env)
+    assert changes["status"] == ["DRAFT", "PLACED"]
+    assert changes["placed_at"] == [encode_value(T0), UNKNOWN]
 
 
 def test_created_columns_written_by_sql(
@@ -411,7 +455,7 @@ def test_sessions_without_capture_keep_nothing(
     seen: list[object] = []
 
     def peek(session: Session, context: UOWTransaction) -> None:
-        seen.append(session.info.get(FLUSH_CAPTURE_KEY))
+        seen.append(session.info.get(_FLUSH_CAPTURE_KEY))
 
     # Not installed, and installed with capture switched off.
     for session in (Session(engine), env.factory(info={"audit_enabled": False})):
@@ -421,7 +465,7 @@ def test_sessions_without_capture_keep_nothing(
             order.status = "X"
             order.placed_at = func.now()
             session.commit()
-            assert FLUSH_CAPTURE_KEY not in session.info
+            assert _FLUSH_CAPTURE_KEY not in session.info
             assert dict(inspect(order).info) == {}
 
     assert seen == [None, None]

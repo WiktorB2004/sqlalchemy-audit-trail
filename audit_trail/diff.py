@@ -57,7 +57,7 @@ ERASED = "[erased]"
 SNAPSHOT_INFO_KEY = "audit_trail.snapshot"
 """``InstanceState.info`` key holding the ``snapshot_on_load`` copies."""
 
-FLUSH_CAPTURE_KEY = "audit_trail.flush_capture"
+_FLUSH_CAPTURE_KEY = "audit_trail.flush_capture"
 """``Session.info`` key holding the values captured during the current flush.
 
 Set to a new ``{InstanceState: _Captured}`` dict by the installed
@@ -162,7 +162,7 @@ def _keys_for_flush(mapper: Mapper[Any]) -> _FlushKeys:
     return keys
 
 
-def capture_before_update(state: InstanceState[Any]) -> None:
+def _capture_before_update(state: InstanceState[Any]) -> None:
     """Keep the old values the UPDATE of ``state`` is about to lose.
 
     Called from the mapper's ``before_update`` event. Does nothing unless
@@ -173,7 +173,7 @@ def capture_before_update(state: InstanceState[Any]) -> None:
     """
     session = state.session
     capture: dict[InstanceState[Any], _Captured] | None = (
-        None if session is None else session.info.get(FLUSH_CAPTURE_KEY)
+        None if session is None else session.info.get(_FLUSH_CAPTURE_KEY)
     )
     if capture is None:
         return
@@ -197,7 +197,7 @@ def _captured(state: InstanceState[Any]) -> _Captured | None:
     if session is None:
         return None
     capture: dict[InstanceState[Any], _Captured] | None = session.info.get(
-        FLUSH_CAPTURE_KEY
+        _FLUSH_CAPTURE_KEY
     )
     return None if capture is None else capture.get(state)
 
@@ -421,8 +421,6 @@ def _add_captured(
         if spec is None or key in changes:
             continue
         new = current.get(key, _MISSING)
-        if _is_sql(new):
-            new = _MISSING
         if _same(spec, old, new):
             continue
         changes[key] = [render(old, spec), render(new, spec)]

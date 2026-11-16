@@ -30,8 +30,8 @@ Nothing is recorded until `AuditTrail.install()` has been called on the session 
 
 | Verb | `data["changes"]` |
 |---|---|
-| `entity.created` | every audited column as `[null, value]`, empty ones too |
-| `entity.updated` | only the columns whose value really changed, as `[old, new]` |
+| `entity.created` | every audited column as `[null, value]`, empty ones too; `"<unknown>"` for a value SQL wrote and did not fetch back |
+| `entity.updated` | the columns whose value really changed, as `[old, new]`, plus columns the UPDATE set by SQL (see below) |
 | `entity.deleted` | every audited column as `[value, null]` |
 
 An update that changes nothing (for example `Decimal("1.5")` to `Decimal("1.50")`, compared with the column type) writes no entry. One entry is written per object and flush; when you read the log, the rows of one object within one transaction are merged into its net change (see [querying](querying.md#compaction)).

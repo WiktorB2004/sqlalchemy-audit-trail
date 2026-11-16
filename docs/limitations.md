@@ -48,7 +48,7 @@ As a new value, `"<unknown>"` means the column was written, possibly with the va
 - `server_onupdate`, triggers and `Computed` are recorded only with `eager_defaults=True`. Otherwise the value is not in memory after the UPDATE, and the library cannot tell whether it changed.
 - A second flush of the same object in one transaction leaves such a column out unless `eager_defaults=True`: the first flush expired its value, so the old value is unknown.
 - An entry whose only changes are [relationship changes](#relationships) gets none of these columns.
-- A SQL expression assigned in your own `before_update` mapper listener is not seen, because the library's listener runs first. Assign it in a `before_flush` session listener instead.
+- A SQL expression assigned in your own `before_update` mapper listener is recorded only if that listener runs before the library's. Listeners run in registration order, so one added with `event.listen(Model, "before_update", fn)` after the model is defined runs after the library's and its expression is missed. Register it with `insert=True`, or assign the expression in a `before_flush` session listener, which is always recorded.
 
 ## Unloaded attributes under AsyncSession
 

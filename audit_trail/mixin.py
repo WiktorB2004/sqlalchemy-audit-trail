@@ -27,7 +27,7 @@ from audit_trail.config import AuditOptions
 from audit_trail.diff import (
     SNAPSHOT_INFO_KEY,
     _audited_columns,
-    capture_before_update,
+    _capture_before_update,
     options_of,
 )
 
@@ -105,7 +105,7 @@ def _on_refresh(
 def _before_update(
     mapper: Mapper[Any], connection: Connection, target: Audited
 ) -> None:
-    capture_before_update(instance_state(target))
+    _capture_before_update(instance_state(target))
 
 
 def _keep_old_value(

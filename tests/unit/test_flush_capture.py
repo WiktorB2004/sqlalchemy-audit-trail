@@ -16,7 +16,7 @@ from sqlalchemy import Engine, create_engine, event, func, literal_column
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from audit_trail.diff import (
-    FLUSH_CAPTURE_KEY,
+    _FLUSH_CAPTURE_KEY,
     UNKNOWN,
     Changes,
     _is_sql,
@@ -65,7 +65,7 @@ def capturing(session: Session) -> list[Changes]:
     seen: list[Changes] = []
 
     def before_flush(session: Session, context: object, instances: object) -> None:
-        session.info[FLUSH_CAPTURE_KEY] = {}
+        session.info[_FLUSH_CAPTURE_KEY] = {}
 
     def after_flush(session: Session, context: object) -> None:
         for obj in session.dirty:
@@ -74,7 +74,7 @@ def capturing(session: Session) -> list[Changes]:
                 seen.append(changes)
 
     def after_flush_postexec(session: Session, context: object) -> None:
-        session.info.pop(FLUSH_CAPTURE_KEY, None)
+        session.info.pop(_FLUSH_CAPTURE_KEY, None)
 
     event.listen(session, "before_flush", before_flush)
     event.listen(session, "after_flush", after_flush)

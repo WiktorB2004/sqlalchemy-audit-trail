@@ -60,7 +60,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from audit_trail._compaction import FieldChange
 from audit_trail.context import AuditContext, ContextSnapshot, resolve_context
 from audit_trail.diff import (
-    FLUSH_CAPTURE_KEY,
+    _FLUSH_CAPTURE_KEY,
     USE_CONTEXT,
     ChangeKind,
     entity_changes,
@@ -628,13 +628,13 @@ def _before_flush(
     # and read by entity_changes in after_flush. Without it (another session
     # class, or capture switched off) before_update keeps nothing.
     if session.info.get(AUDIT_ENABLED_KEY) is False:
-        session.info.pop(FLUSH_CAPTURE_KEY, None)
+        session.info.pop(_FLUSH_CAPTURE_KEY, None)
     else:
-        session.info[FLUSH_CAPTURE_KEY] = {}
+        session.info[_FLUSH_CAPTURE_KEY] = {}
 
 
 def _after_flush_postexec(session: Session, flush_context: UOWTransaction) -> None:
-    session.info.pop(FLUSH_CAPTURE_KEY, None)
+    session.info.pop(_FLUSH_CAPTURE_KEY, None)
 
 
 def _after_transaction_end(session: Session, transaction: SessionTransaction) -> None:
@@ -643,7 +643,9 @@ def _after_transaction_end(session: Session, transaction: SessionTransaction) ->
     # A released savepoint or a flush's subtransaction is not the end of the
     # database transaction: the rows live on in the enclosing one.
     # A failed flush never reaches after_flush_postexec: drop its capture.
-    session.info.pop(FLUSH_CAPTURE_KEY, None)
+    # A nested end is a host savepoint opened inside the flush: keep it.
+    if not transaction.nested:
+        session.info.pop(_FLUSH_CAPTURE_KEY, None)
     if transaction.parent is None:
         session.info.pop(_CACHE_KEY, None)
 
@@ -673,5 +675,4 @@ def _within(transaction: SessionTransaction, ancestor: SessionTransaction) -> bo
 def _after_rollback(session: Session) -> None:
     # Also fires for a savepoint rollback, so it must not drop the cached
     # transaction row (see the module docstring).
-    session.info.pop(FLUSH_CAPTURE_KEY, None)
     discard_relationship_changes(session)
