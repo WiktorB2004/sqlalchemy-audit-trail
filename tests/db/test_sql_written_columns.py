@@ -492,7 +492,23 @@ def test_second_flush_in_one_transaction(
         assert changes["modified_at"] == [encode_value(first), encode_value(second)]
     else:
         # The first flush expired modified_at, and nothing loaded it again.
-        assert "modified_at" not in changes
+        assert changes["modified_at"] == [UNKNOWN, UNKNOWN]
+
+
+def test_second_flush_child_only_change_keeps_parent_out(
+    env: Env, models: Models
+) -> None:
+    with env.factory() as session:
+        dog = models.Dog(name="Rex", breed="lab")
+        session.add(dog)
+        session.commit()
+        dog.name = "Max"
+        session.flush()  # parent row updated: modified_at expired (or fetched)
+        dog.breed = "pug"  # only the dog table is updated
+        session.flush()
+        session.commit()
+
+    assert updates(env, "Dog")[1] == {"breed": ["lab", "pug"]}
 
 
 def test_clause_element_object_is_an_expression(env: Env, models: Models) -> None:

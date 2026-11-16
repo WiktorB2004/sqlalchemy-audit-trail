@@ -300,8 +300,9 @@ def entity_changes(
       SQL expression (``obj.placed_at = func.now()``) is a change on its
       own. Columns the UPDATE sets without an assignment (``onupdate``,
       ``server_onupdate``, ``Computed``, the mapper's ``version_id_col``)
-      are added only next to another column change, and only when their old
-      value is in memory; server-side ones only when ``eager_defaults=True``
+      are added only next to another column change of their table; an old
+      value that is not in memory (a second flush in one transaction) is
+      ``"<unknown>"``. Server-side ones only when ``eager_defaults=True``
       fetched the new value back and it differs.
     - ``deleted``: every audited column as ``[value, None]``.
 
@@ -427,10 +428,15 @@ def _add_captured(
     if not changes:
         return
     server_side = _keys_for_flush(state.mapper).server_side
+    # Tables this UPDATE certainly wrote: those of the changed columns. With
+    # joined inheritance a child-only change leaves the parent table alone.
+    updated = {by_key[key].column.table for key in changes if key in by_key}
     for key, old in captured.derived.items():
         spec = by_key.get(key)
-        if spec is None or key in changes or old is _MISSING:
+        if spec is None or key in changes:
             continue
+        if old is _MISSING and spec.column.table not in updated:
+            continue  # unknown old value and maybe no write at all
         new = current.get(key, _MISSING)
         if new is _MISSING and key in server_side:
             continue  # not fetched back, and may well be unchanged

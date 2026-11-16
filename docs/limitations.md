@@ -46,7 +46,7 @@ As a new value, `"<unknown>"` means the column was written, possibly with the va
 
 - `eager_defaults="auto"`, SQLAlchemy's default, fetches values back on INSERT only, never on UPDATE. Use `eager_defaults=True` to get the new value of `onupdate=func.now()`; without it the entry holds `"<unknown>"`.
 - `server_onupdate`, triggers and `Computed` are recorded only with `eager_defaults=True`. Otherwise the value is not in memory after the UPDATE, and the library cannot tell whether it changed.
-- A second flush of the same object in one transaction leaves such a column out unless `eager_defaults=True`: the first flush expired its value, so the old value is unknown.
+- On a second flush of the same object in one transaction, the first flush expired such a column, so its old value is `"<unknown>"` unless `eager_defaults=True`. With `onupdate=func.now()` and no `eager_defaults=True` both values are `"<unknown>"`: the entry only says the column was written.
 - An entry whose only changes are [relationship changes](#relationships) gets none of these columns.
 - A SQL expression assigned in your own `before_update` mapper listener is recorded only if that listener runs before the library's. Listeners run in registration order, so one added with `event.listen(Model, "before_update", fn)` after the model is defined runs after the library's and its expression is missed. Register it with `insert=True`, or assign the expression in a `before_flush` session listener, which is always recorded.
 
