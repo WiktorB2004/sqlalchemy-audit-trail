@@ -34,7 +34,21 @@ Rows deleted by the database, through `ForeignKey(..., ondelete="CASCADE")` with
 `"<unknown>"` is a marker, not a value: it stands where the value was not in memory when the session flushed, and the library does not run extra SQL to fetch it. Besides JSON changed in place, it appears for:
 
 - a column filled by the database on INSERT (`server_default`, `Computed`, `Identity`) in an `entity.created` entry, **only** when the mapper sets `eager_defaults=False`. SQLAlchemy's default, `eager_defaults="auto"`, fetches these values with `RETURNING` on PostgreSQL, so the entry holds the real value;
-- a column that is not loaded when the object is deleted, such as a `deferred()` column, in an `entity.deleted` entry.
+- a column that is not loaded when the object is deleted, such as a `deferred()` column, in an `entity.deleted` entry;
+- the new value of a column assigned a SQL expression (`obj.placed_at = func.now()`), on INSERT and UPDATE, and of a client-side SQL default (`default=func.now()`) on INSERT with `eager_defaults=False`;
+- the new value of `onupdate=func.now()` unless the mapper sets `eager_defaults=True`.
+
+As a new value, `"<unknown>"` means the column was written, possibly with the value it already had.
+
+## Columns set by SQL
+
+`onupdate`, `server_onupdate`, `Computed` and the mapper's `version_id_col` are added to an `entity.updated` entry only when another column of the object changed too (see [timestamps](guides/models.md#timestamps-and-other-columns-set-by-sql)). Some cases are not recorded:
+
+- `eager_defaults="auto"`, SQLAlchemy's default, fetches values back on INSERT only, never on UPDATE. Use `eager_defaults=True` to get the new value of `onupdate=func.now()`; without it the entry holds `"<unknown>"`.
+- `server_onupdate`, triggers and `Computed` are recorded only with `eager_defaults=True`. Otherwise the value is not in memory after the UPDATE, and the library cannot tell whether it changed.
+- A second flush of the same object in one transaction leaves such a column out unless `eager_defaults=True`: the first flush expired its value, so the old value is unknown.
+- An entry whose only changes are [relationship changes](#relationships) gets none of these columns.
+- A SQL expression assigned in your own `before_update` mapper listener is not seen, because the library's listener runs first. Assign it in a `before_flush` session listener instead.
 
 ## Unloaded attributes under AsyncSession
 

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `entity.updated` and `entity.created` record columns written by SQL instead of dropping them or storing `null`. A column assigned a SQL expression (`obj.placed_at = func.now()`) is a change on its own and stores `[old, "<unknown>"]`. Next to another change, `onupdate`, the version counter and, with `eager_defaults=True`, `server_onupdate`/`Computed` are recorded too. On INSERT, a SQL default or expression that was not fetched back is `"<unknown>"`, not `null`. Stored entries gain these keys; exclude a timestamp with `info={"audit": "exclude"}` to keep it out
+
 ## 0.2.0 - 2026-09-27
 
 - Repository: a reproducible benchmark (`benchmark/`) and an example multi-tenant FastAPI application (`examples/fastapi_app/`), neither part of the package

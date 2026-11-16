@@ -121,6 +121,18 @@ A JSON column changed in place (`obj.settings["theme"] = "dark"`) is a special c
 
 Assigning a new object (`obj.settings = {**obj.settings, "theme": "dark"}`) always records both values.
 
+### Timestamps and other columns set by SQL
+
+A column the UPDATE sets on its own goes into an `entity.updated` entry only next to another change of the same object. That covers `onupdate`, `server_onupdate`, `Computed` and the mapper's `version_id_col`. A change of only such columns, or of only excluded columns, writes no entry.
+
+- `onupdate=func.now()` is a SQL expression. SQLAlchemy does not fetch the new value back unless the mapper sets `eager_defaults=True`; the default `"auto"` fetches on INSERT only. Without it the entry stores `[old, "<unknown>"]`.
+- `onupdate=datetime.now` (a Python callable) and the version counter are in memory, so the entry stores `[old, new]`.
+- `server_onupdate`, triggers and `Computed` are recorded only with `eager_defaults=True`, and only when the value changed.
+
+For real `updated_at` values in the log, use `eager_defaults=True` or a Python callable. To keep a timestamp out of the log, give it `info={"audit": "exclude"}`; that also leaves it out of `entity.created`.
+
+Assigning a SQL expression yourself (`order.placed_at = func.now()`) is a change on its own: the entry stores `[old, "<unknown>"]`, since the new value is never fetched back. See [limitations](../limitations.md#columns-set-by-sql).
+
 ## Object ids
 
 `object_id` is a string: `str(pk)` for a single-column key (a UUID in lowercase canonical form), and a compact JSON array of strings for a composite key, e.g. `["a","1"]`. To query by id, format it with the same functions the library uses:

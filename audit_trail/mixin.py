@@ -7,7 +7,11 @@ Mixing ``Audited`` into a mapped class, when its mappers are configured:
   expired attribute loads its old value at assignment time rather than
   leaving the old value unknown at flush time;
 - deep-copies the ``snapshot_on_load`` columns whenever the instance is
-  loaded or refreshed, so an in-place change still has an old value.
+  loaded or refreshed, so an in-place change still has an old value;
+- in a flush of an installed session, keeps the old values of columns the
+  UPDATE writes without attribute history (assigned SQL expressions,
+  ``onupdate``, ``server_onupdate``, the version counter) for
+  ``entity_changes``.
 """
 
 from __future__ import annotations
@@ -20,9 +24,15 @@ from sqlalchemy import event
 from sqlalchemy.orm.attributes import instance_state
 
 from audit_trail.config import AuditOptions
-from audit_trail.diff import SNAPSHOT_INFO_KEY, _audited_columns, options_of
+from audit_trail.diff import (
+    SNAPSHOT_INFO_KEY,
+    _audited_columns,
+    capture_before_update,
+    options_of,
+)
 
 if TYPE_CHECKING:
+    from sqlalchemy import Connection
     from sqlalchemy.orm import AttributeEventToken, InstanceState, Mapper, QueryContext
 
 
@@ -92,6 +102,12 @@ def _on_refresh(
     _take_snapshot(instance_state(target), attrs)
 
 
+def _before_update(
+    mapper: Mapper[Any], connection: Connection, target: Audited
+) -> None:
+    capture_before_update(instance_state(target))
+
+
 def _keep_old_value(
     target: object, value: object, oldvalue: object, initiator: AttributeEventToken
 ) -> None:
@@ -116,3 +132,4 @@ def _on_mapper_configured(mapper: Mapper[_A], cls: type[_A]) -> None:
 event.listen(Audited, "mapper_configured", _on_mapper_configured, propagate=True)
 event.listen(Audited, "load", _on_load, propagate=True)
 event.listen(Audited, "refresh", _on_refresh, propagate=True)
+event.listen(Audited, "before_update", _before_update, propagate=True)

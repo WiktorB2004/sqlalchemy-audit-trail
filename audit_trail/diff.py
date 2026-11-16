@@ -15,6 +15,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import weakref
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -24,6 +25,7 @@ from sqlalchemy import Column, inspect
 from sqlalchemy.orm import ColumnProperty
 from sqlalchemy.orm.attributes import instance_state
 from sqlalchemy.orm.base import NO_VALUE
+from sqlalchemy.sql import ClauseElement
 
 from audit_trail._typing import assert_never
 from audit_trail.config import AuditOptions, Target
@@ -54,6 +56,14 @@ ERASED = "[erased]"
 
 SNAPSHOT_INFO_KEY = "audit_trail.snapshot"
 """``InstanceState.info`` key holding the ``snapshot_on_load`` copies."""
+
+FLUSH_CAPTURE_KEY = "audit_trail.flush_capture"
+"""``Session.info`` key holding the values captured during the current flush.
+
+Set to a new ``{InstanceState: _Captured}`` dict by the installed
+``before_flush`` listener and removed after the flush, so it only exists
+while a flush of an installed session runs.
+"""
 
 _POLICIES: dict[str, FieldPolicy] = {
     "exclude": "exclude",
@@ -93,6 +103,103 @@ class _AuditedColumn:
     key: str
     column: Column[Any]
     policy: _ValuePolicy | None
+
+
+@dataclass(frozen=True, slots=True)
+class _Captured:
+    """Old values of one row, taken in ``before_update``.
+
+    Attributes:
+        expr: Old values of audited columns assigned a SQL expression.
+        derived: Old values of audited columns the UPDATE may set without an
+            assignment (``onupdate``, ``server_onupdate``, ``Computed``, the
+            version counter), for those not assigned.
+    """
+
+    expr: dict[str, object]
+    derived: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _FlushKeys:
+    audited: tuple[str, ...]
+    derived: tuple[str, ...]
+    server_side: frozenset[str]
+
+
+_flush_keys: weakref.WeakKeyDictionary[Mapper[Any], _FlushKeys] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _is_sql(value: object) -> bool:
+    # The test the flush uses to send a value as SQL rather than a parameter.
+    return isinstance(value, ClauseElement) or hasattr(value, "__clause_element__")
+
+
+def _keys_for_flush(mapper: Mapper[Any]) -> _FlushKeys:
+    keys = _flush_keys.get(mapper)
+    if keys is not None:
+        return keys
+    version = mapper.version_id_col
+    derived: list[str] = []
+    server_side: set[str] = set()
+    columns = _audited_columns(mapper)
+    for spec in columns:
+        column = spec.column
+        is_version = version is not None and column is version
+        if column.server_onupdate is not None or (
+            is_version and mapper.version_id_generator is False
+        ):
+            server_side.add(spec.key)
+        elif not (column.onupdate is not None or is_version):
+            continue
+        derived.append(spec.key)
+    keys = _FlushKeys(
+        tuple(spec.key for spec in columns), tuple(derived), frozenset(server_side)
+    )
+    _flush_keys[mapper] = keys
+    return keys
+
+
+def capture_before_update(state: InstanceState[Any]) -> None:
+    """Keep the old values the UPDATE of ``state`` is about to lose.
+
+    Called from the mapper's ``before_update`` event. Does nothing unless
+    the state's session is in a flush of an installed session.
+
+    Args:
+        state: The state of an ``Audited`` instance about to be updated.
+    """
+    session = state.session
+    capture: dict[InstanceState[Any], _Captured] | None = (
+        None if session is None else session.info.get(FLUSH_CAPTURE_KEY)
+    )
+    if capture is None:
+        return
+    keys = _keys_for_flush(state.mapper)
+    committed = state.committed_state
+    current = state.dict
+    expr = {
+        key: _MISSING if committed[key] is NO_VALUE else committed[key]
+        for key in keys.audited
+        if key in committed and _is_sql(current.get(key))
+    }
+    derived = {
+        key: current.get(key, _MISSING) for key in keys.derived if key not in committed
+    }
+    if expr or derived:
+        capture[state] = _Captured(expr, derived)
+
+
+def _captured(state: InstanceState[Any]) -> _Captured | None:
+    session = state.session
+    if session is None:
+        return None
+    capture: dict[InstanceState[Any], _Captured] | None = session.info.get(
+        FLUSH_CAPTURE_KEY
+    )
+    return None if capture is None else capture.get(state)
 
 
 def options_of(model: type[Any]) -> AuditOptions:
@@ -189,7 +296,13 @@ def entity_changes(
     - ``updated``: only columns with a net change. Old and new raw values are
       compared with ``column.type.compare_values`` before any redaction or
       encoding, so ``Decimal("1.5")`` vs ``Decimal("1.50")`` is no change.
-      An empty result means there is nothing to record.
+      An empty result means there is nothing to record. A column assigned a
+      SQL expression (``obj.placed_at = func.now()``) is a change on its
+      own. Columns the UPDATE sets without an assignment (``onupdate``,
+      ``server_onupdate``, ``Computed``, the mapper's ``version_id_col``)
+      are added only next to another column change, and only when their old
+      value is in memory; server-side ones only when ``eager_defaults=True``
+      fetched the new value back and it differs.
     - ``deleted``: every audited column as ``[value, None]``.
 
     ``exclude`` columns are left out. ``redact`` stores ``"***"`` and
@@ -197,15 +310,27 @@ def entity_changes(
     goes through ``encode_value``.
 
     ``"<unknown>"`` is a marker, not a value: it stands where the value is not
-    in memory. That is the old value of a JSON column changed in place
-    (``MutableDict``) without ``snapshot_on_load``, a ``deleted`` column that
-    is not loaded (for example ``deferred``), and a ``created`` column filled
-    by a server-side default (``server_default``, ``Computed``, ``Identity``)
-    that was not fetched back. On PostgreSQL the mapper's default
-    ``eager_defaults="auto"`` fetches them with ``RETURNING`` on INSERT, so
-    ``created`` entries hold the real values; only a mapper with
-    ``eager_defaults=False`` leaves them ``"<unknown>"``. A ``created`` column
-    that was not set and has no server-side default is ``None``, as stored.
+    in memory. A new value of ``"<unknown>"`` means the column was written,
+    possibly with its old value. The marker appears for:
+
+    - the old value of a JSON column changed in place (``MutableDict``)
+      without ``snapshot_on_load``;
+    - a ``deleted`` column that is not loaded (for example ``deferred``);
+    - a ``created`` column filled by a server-side default
+      (``server_default``, ``Computed``, ``Identity``) that was not fetched
+      back. On PostgreSQL the mapper's default ``eager_defaults="auto"``
+      fetches them with ``RETURNING`` on INSERT, so ``created`` entries hold
+      the real values; only a mapper with ``eager_defaults=False`` leaves
+      them ``"<unknown>"``. The same goes for a client-side SQL default
+      (``default=func.now()``);
+    - the new value of a column assigned a SQL expression, in ``created`` and
+      ``updated``: SQLAlchemy does not fetch it back, whatever
+      ``eager_defaults`` says;
+    - the new value of a client-side SQL ``onupdate`` (``onupdate=func.now()``)
+      unless ``eager_defaults=True``; ``"auto"`` fetches nothing on UPDATE.
+
+    A ``created`` column that was not set and has no server-side or SQL
+    default is ``None``, as stored.
 
     Args:
         obj: A mapped instance.
@@ -242,8 +367,14 @@ def entity_changes(
         case "created":
             for spec in columns:
                 new = state.dict.get(spec.key, _MISSING)
-                if new is _MISSING and spec.column.server_default is None:
-                    # Identity and Computed also live in server_default.
+                if (
+                    new is _MISSING
+                    and spec.column.server_default is None
+                    and spec.key not in state.expired_attributes
+                ):
+                    # Identity and Computed also live in server_default. An
+                    # expired column was written by SQL (a client-side SQL
+                    # default or an assigned expression) and not fetched.
                     new = None
                 changes[spec.key] = [None, render(new, spec)]
         case "deleted":
@@ -266,9 +397,56 @@ def entity_changes(
                 if old is not _MISSING and spec.column.type.compare_values(old, new):
                     continue
                 changes[spec.key] = [render(old, spec), render(new, spec)]
+            captured = _captured(state)
+            if captured is not None:
+                _add_captured(state, columns, captured, changes, render)
         case _:
             assert_never(kind)
     return changes
+
+
+def _add_captured(
+    state: InstanceState[Any],
+    columns: Sequence[_AuditedColumn],
+    captured: _Captured,
+    changes: Changes,
+    render: Callable[[object, _AuditedColumn], JSONValue],
+) -> None:
+    # Columns the UPDATE wrote without leaving attribute history: assigned
+    # SQL expressions, then (only next to a real change) derived columns.
+    by_key = {spec.key: spec for spec in columns}
+    current = state.dict
+    for key, old in captured.expr.items():
+        spec = by_key.get(key)
+        if spec is None or key in changes:
+            continue
+        new = current.get(key, _MISSING)
+        if _is_sql(new):
+            new = _MISSING
+        if _same(spec, old, new):
+            continue
+        changes[key] = [render(old, spec), render(new, spec)]
+    if not changes:
+        return
+    server_side = _keys_for_flush(state.mapper).server_side
+    for key, old in captured.derived.items():
+        spec = by_key.get(key)
+        if spec is None or key in changes or old is _MISSING:
+            continue
+        new = current.get(key, _MISSING)
+        if new is _MISSING and key in server_side:
+            continue  # not fetched back, and may well be unchanged
+        if _same(spec, old, new):
+            continue
+        changes[key] = [render(old, spec), render(new, spec)]
+
+
+def _same(spec: _AuditedColumn, old: object, new: object) -> bool:
+    return (
+        old is not _MISSING
+        and new is not _MISSING
+        and bool(spec.column.type.compare_values(old, new))
+    )
 
 
 def _render(
