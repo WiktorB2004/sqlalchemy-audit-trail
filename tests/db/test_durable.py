@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -239,10 +239,10 @@ def test_missing_month_partition_is_created_and_retried(
     engine: Engine, schema: str, make: EnvMaker, verb: DurableEvent
 ) -> None:
     env = make(partitions=[], auto_create_partitions=True)
-    past = datetime(2020, 1, 15, tzinfo=timezone.utc)
+    past = datetime(2020, 1, 15, tzinfo=UTC)
     with engine.begin() as conn:  # every severity, but only January 2020
         ensure_partitions(conn, env.trail.tables, Severity, months_ahead=0, now=past)
-    this_month = datetime.now(timezone.utc).strftime("p%Y_%m")
+    this_month = datetime.now(UTC).strftime("p%Y_%m")
     assert f"audit_transaction_{this_month}" not in partitions(engine, schema)
 
     with env.factory() as session:

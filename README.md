@@ -3,7 +3,7 @@
 Audit trail for **SQLAlchemy on PostgreSQL**: automatic entity change diffs and explicit domain events in one chronological, partitioned log, with who, where and how on every entry. Not a version-table library like sqlalchemy-continuum.
 
 [![PyPI](https://img.shields.io/pypi/v/sqlalchemy-audit-trail)](https://pypi.org/project/sqlalchemy-audit-trail/)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://pypi.org/project/sqlalchemy-audit-trail/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://pypi.org/project/sqlalchemy-audit-trail/)
 [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://wiktorb2004.github.io/sqlalchemy-audit-trail/)
 [![CI](https://img.shields.io/github/actions/workflow/status/WiktorB2004/sqlalchemy-audit-trail/ci.yml?branch=main&label=CI)](https://github.com/WiktorB2004/sqlalchemy-audit-trail/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/WiktorB2004/sqlalchemy-audit-trail)](LICENSE)
@@ -19,7 +19,7 @@ pip install "sqlalchemy-audit-trail[asyncpg]"   # AsyncSession on asyncpg
                                                 # more extras: asyncio, pydantic (payload schemas), fastapi
 ```
 
-Requires Python 3.10+, SQLAlchemy 2.0 or 2.1, and PostgreSQL 14+.
+Requires Python 3.11+, SQLAlchemy 2.0 or 2.1, and PostgreSQL 14+.
 
 ## Quickstart
 
@@ -150,7 +150,7 @@ AUDIT_TEST_PG_IMAGE=postgres:14 uv run pytest     # oldest supported PostgreSQL
 uv run ruff check . && uv run mypy
 ```
 
-To use a server you already have, set `AUDIT_TEST_DATABASE_URL`. CI runs PostgreSQL 14, 16, 17 and 18, SQLAlchemy 2.0 and 2.1, and Python 3.10 to 3.13.
+To use a server you already have, set `AUDIT_TEST_DATABASE_URL`. CI runs PostgreSQL 14, 16, 17 and 18, SQLAlchemy 2.0 and 2.1, and Python 3.11 to 3.13.
 
 ## Docs
 

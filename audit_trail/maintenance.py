@@ -54,7 +54,7 @@ import logging
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypeVar
 
 from sqlalchemy import Connection, Engine, Table, bindparam, text
@@ -770,7 +770,7 @@ def _oid(conn: Connection, qualified: str) -> int:
 
 
 def _months(now: datetime, months_ahead: int) -> list[date]:
-    utc = now.astimezone(timezone.utc)
+    utc = now.astimezone(UTC)
     index = utc.year * 12 + utc.month - 1
     return [
         date(i // 12, i % 12 + 1, 1) for i in range(index, index + months_ahead + 1)

@@ -14,4 +14,4 @@ Extras:
 | `pydantic` | payload schemas for domain events |
 | `fastapi` | FastAPI middleware and dependencies |
 
-Requires Python 3.10+, SQLAlchemy 2.0+ and PostgreSQL 14+.
+Requires Python 3.11+, SQLAlchemy 2.0+ and PostgreSQL 14+.

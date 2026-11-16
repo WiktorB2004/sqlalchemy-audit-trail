@@ -4,7 +4,7 @@ summaries, and ``LabelResolver``."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
 from uuid import UUID
 
@@ -177,7 +177,7 @@ def deleted(label: str) -> Entry:
 # Rows with fixed times, in partitions the helper creates: February and
 # March 2026. BASE is one second into March.
 
-BASE = datetime(2026, 3, 1, 0, 0, 1, tzinfo=timezone.utc)
+BASE = datetime(2026, 3, 1, 0, 0, 1, tzinfo=UTC)
 
 
 class Row(NamedTuple):
@@ -204,7 +204,7 @@ def insert_rows(env: Env, rows: list[Row]) -> dict[int, str]:
             tables,
             list(Sev),
             months_ahead=1,
-            now=datetime(2026, 2, 15, tzinfo=timezone.utc),
+            now=datetime(2026, 2, 15, tzinfo=UTC),
         )
         for row in rows:
             at = BASE - timedelta(seconds=row.at)

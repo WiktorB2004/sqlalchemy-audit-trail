@@ -42,7 +42,7 @@ whatever the session or server time zone.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 from sqlalchemy import Connection
 from sqlalchemy.dialects.postgresql.base import PGDialect
@@ -103,11 +103,11 @@ def month_bounds(month: date) -> tuple[datetime, datetime]:
     Returns:
         The first instant of the month and of the next one, both in UTC.
     """
-    start = datetime(month.year, month.month, 1, tzinfo=timezone.utc)
+    start = datetime(month.year, month.month, 1, tzinfo=UTC)
     if month.month == 12:
-        end = datetime(month.year + 1, 1, 1, tzinfo=timezone.utc)
+        end = datetime(month.year + 1, 1, 1, tzinfo=UTC)
     else:
-        end = datetime(month.year, month.month + 1, 1, tzinfo=timezone.utc)
+        end = datetime(month.year, month.month + 1, 1, tzinfo=UTC)
     return start, end
 
 
@@ -306,4 +306,4 @@ def _script(statements: list[str]) -> str:
 
 def _timestamptz(value: datetime) -> str:
     # Explicit +00 offset: the literal means the same instant in any TimeZone.
-    return f"'{value.astimezone(timezone.utc):%Y-%m-%d %H:%M:%S}+00'"
+    return f"'{value.astimezone(UTC):%Y-%m-%d %H:%M:%S}+00'"

@@ -8,8 +8,9 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
+    from typing import Self
+
     from pydantic import BaseModel
-    from typing_extensions import Self
 
     from audit_trail.config import AuditOptions
 

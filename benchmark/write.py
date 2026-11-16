@@ -26,13 +26,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Literal, NamedTuple, TypedDict, cast
+from typing import Literal, NamedTuple, TypedDict, assert_never, cast
 
 from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from audit_trail import Audited, AuditEvent, AuditTrail
-from audit_trail._typing import assert_never
 from audit_trail.listener import AUDIT_ENABLED_KEY, installed_trail
 from audit_trail.maintenance import ensure_partitions
 from audit_trail.migrations import create_audit_tables

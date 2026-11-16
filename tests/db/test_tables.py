@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import IntEnum
 
 import pytest
@@ -33,7 +33,7 @@ class Sev(IntEnum):
     CRITICAL = 40
 
 
-SEPT = datetime(2026, 9, 10, 12, tzinfo=timezone.utc)
+SEPT = datetime(2026, 9, 10, 12, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -180,7 +180,7 @@ def test_insert_without_partition_fails_with_23514(
 ) -> None:
     with engine.begin() as conn:
         ensure_partitions(conn, tables, Sev, now=SEPT)
-    at, severity = (datetime(2030, 1, 1, tzinfo=timezone.utc), 10)
+    at, severity = (datetime(2030, 1, 1, tzinfo=UTC), 10)
     if missing == "severity":
         at, severity = SEPT, 99
 

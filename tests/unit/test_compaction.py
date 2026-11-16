@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TypeAlias
 from uuid import UUID
 
@@ -18,7 +18,7 @@ UPDATED = "entity.updated"
 DELETED = "entity.deleted"
 CUSTOM = "shop.order_placed"
 
-CREATED_AT = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+CREATED_AT = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
 CORRELATION = UUID("00000000-0000-0000-0000-000000000001")
 
 

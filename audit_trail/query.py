@@ -34,9 +34,9 @@ import binascii
 import heapq
 from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, TypedDict
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, TypedDict, assert_never
 from uuid import UUID
 
 from sqlalchemy import (
@@ -58,7 +58,6 @@ from sqlalchemy import (
 from sqlalchemy.exc import NoReferenceError
 
 from audit_trail._compaction import ActivityData, ActivityRow, FieldChange, compact_rows
-from audit_trail._typing import assert_never
 from audit_trail.checks import _registry_of
 from audit_trail.diff import REDACTED, UNKNOWN, field_policy, options_of
 from audit_trail.serialization import JSONValue
@@ -1047,7 +1046,7 @@ class AuditQuery:
             case None:
                 if window is None:
                     return ALL_HISTORY
-                return (datetime.now(timezone.utc) if until is None else until) - window
+                return (datetime.now(UTC) if until is None else until) - window
             case _:
                 assert_never(since)
 

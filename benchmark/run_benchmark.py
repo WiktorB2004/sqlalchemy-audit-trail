@@ -21,7 +21,7 @@ import time
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict
 
@@ -276,7 +276,7 @@ def run(args: argparse.Namespace) -> tuple[Report, Path]:
 
     report = Report(
         schema_version=SCHEMA_VERSION,
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=datetime.now(UTC).isoformat(),
         duration_s=time.perf_counter() - started,
         config=_config(args),
         environment=env,
@@ -285,7 +285,7 @@ def run(args: argparse.Namespace) -> tuple[Report, Path]:
         read=read_result,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     path = args.output_dir / f"run_{stamp}_{run_id}.json"
     path.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
     if not args.quiet:

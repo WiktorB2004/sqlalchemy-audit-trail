@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -488,7 +488,7 @@ ROWS = [
 
 # Fixed times in partitions the fixture creates, across a month boundary:
 # F and G fall in February, the rest in March.
-BASE = datetime(2026, 3, 1, 0, 0, 1, tzinfo=timezone.utc)
+BASE = datetime(2026, 3, 1, 0, 0, 1, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -504,7 +504,7 @@ def collisions(env: Env) -> tuple[Env, dict[int, str]]:
             tables,
             list(Sev),
             months_ahead=1,
-            now=datetime(2026, 2, 15, tzinfo=timezone.utc),
+            now=datetime(2026, 2, 15, tzinfo=UTC),
         )
         for row in ROWS:
             at = base - timedelta(seconds=row.at)

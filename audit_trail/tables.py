@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, Literal, assert_never, get_args
 
 from sqlalchemy import (
     BigInteger,
@@ -36,8 +36,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 from sqlalchemy.exc import UnboundExecutionError
-
-from audit_trail._typing import assert_never
 
 if TYPE_CHECKING:
     from sqlalchemy import Connection
