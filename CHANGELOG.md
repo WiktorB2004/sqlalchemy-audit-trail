@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-11-17
+
 - Python 3.10 is no longer supported; it reached end of life in October 2026. The package now requires Python 3.11+.
 - `entity.updated` and `entity.created` record columns written by SQL instead of dropping them or storing `null`. A column assigned a SQL expression (`obj.placed_at = func.now()`) is a change on its own and stores `[old, "<unknown>"]`. Next to another change, `onupdate`, the version counter and, with `eager_defaults=True`, `server_onupdate`/`Computed` are recorded too. On INSERT, a SQL default or expression that was not fetched back is `"<unknown>"`, not `null`. Stored entries gain these keys; exclude a timestamp with `info={"audit": "exclude"}` to keep it out. Tests that compare `data["changes"]` exactly, expect `null` for such columns, or call `assert_not_audited` after a flush that only assigns a SQL expression need updating; `assert_audited(changes=...)` matches a subset and still passes.
 
