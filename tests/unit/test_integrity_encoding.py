@@ -91,6 +91,30 @@ def test_numbers_are_never_rounded() -> None:
     assert len(canonical(5e-324)) == 326
 
 
+def test_decimal_digit_limit() -> None:
+    assert canonical(Decimal(f"1E+{MAX_INT_DIGITS - 1}")) == canonical(
+        10 ** (MAX_INT_DIGITS - 1)
+    )
+    # "0." and the fraction: 1 + (MAX_INT_DIGITS - 1) digits.
+    assert len(canonical(Decimal(f"1E-{MAX_INT_DIGITS - 1}"))) == MAX_INT_DIGITS + 1
+    # Trailing fraction zeros are not written, so they do not count.
+    assert canonical(Decimal("1." + "0" * MAX_INT_DIGITS)) == b"1"
+    for text in (f"1E+{MAX_INT_DIGITS}", f"-1E-{MAX_INT_DIGITS}", "1E+999999999"):
+        with pytest.raises(CanonicalEncodingError, match="4300 digits"):
+            canonical(Decimal(text))
+    assert canonical(Decimal("0E+999999999")) == canonical(Decimal("-0E-9")) == b"0"
+
+
+def test_deep_nesting_is_refused() -> None:
+    value: list[object] = []
+    for _ in range(sys.getrecursionlimit() * 2):
+        value = [value]
+    with pytest.raises(CanonicalEncodingError, match="nested"):
+        canonical(value)
+    with pytest.raises(CanonicalEncodingError, match="nested"):
+        canonical({"a": value})
+
+
 def test_readers_types_give_the_same_text() -> None:
     # JSONB may hand back an int, a float or a Decimal for the same number.
     assert canonical(1e16) == canonical(10**16) == canonical(Decimal("1E+16"))

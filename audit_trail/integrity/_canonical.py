@@ -14,7 +14,8 @@ written differently.
   trailing fraction zeros or a trailing dot, and ``-0`` is ``0``: ``1e16``
   is ``10000000000000000``, ``1.50`` is ``1.5``. JSONB reads ``-0.0`` back as
   ``0`` and an integral float of 1e16 or more as an int, and both give the
-  same text. Ints over ``MAX_INT_DIGITS`` digits are refused.
+  same text. A number written with more than ``MAX_INT_DIGITS`` digits is
+  refused, and so is a value nested deeper than Python's recursion limit.
 - An object's keys are sorted by their UTF-16 code units, as in JCS.
 - No whitespace anywhere; the result is UTF-8.
 
@@ -30,7 +31,7 @@ from collections.abc import Mapping, Sequence
 from decimal import Decimal
 
 MAX_INT_DIGITS = 4300
-"""Most digits of an int that is encoded, Python's default ``str()`` limit."""
+"""Most digits of an encoded int or ``Decimal``, Python's default ``str()`` limit."""
 
 
 class CanonicalEncodingError(ValueError):
@@ -53,11 +54,17 @@ def canonical(value: object) -> bytes:
 
     Raises:
         CanonicalEncodingError: The value or a nested one has another type, is
-            a non-finite number, an int of more than ``MAX_INT_DIGITS``
-            digits, or a string holding ``\\u0000`` or a lone surrogate.
+            a non-finite number, a number of more than ``MAX_INT_DIGITS``
+            digits, a string holding ``\\u0000`` or a lone surrogate, or is
+            nested deeper than the recursion limit.
     """
     parts: list[str] = []
-    _encode(value, parts)
+    try:
+        _encode(value, parts)
+    except RecursionError:
+        raise CanonicalEncodingError(
+            "cannot encode a value nested this deeply"
+        ) from None
     return "".join(parts).encode()
 
 
@@ -104,6 +111,28 @@ def _int(value: int) -> str:
 
 
 def _decimal(value: Decimal) -> str:
+    if value.is_zero():
+        return "0"
+    # Count the digits of the text before writing it: Decimal("1E+999999999")
+    # is small, its text is not.
+    _sign, digits, exponent = value.as_tuple()
+    assert isinstance(exponent, int)  # the callers pass finite values only
+    length = len(digits)
+    if exponent < 0:
+        # Trailing zeros of the fraction are not written.
+        kept = length
+        while kept > 1 and digits[kept - 1] == 0 and length - kept < -exponent:
+            kept -= 1
+        exponent += length - kept
+        length = kept
+    if exponent >= 0:
+        written = length + exponent
+    else:
+        written = max(length + exponent, 1) - exponent
+    if written > MAX_INT_DIGITS:
+        raise CanonicalEncodingError(
+            f"cannot encode a Decimal of more than {MAX_INT_DIGITS} digits"
+        )
     # format(..., "f") writes every digit and never rounds; normalize() would
     # round to the 28-digit context.
     text = format(value, "f")
