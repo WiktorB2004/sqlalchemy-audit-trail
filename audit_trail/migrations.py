@@ -41,14 +41,21 @@ whatever the session or server time zone.
 
 from __future__ import annotations
 
+import logging
+import random
+import time
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
 
-from sqlalchemy import Connection
+from sqlalchemy import Connection, text
 from sqlalchemy.dialects.postgresql.base import PGDialect
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.schema import CreateIndex, CreateTable
 
+from audit_trail.integrity import _schema as integrity_schema
 from audit_trail.tables import AuditTables
+
+logger = logging.getLogger(__name__)
 
 # With the "named" paramstyle a "%" in a name is not doubled.
 _DIALECT = PGDialect(paramstyle="named")  # type: ignore[no-untyped-call]
@@ -281,6 +288,129 @@ def drop_audit_tables(connection: Connection, tables: AuditTables) -> None:
     """
     for statement in drop_statements(tables):
         _execute_ddl(connection, statement)
+
+
+def add_integrity_statements(tables: AuditTables) -> list[str]:
+    """DDL adding the integrity columns and indexes to existing audit tables.
+
+    On both parents (PostgreSQL adds the columns and indexes to every
+    partition): ``xid`` and the ``seal_*`` columns in one ``ALTER``, the
+    ``xid`` default in a second one, then the ``(xid, id)`` index. The default
+    must be a statement of its own: ``pg_current_xact_id()`` is ``STABLE``,
+    so ``ADD COLUMN ... DEFAULT pg_current_xact_id()`` would stamp every
+    existing row with the migration's own ``xid``. Existing rows keep
+    ``xid`` ``NULL``, and the column stays nullable. Every statement is
+    idempotent.
+
+    Args:
+        tables: The audit tables.
+
+    Returns:
+        The statements, in order, without trailing semicolons.
+    """
+    statements: list[str] = []
+    for table in (tables.transaction, tables.activity):
+        name = qualified_name(table.schema, table.name)
+        added = ", ".join(
+            [
+                f"ADD COLUMN IF NOT EXISTS {integrity_schema.XID} xid8",
+                *(
+                    f"ADD COLUMN IF NOT EXISTS {column} jsonb"
+                    for column in integrity_schema.SEAL_COLUMNS
+                ),
+            ]
+        )
+        statements.append(f"ALTER TABLE {name} {added}")
+        statements.append(
+            f"ALTER TABLE {name} ALTER COLUMN {integrity_schema.XID} "
+            f"SET DEFAULT {integrity_schema.XID_DEFAULT}"
+        )
+    for table in (tables.transaction, tables.activity):
+        index = _PREPARER.quote(integrity_schema.xid_index_name(table.name))
+        statements.append(
+            f"CREATE INDEX IF NOT EXISTS {index} ON "
+            f"{qualified_name(table.schema, table.name)} "
+            f"({integrity_schema.XID}, id)"
+        )
+    return statements
+
+
+def add_integrity(
+    connection: Connection,
+    tables: AuditTables,
+    *,
+    lock_timeout: str = "2s",
+    attempts: int = 5,
+) -> None:
+    """Add the integrity columns and indexes to existing audit tables.
+
+    Executes ``add_integrity_statements`` in a savepoint of the connection's
+    current transaction; the caller commits. The ``ALTER`` statements take
+    an ``ACCESS EXCLUSIVE`` lock on each parent and its partitions, without
+    rewriting them. While one waits for that lock, new audit writes queue
+    behind it, so the wait is capped by ``lock_timeout``; on a timeout
+    (SQLSTATE ``55P03``) the savepoint is rolled back, which changes nothing,
+    and the statements are retried after a random pause. Running it again
+    later is safe.
+
+    Args:
+        connection: Connection with DDL privileges, not in ``AUTOCOMMIT``.
+        tables: The audit tables.
+        lock_timeout: PostgreSQL ``lock_timeout`` of each attempt.
+        attempts: Attempts before giving up, at least 1.
+
+    Raises:
+        ValueError: ``attempts`` is below 1, or the connection is in
+            ``AUTOCOMMIT`` mode.
+        DBAPIError: A statement failed, or the last attempt still timed out.
+    """
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
+    if getattr(connection.connection.dbapi_connection, "autocommit", False):
+        raise ValueError("add_integrity needs a transaction, not AUTOCOMMIT")
+    previous: str = connection.execute(
+        text("SELECT current_setting('lock_timeout')")
+    ).scalar_one()
+    _set_lock_timeout(connection, lock_timeout)
+    statements = add_integrity_statements(tables)
+    for attempt in range(1, attempts + 1):
+        try:
+            with connection.begin_nested():
+                for statement in statements:
+                    _execute_ddl(connection, statement)
+            break
+        except DBAPIError as exc:
+            if attempt == attempts or not _is_lock_timeout(exc):
+                raise
+            pause = random.uniform(0, _RETRY_PAUSE * 2 ** (attempt - 1))
+            logger.warning(
+                "add_integrity: a lock was not granted within lock_timeout=%r "
+                "(attempt %d of %d); retrying in %.2f s.",
+                lock_timeout,
+                attempt,
+                attempts,
+                pause,
+            )
+            _sleep(pause)
+    _set_lock_timeout(connection, previous)
+
+
+# The first retry pauses up to this many seconds, each later one twice as long.
+_RETRY_PAUSE = 0.5
+_LOCK_NOT_AVAILABLE = "55P03"
+_sleep = time.sleep
+
+
+def _is_lock_timeout(exc: DBAPIError) -> bool:
+    orig = exc.orig
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return sqlstate == _LOCK_NOT_AVAILABLE
+
+
+def _set_lock_timeout(connection: Connection, value: str) -> None:
+    connection.execute(
+        text("SELECT set_config('lock_timeout', :value, true)"), {"value": value}
+    )
 
 
 def _execute_ddl(connection: Connection, statement: str) -> None:
