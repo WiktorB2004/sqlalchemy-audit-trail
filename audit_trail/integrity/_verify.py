@@ -33,7 +33,8 @@ What it checks:
   ``SEGMENT_MISSING``. Given the retention, a retire block whose partition
   was still inside it is ``RETIRED_EARLY``.
 - The horizon of the database against the chain's: ``XID_REWIND`` when it
-  is lower.
+  is lower, and for a row whose ``xid`` is at or above the ``xmax`` of the
+  snapshot that read it (a row from the future).
 
 Rows are judged per *incarnation* of the chain: an ``xid`` below its
 ``enforce_from`` is ``PRE_GENESIS``, one at or above its sealed horizon is
@@ -852,6 +853,16 @@ class Verifier:
                 **where,
             )
 
+    def observe_xmax(self, xmax: int) -> None:
+        """Raise the ``xmax`` bound to one read after the horizon.
+
+        The reader calls it with ``pg_snapshot_xmax`` read after each chunk
+        of rows, before handing the chunk over: a transaction that started
+        after the horizon was read may have committed rows by then, and they
+        belong to the unsealed tail, not the future.
+        """
+        self._xmax = max(self._xmax, xmax)
+
     def null_xid_rows(self, partition: Partition, count: int) -> None:
         """Note rows written before the ``xid`` column existed."""
         if count:
@@ -876,6 +887,15 @@ class Verifier:
             "id": row_id,
             "xid": xid,
         }
+        if xid >= self._xmax:
+            # No transaction with this xid had started when the row was
+            # read; left alone, it would sit in the unsealed tail forever.
+            self._fail(
+                FailureKind.XID_REWIND,
+                "the row's xid is from a transaction that has not started",
+                **where,
+            )
+            return
         incarnation = self.incarnation_of(stream, row_id)
         pre_genesis = incarnation is None or incarnation.is_pre_genesis(xid)
         enforce_from = (incarnation or self.incarnations[0]).enforce_from

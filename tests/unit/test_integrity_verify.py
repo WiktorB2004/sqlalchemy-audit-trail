@@ -281,6 +281,30 @@ def test_a_horizon_below_the_chain_is_xid_rewind(sealed: Sealed) -> None:
     assert check(*sealed, horizon=300).status is Status.VALID
 
 
+def test_a_row_from_the_future_is_xid_rewind(sealed: Sealed) -> None:
+    chain, transactions, activities = sealed
+    future = activity_row(9, 10**15)
+    report = check(chain, transactions, [*activities, future])
+    assert failures(report) == {FailureKind.XID_REWIND}
+    (finding,) = report.failures
+    assert (finding.table, finding.id, finding.xid) == ("activity", 9, 10**15)
+
+
+def test_a_row_below_a_later_xmax_is_in_the_tail(sealed: Sealed) -> None:
+    # A transaction that started after the horizon was read, seen by a
+    # later chunk whose snapshot reaches it.
+    chain, transactions, activities = sealed
+    verifier = Verifier(chain.blocks, horizon=10_000)
+    verifier.observe_xmax(10_005)
+    verifier.check_partition(Partition("transaction", TX_PART), transactions)
+    late = activity_row(9, 10_004)
+    verifier.check_partition(Partition("activity", ACT_PART), [*activities, late])
+    verifier.schema([])
+    report = verifier.report()
+    assert report.failures == []
+    assert {(f.kind, f.count) for f in report.notes} == {(NoteKind.UNSEALED_TAIL, 1)}
+
+
 def test_a_seal_that_does_not_start_where_the_last_ended_is_malformed(
     sealed: Sealed,
 ) -> None:

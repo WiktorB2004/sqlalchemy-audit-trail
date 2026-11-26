@@ -60,6 +60,8 @@ DEFAULT_CHUNK_ROWS = 2_000
 
 _BLOCK_CHUNK = 1_000
 
+_XMAX = text("SELECT pg_snapshot_xmax(pg_current_snapshot())::text")
+
 
 class VerifyBusyError(RuntimeError):
     """Another ``verify`` of the same chain is running."""
@@ -189,7 +191,9 @@ def _verify(
                     .where(table.c[_schema.XID].is_(None))
                 ).scalar_one()
             verifier.null_xid_rows(leaf.partition, int(nulls))
-            verifier.check_partition(leaf.partition, _rows(conn, table, chunk_rows))
+            verifier.check_partition(
+                leaf.partition, _rows(conn, table, chunk_rows, verifier)
+            )
         verifier.schema(detached)
     return verifier.report()
 
@@ -274,8 +278,15 @@ def _partition_table(parent: Table, leaf: _Leaf) -> Table:
     return Table(leaf.partition.name, MetaData(), *columns, schema=leaf.schema)
 
 
-def _rows(conn: Connection, table: Table, chunk_rows: int) -> Iterator[dict[str, Any]]:
-    """The rows of a partition with an ``xid``, in ``(xid, id)`` order."""
+def _rows(
+    conn: Connection, table: Table, chunk_rows: int, verifier: Verifier
+) -> Iterator[dict[str, Any]]:
+    """The rows of a partition with an ``xid``, in ``(xid, id)`` order.
+
+    After each chunk, in the same transaction, the snapshot's ``xmax`` is
+    read and given to the verifier. Read after the rows, it is at least the
+    ``xmax`` of the snapshot that read them, so every real row is below it.
+    """
     xid, row_id = table.c[_schema.XID], table.c.id
     last: tuple[int, int] | None = None
     while True:
@@ -291,6 +302,8 @@ def _rows(conn: Connection, table: Table, chunk_rows: int) -> Iterator[dict[str,
         statement = statement.order_by(xid, row_id).limit(chunk_rows)
         with _read_only(conn):
             rows = [dict(row) for row in conn.execute(statement).mappings()]
+            xmax = conn.execute(_XMAX).scalar_one()
+        verifier.observe_xmax(int(xmax))
         yield from rows
         if len(rows) < chunk_rows:
             return

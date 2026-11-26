@@ -557,6 +557,22 @@ def test_a_chain_sealed_past_the_database_is_xid_rewind(env: Env) -> None:
     assert failed(report) == {FailureKind.XID_REWIND}
 
 
+def test_a_row_from_the_future_is_xid_rewind(env: Env) -> None:
+    assert_valid(env)
+    # A copy of a row under an xid no transaction has had yet: it would sit
+    # in the unsealed tail forever.
+    (row,) = env.transactions()[:1]
+    table = env.trail.tables.transaction
+    future = 10**15
+    with env.engine.begin() as conn:
+        values = {c: row[c] for c in row if c != "id"}
+        conn.execute(insert(table).values({**values, "xid": future}))
+    report = run(env)
+    assert failed(report) == {FailureKind.XID_REWIND}
+    (finding,) = report.failures
+    assert (finding.table, finding.xid) == ("transaction", future)
+
+
 def retire(env: Env, upper_bound: datetime) -> int:
     partition = transaction_partition(env)
     return append_block(
