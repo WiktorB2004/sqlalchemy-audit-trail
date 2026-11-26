@@ -44,7 +44,6 @@ from audit_trail.integrity._verify import (
     VerificationReport,
 )
 from audit_trail.integrity._verify_db import VerifyBusyError, acknowledge, verify
-from audit_trail.migrations import month_partition_name
 from tests.db.listener_support import Env, make_env, record_statements
 
 pytestmark = pytest.mark.filterwarnings("ignore:Did not recognize type 'xid8'")
@@ -177,8 +176,21 @@ def sealed_to(env: Env) -> int:
 
 
 def transaction_partition(env: Env) -> str:
-    now = datetime.now(UTC).date().replace(day=1)
-    return month_partition_name(env.trail.tables.transaction.name, now)
+    """The partition holding the transaction rows, read from the rows.
+
+    Not from the clock: a test that runs across a month boundary would
+    otherwise name the wrong month.
+    """
+    table = env.trail.tables.transaction
+    with env.engine.connect() as conn:
+        (name,) = conn.execute(
+            text(
+                "SELECT DISTINCT c.relname FROM "
+                f'"{table.schema}"."{table.name}" t '
+                "JOIN pg_catalog.pg_class c ON c.oid = t.tableoid"
+            )
+        ).scalars()
+    return str(name)
 
 
 # -- clean ------------------------------------------------------------------
@@ -203,6 +215,19 @@ def test_small_chunks_page_through_ties(env: Env, models: Models) -> None:
     assert len(read_only) > len(env.activities()) + len(env.transactions())
     # Later chunks start after the (xid, id) of the last row.
     assert keyset
+
+
+def test_a_chunk_size_that_divides_the_rows_exactly(env: Env) -> None:
+    # Two transactions; the last full chunk is followed by an empty one.
+    assert len(env.transactions()) == 2
+    with record_statements(env.engine) as log:
+        log.recording = True
+        report = run(env, chunk_rows=2)
+    assert report.status is Status.VALID
+    table = env.trail.tables.transaction.name
+    reads = [s for s in log.statements if f"{table}_p" in s and "LIMIT" in s]
+    assert len(reads) == 2
+    assert ") > (" in reads[1]
 
 
 def test_a_scrub_and_a_scrub_actor_in_one_transaction_verify_clean(
@@ -548,12 +573,17 @@ def retire(env: Env, upper_bound: datetime) -> int:
     )
 
 
+# Retire bounds pinned far from any clock the tests run at: inside every
+# retention, or past it.
+FAR_FUTURE = datetime(2999, 1, 1, tzinfo=UTC)
+LONG_AGO = datetime(2000, 1, 1, tzinfo=UTC)
+
 RETENTION = {Severity.INFO: timedelta(days=30), Severity.WARNING: timedelta(days=30)}
 
 
 def test_a_retire_inside_the_retention_is_retired_early(env: Env) -> None:
     assert run(env, retention=RETENTION).status is Status.VALID
-    retire(env, datetime.now(UTC) + timedelta(days=31))
+    retire(env, FAR_FUTURE)
     # Without the retention, the retire block is not judged.
     assert run(env).status is Status.VALID
     report = run(env, retention=RETENTION)
@@ -563,7 +593,7 @@ def test_a_retire_inside_the_retention_is_retired_early(env: Env) -> None:
 
 def test_a_retired_partition_that_is_gone_is_a_note(env: Env) -> None:
     assert_valid(env)
-    retire(env, datetime.now(UTC) - timedelta(days=90))
+    retire(env, LONG_AGO)
     partition = transaction_partition(env)
     detach(env, partition)
     schema = env.trail.tables.transaction.schema
