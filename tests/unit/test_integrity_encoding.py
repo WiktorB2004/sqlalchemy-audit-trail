@@ -160,7 +160,10 @@ def test_commitment_vectors(case: dict[str, str]) -> None:
     assert hashlib.sha256(preimage).hexdigest() == case["commitment"]
 
 
-@pytest.mark.parametrize("case", load("leaves.json"), ids=["empty", "row"])
+LEAVES = load("leaves.json")
+
+
+@pytest.mark.parametrize("case", LEAVES, ids=[c["name"] for c in LEAVES])
 def test_leaf_vectors(case: dict[str, str]) -> None:
     row = json.loads(case["row"])
     assert canonical(row) == case["canonical"].encode()
