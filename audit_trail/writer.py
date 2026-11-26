@@ -30,6 +30,12 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from audit_trail._compaction import ActivityData
 from audit_trail.context import AuditContext, ContextSnapshot, context_snapshot
 from audit_trail.events import PayloadError
+from audit_trail.integrity._commit import (
+    activity_groups,
+    seal_columns,
+    transaction_groups,
+)
+from audit_trail.integrity._schema import has_integrity
 from audit_trail.maintenance import PartitionError, ensure_partitions
 from audit_trail.serialization import (
     JSONValue,
@@ -274,6 +280,9 @@ def insert_transaction(
 ) -> TransactionRow:
     """Insert an ``audit_transaction`` row.
 
+    On a table with the integrity columns, the row gets fresh commitments and
+    salts on every call, so a retried write never reuses a salt.
+
     Args:
         connection: Connection in the transaction being audited.
         table: The ``audit_transaction`` table.
@@ -285,7 +294,10 @@ def insert_transaction(
     statement = insert(table).returning(
         table.c.id, table.c.issued_at, table.c.correlation_id
     )
-    row_id, issued_at, correlation_id = connection.execute(statement, values).one()
+    row: Mapping[str, object] = values
+    if has_integrity(table):
+        row = {**values, **seal_columns(transaction_groups(values))}
+    row_id, issued_at, correlation_id = connection.execute(statement, row).one()
     return TransactionRow(row_id, issued_at, correlation_id)
 
 
@@ -308,16 +320,45 @@ def insert_activities(
     """
     if not entries:
         return
-    rows: list[ActivityValues] = [
-        {
+    connection.execute(insert(table), activity_rows(table, transaction, entries))
+
+
+def activity_rows(
+    table: Table, transaction: TransactionRow, entries: Sequence[Entry]
+) -> list[dict[str, object]]:
+    """Build the ``audit_activity`` rows of ``insert_activities``.
+
+    Every row has the same keys: ``executemany`` takes its column list from
+    the first row, raises for a later row that lacks a key and silently drops
+    a key the first row does not have. On a table with the integrity columns
+    each row also gets ``SealColumns``, with fresh salts.
+
+    Args:
+        table: The ``audit_activity`` table.
+        transaction: The transaction row the entries belong to.
+        entries: The entries.
+
+    Returns:
+        The rows, in the order of ``entries``.
+
+    Raises:
+        CanonicalEncodingError: An erasable value has no canonical encoding.
+    """
+    sealed = has_integrity(table)
+    rows: list[dict[str, object]] = []
+    for entry in entries:
+        values: ActivityValues = {
             **entry,
             "transaction_id": transaction.id,
             "correlation_id": transaction.correlation_id,
             "created_at": transaction.issued_at,
         }
-        for entry in entries
-    ]
-    connection.execute(insert(table), rows)
+        row: dict[str, object] = dict(values)
+        if sealed:
+            groups = activity_groups(entry["object_label"], entry["data"])
+            row.update(seal_columns(groups))
+        rows.append(row)
+    return rows
 
 
 def run_isolated(
