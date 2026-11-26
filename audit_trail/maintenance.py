@@ -92,8 +92,13 @@ from audit_trail.tables import MAX_IDENTIFIER_LENGTH, AuditTables
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from audit_trail.integrity._retire import Retirer
+
 LOCK_NOT_AVAILABLE = _pg.LOCK_NOT_AVAILABLE
 """SQLSTATE raised when ``lock_timeout`` expires."""
+
+OBJECT_NOT_IN_PREREQUISITE_STATE = "55000"
+"""SQLSTATE of a ``DETACH`` while a detach from the same parent is pending."""
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +150,55 @@ class PartitionLockTimeoutError(PartitionError):
     """
 
 
+SkipReason = Literal[
+    "unsealed",
+    "verify_failed",
+    "lock_not_available",
+    "detach_pending",
+    "changed_after_retire",
+]
+"""Why ``drop_expired`` kept an expired partition, with integrity."""
+
+
+@dataclass(frozen=True)
+class SkippedPartition:
+    """An expired partition that ``drop_expired`` kept, with integrity.
+
+    Private for now. The next call tries it again.
+
+    Attributes:
+        partition: Schema-qualified name, as ``drop_expired`` returns names.
+        reason: ``unsealed``: it holds rows the chain has not sealed yet.
+            ``verify_failed``: ``verify`` found a failure in it, or in the
+            chain. ``lock_not_available``: a lock was not granted within
+            ``lock_timeout`` (SQLSTATE ``55P03``), for example while an
+            open transaction has used it. ``detach_pending``: a detach from
+            the same parent is pending (SQLSTATE ``55000``).
+            ``changed_after_retire``: after its retire block, rows reached it
+            that the block does not cover; it is left detached.
+        detail: A sentence for people.
+    """
+
+    partition: str
+    reason: SkipReason
+    detail: str
+
+
+class DroppedPartitions(list[str]):
+    """What ``drop_expired`` returns: the names dropped, in order.
+
+    A ``list`` of names, as before. ``skipped`` lists the expired partitions
+    kept instead of dropped, which happens only with integrity on; it is
+    private for now.
+    """
+
+    def __init__(
+        self, dropped: Iterable[str] = (), skipped: Iterable[SkippedPartition] = ()
+    ) -> None:
+        super().__init__(dropped)
+        self.skipped: list[SkippedPartition] = list(skipped)
+
+
 class _RetentionTarget(NamedTuple):
     """A partitioned table whose monthly partitions expire together."""
 
@@ -153,6 +207,9 @@ class _RetentionTarget(NamedTuple):
     oid: int
     limit: timedelta | None
     """How long its partitions are kept; ``None`` keeps them forever."""
+    values: frozenset[int] | None = None
+    """The severities of a severity partition; ``None`` for the transaction
+    table."""
 
 
 class _Coverage(NamedTuple):
@@ -340,7 +397,8 @@ def drop_expired(
     transaction_retention: timedelta | None = None,
     now: datetime | None = None,
     lock_timeout: str | None = "5s",
-) -> list[str]:
+    verify_before_drop: bool = True,
+) -> DroppedPartitions:
     """Detach and drop the monthly partitions past their retention.
 
     A partition is dropped when its upper bound is earlier than
@@ -367,6 +425,18 @@ def drop_expired(
     ``PartitionError`` when it changed. ``ensure_partitions`` runs in one
     transaction and works behind such a pooler.
 
+    With integrity on (private for now), the call first seals the finished
+    transactions and, with ``verify_before_drop``, verifies the expired
+    partitions, on a second connection from ``connection.engine``. Before
+    each detach it appends a ``retire`` block for the partition to the hash
+    chain and commits it. An expired partition that cannot be retired, or
+    whose detach or drop is refused with SQLSTATE ``55P03`` (a lock not
+    granted within ``lock_timeout``) or ``55000`` (a sibling's detach
+    pending), is kept and reported in ``skipped`` instead of failing the
+    call; no partition is dropped without a retire block. The backend is
+    also checked before each retire block, so behind a transaction-mode
+    pooler none is written.
+
     Args:
         connection: ``AUTOCOMMIT`` connection with DDL privileges, direct or
             through a session-mode pool.
@@ -385,9 +455,14 @@ def drop_expired(
             ``now()``.
         lock_timeout: PostgreSQL ``lock_timeout`` for each statement, such as
             ``"5s"``. ``None`` keeps the session's setting.
+        verify_before_drop: With integrity, verify the expired partitions
+            and the chain before the first detach, and keep the partitions a
+            failure names (all of them after a failure of the chain itself).
+            Ignored without integrity. Private for now.
 
     Returns:
-        Schema-qualified names of the partitions dropped, in order.
+        Schema-qualified names of the partitions dropped, in order: a
+        ``list``, with the partitions kept under integrity in ``skipped``.
 
     Raises:
         ValueError: If the connection is not in ``AUTOCOMMIT`` mode, a
@@ -397,6 +472,9 @@ def drop_expired(
             pooler. Partitions dropped before that stay dropped.
         PartitionLockTimeoutError: If a lock was not granted within
             ``lock_timeout``. Partitions dropped before that stay dropped.
+            With integrity, a detach or drop skips the partition instead.
+        SealRefusedError: With integrity, the chain has no genesis block or
+            the transaction ids were rewound; nothing was dropped.
     """
     if not getattr(connection.connection.dbapi_connection, "autocommit", False):
         raise ValueError(
@@ -410,7 +488,13 @@ def drop_expired(
     _check_aware(now)
     try:
         return _drop(
-            connection, tables, retention, transaction_retention, now, lock_timeout
+            connection,
+            tables,
+            retention,
+            transaction_retention,
+            now,
+            lock_timeout,
+            verify_before_drop,
         )
     except DBAPIError as exc:
         if _pg.is_sqlstate(exc, LOCK_NOT_AVAILABLE):
@@ -607,16 +691,20 @@ class PartitionManager:
         *,
         transaction_retention: timedelta | None = None,
         lock_timeout: str | None = "5s",
-    ) -> list[str]:
+        verify_before_drop: bool = True,
+    ) -> DroppedPartitions:
         """Drop expired partitions in ``AUTOCOMMIT`` mode; see ``drop_expired``.
 
         Args:
             retention: Retention by severity value; ``None`` keeps forever.
             transaction_retention: Retention of the transaction table.
             lock_timeout: PostgreSQL ``lock_timeout`` for each statement.
+            verify_before_drop: With integrity, verify before the first
+                detach. Private for now.
 
         Returns:
-            Schema-qualified names of the partitions dropped.
+            Schema-qualified names of the partitions dropped, with the
+            partitions kept under integrity in ``skipped``.
 
         Raises:
             TypeError: If the manager was built with an ``AsyncEngine``.
@@ -631,6 +719,7 @@ class PartitionManager:
                 retention,
                 transaction_retention=transaction_retention,
                 lock_timeout=lock_timeout,
+                verify_before_drop=verify_before_drop,
             )
 
     async def adrop_expired(
@@ -639,16 +728,20 @@ class PartitionManager:
         *,
         transaction_retention: timedelta | None = None,
         lock_timeout: str | None = "5s",
-    ) -> list[str]:
+        verify_before_drop: bool = True,
+    ) -> DroppedPartitions:
         """Async ``drop_expired``, for a manager built with an ``AsyncEngine``.
 
         Args:
             retention: Retention by severity value; ``None`` keeps forever.
             transaction_retention: Retention of the transaction table.
             lock_timeout: PostgreSQL ``lock_timeout`` for each statement.
+            verify_before_drop: With integrity, verify before the first
+                detach. Private for now.
 
         Returns:
-            Schema-qualified names of the partitions dropped.
+            Schema-qualified names of the partitions dropped, with the
+            partitions kept under integrity in ``skipped``.
 
         Raises:
             TypeError: If the manager was built with a sync ``Engine``.
@@ -665,6 +758,7 @@ class PartitionManager:
                     retention,
                     transaction_retention=transaction_retention,
                     lock_timeout=lock_timeout,
+                    verify_before_drop=verify_before_drop,
                 )
             )
 
@@ -895,7 +989,8 @@ def _drop(
     transaction_retention: timedelta | None,
     now: datetime | None,
     lock_timeout: str | None,
-) -> list[str]:
+    verify_before_drop: bool = True,
+) -> DroppedPartitions:
     transaction, activity = tables.transaction, tables.activity
     transaction_oid = _oid(conn, _qualified(transaction))
     activity_oid = _oid(conn, _qualified(activity))
@@ -931,7 +1026,10 @@ def _drop(
             if child.relkind == "p":
                 targets.append(
                     _RetentionTarget(
-                        child.qualified, child.oid, _longest(limits, values)
+                        child.qualified,
+                        child.oid,
+                        _longest(limits, values),
+                        frozenset(values),
                     )
                 )
         for value in sorted(partitioned - limits.keys()):
@@ -947,9 +1045,28 @@ def _drop(
                 value,
             )
 
-        dropped: list[str] = []
-        for target in targets:
-            dropped += _drop_months(session, target, now)
+        if not has_integrity(transaction):
+            dropped = DroppedPartitions()
+            for target in targets:
+                dropped += _drop_months(session, target, now)
+        else:
+            # Imported here: the integrity modules import this one.
+            from audit_trail.integrity._retire import Retirer
+
+            session.check()
+            with Retirer(
+                conn, tables, verify_before_drop=verify_before_drop
+            ) as retirer:
+                retirer.prepare(
+                    child
+                    for target in targets
+                    for child in _children(conn, target.oid)
+                    if _is_expired(child, target, now)
+                )
+                dropped = DroppedPartitions()
+                for target in targets:
+                    dropped += _drop_months(session, target, now, retirer)
+                dropped.skipped = retirer.skipped
     except BaseException:
         # A broken connection is discarded by the pool, which releases the
         # session's lock and setting; touching it would hide the real error.
@@ -982,26 +1099,37 @@ def _release(
     return held
 
 
+def _is_expired(child: _Child, target: _RetentionTarget, now: datetime) -> bool:
+    return (
+        target.limit is not None
+        and child.is_range
+        and child.upper is not None
+        and child.upper < now - target.limit
+    )
+
+
 def _drop_months(
-    session: _Session, target: _RetentionTarget, now: datetime
+    session: _Session,
+    target: _RetentionTarget,
+    now: datetime,
+    retirer: Retirer | None = None,
 ) -> list[str]:
     conn = session.conn
-    cutoff = None if target.limit is None else now - target.limit
 
     def expired(child: _Child) -> bool:
-        return (
-            cutoff is not None
-            and child.is_range
-            and child.upper is not None
-            and child.upper < cutoff
-        )
+        return _is_expired(child, target, now)
 
     children = _children(conn, target.oid)
     dropped: list[str] = []
     # At most one partition per parent can be pending; finish it first.
     for child in (c for c in children if c.pending):
+        finalize = _detach_sql(target.parent, child, "FINALIZE")
+        if retirer is not None and expired(child):
+            if _retire_and_drop(session, target, child, finalize, retirer):
+                dropped.append(child.display)
+            continue
         session.check()
-        _pg.execute_ddl(conn, _detach_sql(target.parent, child, "FINALIZE"))
+        _pg.execute_ddl(conn, finalize)
         if expired(child):
             session.check()
             dropped.append(_drop_table(conn, child))
@@ -1013,11 +1141,46 @@ def _drop_months(
             )
     live = [c for c in children if not c.pending and expired(c)]
     for child in sorted(live, key=lambda c: c.upper or now):
+        detach = _detach_sql(target.parent, child, "CONCURRENTLY")
+        if retirer is not None:
+            if _retire_and_drop(session, target, child, detach, retirer):
+                dropped.append(child.display)
+            continue
         session.check()
-        _pg.execute_ddl(conn, _detach_sql(target.parent, child, "CONCURRENTLY"))
+        _pg.execute_ddl(conn, detach)
         session.check()
         dropped.append(_drop_table(conn, child))
     return dropped
+
+
+def _retire_and_drop(
+    session: _Session,
+    target: _RetentionTarget,
+    child: _Child,
+    detach: str,
+    retirer: Retirer,
+) -> bool:
+    """Retire, detach, check and drop one partition; whether it was dropped.
+
+    The retire block is committed before the detach starts, so no partition
+    is detached, and none dropped, without one. The backend is checked
+    before the retire block and before each DDL statement, so a pooler that
+    moved the connection off the advisory lock stops the call first.
+    """
+    conn = session.conn
+    session.check()
+    if not retirer.retire(target, child):
+        return False
+    session.check()
+    if not retirer.ddl(conn, detach, child):
+        return False
+    if not retirer.check_detached(child):
+        return False
+    session.check()
+    if not retirer.ddl(conn, f"DROP TABLE {child.qualified}", child):
+        return False
+    logger.info("dropped expired partition %s", child.display)
+    return True
 
 
 def _drop_table(conn: Connection, child: _Child) -> str:
