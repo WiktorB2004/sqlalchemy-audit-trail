@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import dataclasses
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
@@ -16,6 +17,8 @@ from audit_trail.events import AuditSystem
 from audit_trail.integrity import _verify
 from audit_trail.integrity._block import (
     ZERO_HASH,
+    SealedSegment,
+    Segment,
     SegmentBuilder,
     ack_body,
     activity_leaf_row,
@@ -136,6 +139,46 @@ class Chain:
         body = seal_body(CHAIN, self.next, self.sealed_to, xid_to, builder.segments())
         self.sealed_to = xid_to
         return self.add("seal", body)
+
+    def sealed(self, partition: str) -> list[SealedSegment]:
+        """The segments of ``partition`` in the seal blocks so far."""
+        found = []
+        for block in self.blocks:
+            if block.kind != "seal":
+                continue
+            for item in parse_body(block.body)["segments"]:
+                if item["partition"] == partition:
+                    segment = Segment(
+                        item["stream"],
+                        partition,
+                        item["rows"],
+                        base64.b64decode(item["root"]),
+                    )
+                    found.append(SealedSegment(block.seq, segment))
+        return found
+
+    def retire(
+        self,
+        partition: str,
+        streams: list[str],
+        upper_bound: datetime,
+        *,
+        segments: list[SealedSegment] | None = None,
+        sealed_at: datetime = NOW,
+    ) -> int:
+        """A retire block covering the segments sealed so far, as written."""
+        table = "transaction" if streams == ["transaction"] else "activity"
+        body = retire_body(
+            CHAIN,
+            self.next,
+            table=table,
+            partition=partition,
+            streams=streams,
+            upper_bound=upper_bound,
+            retention=None,
+            segments=self.sealed(partition) if segments is None else segments,
+        )
+        return self.add("retire", body, sealed_at)
 
 
 def check(
@@ -574,18 +617,10 @@ def test_a_retired_receipt_is_a_note() -> None:
     ]
     chain.add("seal", seal_body(CHAIN, chain.next, 100, 300, segments))
     chain.sealed_to = 300
-    chain.add(
-        "retire",
-        retire_body(
-            CHAIN,
-            chain.next,
-            stream="activity.40",
-            partition="audit_activity_40_p2026_01",
-            upper_bound=datetime(2026, 2, 1, tzinfo=UTC),
-            retention=None,
-            rows=1,
-            segments_digest=bytes(32),
-        ),
+    chain.retire(
+        "audit_activity_40_p2026_01",
+        ["activity.40"],
+        datetime(2026, 2, 1, tzinfo=UTC),
     )
     report = check(chain, [], activities, system_severity=40)
     assert report.failures == []
@@ -612,23 +647,38 @@ def test_a_retired_receipt_must_be_in_the_records_stream() -> None:
     segments = [*_segments_of(activities), *builder.segments()]
     chain.add("seal", seal_body(CHAIN, chain.next, 100, 300, segments))
     chain.sealed_to = 300
-    chain.add(
-        "retire",
-        retire_body(
-            CHAIN,
-            chain.next,
-            stream="activity.30",
-            partition="audit_activity_30_p2026_01",
-            upper_bound=datetime(2026, 2, 1, tzinfo=UTC),
-            retention=None,
-            rows=1,
-            segments_digest=bytes(32),
-        ),
+    chain.retire(
+        "audit_activity_30_p2026_01",
+        ["activity.30"],
+        datetime(2026, 2, 1, tzinfo=UTC),
     )
     # A retired partition of severity 30 sealed with the scrub, while the
     # records are written at 40: the missing record is not explained.
     report = check(chain, [], activities, system_severity=40)
     assert failures(report) == {FailureKind.SCRUB_COUNT_MISMATCH}
+    assert NoteKind.ERASED_RECEIPT_RETIRED not in report.kinds()
+
+
+def test_a_retired_receipt_must_be_covered_by_its_retire_block() -> None:
+    # The same record partition, retired before the block that sealed the
+    # record: the retire block covers none of its segments, so it attests
+    # nothing about the record, and the record's segment is missing.
+    activities = [activity_row(1, 200)]
+    scrub(activities[0], 250)
+    scrubbed = record(3, 250, operation="scrub", activity_rows=1)
+    chain = Chain()
+    retired = "audit_activity_40_p2026_01"
+    chain.retire(retired, ["activity.40"], datetime(2026, 2, 1, tzinfo=UTC))
+    builder = SegmentBuilder()
+    builder.add("activity.40", retired, activity_leaf_row(scrubbed))
+    segments = [*_segments_of(activities), *builder.segments()]
+    chain.add("seal", seal_body(CHAIN, chain.next, 100, 300, segments))
+    chain.sealed_to = 300
+    report = check(chain, [], activities, system_severity=40)
+    assert failures(report) == {
+        FailureKind.SCRUB_COUNT_MISMATCH,
+        FailureKind.SEGMENT_MISSING,
+    }
     assert NoteKind.ERASED_RECEIPT_RETIRED not in report.kinds()
 
 
@@ -862,19 +912,7 @@ def test_retention_by_stream() -> None:
 
 def test_retired_early_needs_the_retention(sealed: Sealed) -> None:
     chain, transactions, activities = sealed
-    chain.add(
-        "retire",
-        retire_body(
-            CHAIN,
-            chain.next,
-            stream="transaction",
-            partition=TX_PART,
-            upper_bound=NOW - timedelta(days=10),
-            retention=None,
-            rows=1,
-            segments_digest=bytes(32),
-        ),
-    )
+    chain.retire(TX_PART, ["transaction"], NOW - timedelta(days=10))
     long = {"transaction": timedelta(days=30)}
     short = {"transaction": timedelta(days=5)}
     assert check(chain, transactions, activities).status is Status.VALID
@@ -893,3 +931,144 @@ def test_findings_show_no_salt_or_value(sealed: Sealed) -> None:
     for row in (*transactions, *activities):
         for secret in (*row["seal_salts"].values(), *row["seal_commitments"].values()):
             assert secret not in shown
+
+
+# -- retire blocks are bound to the chain ------------------------------------
+
+
+def check_without_transactions(
+    chain: Chain, activities: list[dict[str, Any]], **options: Any
+) -> _verify.VerificationReport:
+    """Verify with the transaction partition gone."""
+    verifier = Verifier(chain.blocks, horizon=10_000, **options)
+    verifier.check_partition(Partition("activity", ACT_PART), activities)
+    verifier.schema([])
+    return verifier.report()
+
+
+def test_a_retired_partition_still_present_is_checked(sealed: Sealed) -> None:
+    # A crash after the retire block and before the drop.
+    chain, transactions, activities = sealed
+    chain.retire(TX_PART, ["transaction"], datetime(2026, 1, 1, tzinfo=UTC))
+    report = check(chain, transactions, activities)
+    assert report.status is Status.VALID
+    transactions[0]["actor_type"] = "forged"
+    assert failures(check(chain, transactions, activities)) == {
+        FailureKind.ROOT_MISMATCH
+    }
+
+
+def test_a_retired_partition_that_is_gone_is_a_note(sealed: Sealed) -> None:
+    chain, _transactions, activities = sealed
+    seq = chain.retire(TX_PART, ["transaction"], datetime(2026, 1, 1, tzinfo=UTC))
+    report = check_without_transactions(chain, activities)
+    assert report.failures == []
+    assert [(f.kind, f.seq, f.partition, f.count) for f in report.notes] == [
+        (NoteKind.RETIRED, seq, TX_PART, 1)
+    ]
+
+
+def test_a_partition_gone_without_a_retire_block_is_segment_missing(
+    sealed: Sealed,
+) -> None:
+    chain, _transactions, activities = sealed
+    report = check_without_transactions(chain, activities)
+    assert failures(report) == {FailureKind.SEGMENT_MISSING}
+    assert [f.partition for f in report.failures] == [TX_PART]
+
+
+def test_an_empty_partition_retires_with_no_segments() -> None:
+    chain = Chain()
+    seq = chain.retire(
+        "audit_transaction_p2026_01", ["transaction"], datetime(2026, 2, 1, tzinfo=UTC)
+    )
+    body = parse_body(chain.blocks[-1].body)
+    assert (body["seals"], body["segments"], body["rows"]) == (None, 0, 0)
+    report = check(chain, [], [])
+    assert report.status is Status.VALID
+    assert report.verified_to == seq
+
+
+@pytest.mark.parametrize(
+    "forge",
+    [
+        pytest.param({"rows": 2}, id="rows"),
+        pytest.param({"segments": 0}, id="segments"),
+        pytest.param({"seals": None}, id="seals"),
+        pytest.param({"seals": {"first": 2, "last": 3}}, id="seal-range"),
+        pytest.param(
+            {"segments_digest": base64.b64encode(bytes(32)).decode()}, id="digest"
+        ),
+        pytest.param({"partition": ACT_PART}, id="other-partition"),
+        pytest.param({"streams": ["activity.20"]}, id="other-stream"),
+        pytest.param({"table": "activity"}, id="other-table"),
+        pytest.param({"streams": []}, id="no-stream"),
+    ],
+)
+def test_a_retire_block_that_does_not_match_the_chain_retires_nothing(
+    sealed: Sealed, forge: dict[str, Any]
+) -> None:
+    chain, _transactions, activities = sealed
+    body = parse_body(
+        retire_body(
+            CHAIN,
+            chain.next,
+            table="transaction",
+            partition=TX_PART,
+            streams=["transaction"],
+            upper_bound=datetime(2026, 1, 1, tzinfo=UTC),
+            retention=None,
+            segments=chain.sealed(TX_PART),
+        )
+    )
+    seq = chain.add("retire", canonical({**body, **forge}))
+    report = check_without_transactions(chain, activities)
+    assert [(f.kind, f.seq) for f in report.failures if f.seq == seq] == [
+        (FailureKind.MALFORMED_BLOCK, seq)
+    ]
+    # The partition it should have retired is gone without a retire block.
+    assert [(f.kind, f.partition) for f in report.failures if f.seq != seq] == [
+        (FailureKind.SEGMENT_MISSING, TX_PART)
+    ]
+    assert NoteKind.RETIRED not in report.kinds()
+
+
+def test_a_segment_sealed_after_the_retire_block_is_not_covered() -> None:
+    transactions = [transaction_row(1, 200)]
+    chain = Chain()
+    chain.seal(300, transactions)
+    chain.retire(TX_PART, ["transaction"], datetime(2026, 1, 1, tzinfo=UTC))
+    late = transaction_row(2, 400)
+    after = chain.seal(500, [late])
+    # Present, the partition is checked as usual.
+    assert check(chain, [*transactions, late], []).status is Status.VALID
+    # Gone, the segment sealed after its retire block is missing.
+    report = check_without_transactions(chain, [])
+    assert [(f.kind, f.seq, f.count) for f in report.failures] == [
+        (FailureKind.SEGMENT_MISSING, after, 1)
+    ]
+    assert [f.kind for f in report.notes] == [NoteKind.RETIRED]
+
+
+def test_a_partition_retired_twice_is_malformed(sealed: Sealed) -> None:
+    chain, transactions, activities = sealed
+    chain.retire(TX_PART, ["transaction"], datetime(2026, 1, 1, tzinfo=UTC))
+    again = chain.retire(TX_PART, ["transaction"], datetime(2026, 1, 1, tzinfo=UTC))
+    report = check(chain, transactions, activities)
+    assert [(f.kind, f.seq) for f in report.failures] == [
+        (FailureKind.MALFORMED_BLOCK, again)
+    ]
+
+
+def test_a_partition_of_several_severities_keeps_the_longest() -> None:
+    chain = Chain()
+    upper = NOW - timedelta(days=10)
+    chain.retire("audit_activity_x_p2026_01", ["activity.10", "activity.20"], upper)
+    short, long = timedelta(days=5), timedelta(days=30)
+    both_short = {"activity.10": short, "activity.20": short}
+    one_long = {"activity.10": short, "activity.20": long}
+    assert check(chain, [], [], retention=both_short).failures == []
+    report = check(chain, [], [], retention=one_long)
+    assert [(f.kind, f.stream) for f in report.failures] == [
+        (FailureKind.RETIRED_EARLY, "activity.20")
+    ]

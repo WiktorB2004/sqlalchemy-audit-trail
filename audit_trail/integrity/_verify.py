@@ -30,8 +30,12 @@ What it checks:
 - The partitions named by segments: present ones are checked, retired ones
   (a ``retire`` block) are accepted with a ``RETIRED`` note, detached or
   pending ones are ``DETACHED_PARTITION`` and absent ones
-  ``SEGMENT_MISSING``. Given the retention, a retire block whose partition
-  was still inside it is ``RETIRED_EARLY``.
+  ``SEGMENT_MISSING``. A retire block covers only the segments of its
+  partition sealed before it, and must match them (``retire_coverage``),
+  or it is ``MALFORMED_BLOCK`` and retires nothing; a segment sealed after
+  it is ``SEGMENT_MISSING`` once the partition is gone. Given the
+  retention, a retire block whose partition was still inside it, for any
+  of its streams, is ``RETIRED_EARLY``.
 - The horizon of the database against the chain's: ``XID_REWIND`` when it
   is lower, and for a row whose ``xid`` is at or above the ``xmax`` of the
   snapshot that read it (a row from the future).
@@ -65,11 +69,14 @@ from audit_trail.integrity._block import (
     TRANSACTION_STREAM,
     ZERO_HASH,
     ExpectedSegment,
+    SealedSegment,
+    Segment,
     activity_leaf_row,
     activity_stream,
     block_hash,
     parse_body,
     parse_segments,
+    retire_coverage,
     transaction_leaf_row,
 )
 from audit_trail.integrity._canonical import CanonicalEncodingError
@@ -388,13 +395,26 @@ class Ack:
 
 @dataclass(frozen=True)
 class Retired:
-    """A ``retire`` block."""
+    """A ``retire`` block that matches the chain before it.
+
+    Attributes:
+        seq: Its block number.
+        table: ``transaction`` or ``activity``.
+        partition: The partition it retires.
+        streams: The streams of the partition.
+        upper_bound: The partition's exclusive upper bound.
+        sealed_at: When the block was written.
+        covered: The ``(seq, stream)`` of every segment it covers: those of
+            the partition in the seal blocks before it.
+    """
 
     seq: int
-    stream: str
+    table: str
     partition: str
+    streams: tuple[str, ...]
     upper_bound: datetime
     sealed_at: datetime
+    covered: frozenset[tuple[int, str]]
 
 
 @dataclass(frozen=True)
@@ -705,6 +725,10 @@ class Verifier:
         system_severity: Severity of the ``audit.scrubbed`` records. A
             retired partition explains a missing record only in that
             stream; ``None`` accepts no retired record.
+        count_scrubs: Compare the ``audit.scrubbed`` records with the
+            stamps. ``False`` for a run that reads only some partitions
+            (``skip_partition`` for the others), where neither count is
+            whole.
     """
 
     def __init__(
@@ -715,7 +739,9 @@ class Verifier:
         xmax: int | None = None,
         retention: Mapping[str, timedelta | None] | None = None,
         system_severity: int | None = None,
+        count_scrubs: bool = True,
     ) -> None:
+        self._count_scrubs = count_scrubs
         self._failures: list[Finding] = []
         self._notes: list[Finding] = []
         self._horizon = 0
@@ -854,35 +880,83 @@ class Verifier:
             except ValueError:
                 malformed("the ack block has no valid failure, scope and pins")
         elif kind == "retire":
-            stream, partition = body.get("stream"), body.get("partition")
-            upper = parse_rfc3339(body.get("upper_bound"))
-            if (
-                not isinstance(stream, str)
-                or not isinstance(partition, str)
-                or upper is None
-            ):
-                malformed("the retire block names no partition and bound")
-                return
-            retired = Retired(block.seq, stream, partition, upper, block.sealed_at)
-            self._retired[partition] = retired
-            self._check_retention(retired)
+            self._read_retire(block, body)
         elif kind == "checkpoint":
             pass
         else:
             malformed(f"{kind!r} blocks are not supported by this verifier")
 
-    def _check_retention(self, retired: Retired) -> None:
-        if self._retention is None or retired.stream not in self._retention:
+    def _read_retire(self, block: StoredBlock, body: Mapping[str, Any]) -> None:
+        """Accept a retire block only as a match for the chain before it.
+
+        Its partition, table and streams must name the segments sealed so
+        far, and its coverage must be theirs (``retire_coverage``); a retire
+        block that does not match retires nothing, so the partition's
+        segments are ``SEGMENT_MISSING`` once it is gone.
+        """
+
+        def malformed(why: str) -> None:
+            self._fail(FailureKind.MALFORMED_BLOCK, why, seq=block.seq)
+
+        table, partition = body.get("table"), body.get("partition")
+        streams = body.get("streams")
+        upper = parse_rfc3339(body.get("upper_bound"))
+        if (
+            table not in (TRANSACTION, ACTIVITY)
+            or not isinstance(partition, str)
+            or not isinstance(streams, list)
+            or not streams
+            or not all(_stream_of(table, s) for s in streams)
+            or upper is None
+        ):
+            malformed("the retire block names no partition, streams and bound")
             return
-        limit = self._retention[retired.stream]
-        if limit is None or retired.upper_bound > retired.sealed_at - limit:
-            self._fail(
-                FailureKind.RETIRED_EARLY,
-                "the partition was retired while still inside its retention",
-                seq=retired.seq,
-                stream=retired.stream,
-                partition=retired.partition,
-            )
+        if partition in self._retired:
+            malformed("the partition was retired before")
+            return
+        sealed = self._segments.get(partition, {})
+        coverage = retire_coverage(
+            SealedSegment(s.seq, Segment(s.stream, s.partition, s.rows, s.root))
+            for s in sealed.values()
+        )
+        found = {name: body.get(name) for name in coverage}
+        if found != coverage or not {stream for _, stream in sealed} <= set(streams):
+            malformed("the retire block does not match the segments sealed before it")
+            return
+        retired = Retired(
+            block.seq,
+            str(table),
+            partition,
+            tuple(streams),
+            upper,
+            block.sealed_at,
+            frozenset(sealed),
+        )
+        self._retired[partition] = retired
+        self._check_retention(retired)
+
+    def _check_retention(self, retired: Retired) -> None:
+        """``RETIRED_EARLY`` when a stream of the partition still kept it.
+
+        A partition of several streams is kept for the longest of their
+        retentions, as ``drop_expired`` keeps it.
+        """
+        if self._retention is None:
+            return
+        for stream in retired.streams:
+            if stream not in self._retention:
+                continue
+            limit = self._retention[stream]
+            if limit is None or retired.upper_bound > retired.sealed_at - limit:
+                self._fail(
+                    FailureKind.RETIRED_EARLY,
+                    "the partition was retired while still inside its retention",
+                    seq=retired.seq,
+                    table=retired.table,
+                    stream=stream,
+                    partition=retired.partition,
+                )
+                return
 
     def set_horizon(self, horizon: int, xmax: int | None = None) -> None:
         """Give the horizon and ``xmax``, read after the blocks."""
@@ -953,6 +1027,14 @@ class Verifier:
         belong to the unsealed tail, not the future.
         """
         self._xmax = max(self._xmax, xmax)
+
+    def skip_partition(self, partition: Partition) -> None:
+        """Take a partition that holds rows as present, without reading it.
+
+        For a run that checks only some partitions: its segments are neither
+        checked nor ``SEGMENT_MISSING``.
+        """
+        self._checked.add(partition.name)
 
     def null_xid_rows(self, partition: Partition, count: int) -> None:
         """Note rows written before the ``xid`` column existed."""
@@ -1141,25 +1223,32 @@ class Verifier:
         for name, segments in sorted(self._segments.items()):
             if name in self._checked or name in self._detached:
                 continue
-            first = min(segments.values(), key=lambda s: s.seq)
             retired = self._retired.get(name)
-            if retired is not None:
+            missing = [
+                segment
+                for key, segment in segments.items()
+                if retired is None or key not in retired.covered
+            ]
+            if retired is not None and retired.covered:
                 self._note(
                     NoteKind.RETIRED,
                     "a retired partition",
                     seq=retired.seq,
-                    stream=retired.stream,
+                    table=retired.table,
+                    stream=retired.streams[0] if len(retired.streams) == 1 else None,
                     partition=name,
-                    count=len(segments),
+                    count=len(retired.covered),
                 )
-            else:
+            if missing:
+                first = min(missing, key=lambda s: s.seq)
+                why = "sealed after its retire block" if retired else "absent"
                 self._fail(
                     FailureKind.SEGMENT_MISSING,
-                    f"{len(segments)} sealed segments name an absent partition",
+                    f"{len(missing)} sealed segments name a partition {why}",
                     seq=first.seq,
                     stream=first.stream,
                     partition=name,
-                    count=len(segments),
+                    count=len(missing),
                 )
 
     def _check_scrubs(self) -> None:
@@ -1228,8 +1317,9 @@ class Verifier:
         """Whether the record of the scrub at ``xid`` was sealed and retired.
 
         The record has the xid of its scrub, so it was sealed by the block
-        whose range holds that xid, in the stream of its severity. A retired
-        partition with a segment of that block and stream attests it.
+        whose range holds that xid, in the stream of its severity. A retire
+        block attests it when it names that stream and covers the segment of
+        that block and stream in its partition, and the partition is gone.
         """
         stream = self._scrubbed_stream
         if stream is None:
@@ -1238,12 +1328,11 @@ class Verifier:
             sealed = incarnation.seal_of(xid)
             if sealed is None:
                 continue
-            for name, segments in self._segments.items():
-                retired = self._retired.get(name)
+            for name, retired in self._retired.items():
                 if (
-                    retired is not None
-                    and retired.stream == stream
-                    and (sealed.seq, stream) in segments
+                    name not in self._checked
+                    and stream in retired.streams
+                    and (sealed.seq, stream) in retired.covered
                 ):
                     return True
         return False
@@ -1254,7 +1343,8 @@ class Verifier:
         """Finish: the scrub counts and the horizon, then the report."""
         if not self._has_horizon:
             raise ValueError("set the horizon before the report")
-        self._check_scrubs()
+        if self._count_scrubs:
+            self._check_scrubs()
         current = self.incarnations[-1]
         if self._horizon < current.sealed_to:
             self._fail(
@@ -1334,6 +1424,16 @@ def _leaf(table: str, row: Mapping[str, Any]) -> bytes:
     except (CanonicalEncodingError, KeyError, TypeError, AttributeError):
         # A row that cannot be encoded matches no sealed leaf.
         return bytes(32)
+
+
+def _stream_of(table: object, stream: object) -> bool:
+    """Whether ``stream`` is a stream of the rows of ``table``."""
+    if table == TRANSACTION:
+        return stream == TRANSACTION_STREAM
+    if not isinstance(stream, str) or not stream.startswith("activity."):
+        return False
+    severity = stream.removeprefix("activity.")
+    return severity.lstrip("-").isdigit() and activity_stream(int(severity)) == stream
 
 
 def stream_retention(

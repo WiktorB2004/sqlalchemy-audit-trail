@@ -6,6 +6,7 @@ context strings, never an edit of version 1.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import itertools
 import json
@@ -19,6 +20,7 @@ import pytest
 
 from audit_trail.integrity._block import (
     ZERO_HASH,
+    SealedSegment,
     Segment,
     SegmentBuilder,
     activity_leaf_row,
@@ -27,6 +29,7 @@ from audit_trail.integrity._block import (
     fork_body,
     genesis_body,
     parse_body,
+    retire_body,
     seal_body,
     transaction_leaf_row,
 )
@@ -150,6 +153,38 @@ def test_body_builders_give_the_vectors() -> None:
     assert plain == body_of("fork without an id window")
     fork = parse_body(plain)
     assert (fork["id_floor"], fork["id_count"]) == (None, None)
+    retired = SealedSegment(2, segments[1])
+    retire = retire_body(
+        chain,
+        6,
+        table="transaction",
+        partition="audit_transaction_p2026_11",
+        streams=["transaction"],
+        upper_bound=datetime(2026, 12, 1, tzinfo=UTC),
+        retention=90 * 86400,
+        segments=[retired],
+    )
+    assert retire == body_of("retire of one segment")
+
+
+def test_the_retire_digest_is_over_the_covered_segments() -> None:
+    body = parse_body(body_of("retire of one segment"))
+    (sealed,) = [c for c in VECTORS["blocks"] if c["name"] == "seal with two segments"]
+    (segment,) = [
+        s
+        for s in parse_body(sealed["body"].encode())["segments"]
+        if s["partition"] == body["partition"]
+    ]
+    covered = canonical(
+        {"seq": 2, **{k: segment[k] for k in ("stream", "rows", "root")}}
+    )
+    digest = hashlib.sha256(b"sqlalchemy-audit-trail/retire/v1\x00" + covered)
+    assert body["segments_digest"] == base64.b64encode(digest.digest()).decode()
+    assert (body["seals"], body["segments"], body["rows"]) == (
+        {"first": 2, "last": 2},
+        1,
+        1,
+    )
 
 
 def test_block_hash_checks_prev_hash() -> None:
