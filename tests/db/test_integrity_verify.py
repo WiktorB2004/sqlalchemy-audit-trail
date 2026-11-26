@@ -709,3 +709,42 @@ def test_integrity_off_changes_nothing(engine: Engine, schema: str) -> None:
     assert not {"verify", "acknowledge", "VerificationReport"} & set(
         audit_trail.__all__
     )
+
+
+def test_a_scrub_over_rows_written_before_integrity_verifies_clean(
+    engine: Engine, schema: str, models: Models
+) -> None:
+    old = make_env(engine, schema, events=[VerifyEvent], severities=Severity)
+    try:
+        with old.trail.context(ANN), old.factory() as session:
+            session.add(models.Doc(id=1, title="Old"))
+            session.commit()
+        with engine.begin() as conn:
+            migrations.add_integrity(conn, old.trail.tables)
+    finally:
+        old.trail.dispose()
+    new = AuditTrail(engine, schema=schema, **OPTIONS)
+    factory = sessionmaker(engine)
+    new.install(factory)
+    built = Env(engine, new, factory)
+    try:
+        with engine.begin() as conn:
+            migrations.write_genesis(conn, new.tables)
+        write_docs_again(built, models)
+        with new.context(ADMIN):
+            # Changes the old row too, which has nothing to stamp.
+            assert new.scrub("Doc", "1").activity_rows == 2
+        seal(built)
+        report = run(built)
+        assert report.failures == []
+        assert noted(report) == {NoteKind.PRE_GENESIS, NoteKind.ERASED}
+    finally:
+        new.dispose()
+
+
+def write_docs_again(env: Env, models: Models) -> None:
+    with env.trail.context(ANN), env.factory() as session:
+        doc = session.get(models.Doc, 1)
+        assert doc is not None
+        doc.title = "New"
+        session.commit()
