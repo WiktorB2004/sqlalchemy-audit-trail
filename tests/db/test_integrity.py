@@ -596,6 +596,64 @@ def test_add_integrity_upgrades_an_existing_install(
     check_activity(new_row)
 
 
+@pytest.fixture
+def upgraded(engine: Engine, models: Models, old_install: Env) -> Iterator[Env]:
+    """``old_install`` after add_integrity, with a new entry for the same Doc."""
+    with engine.begin() as conn:
+        migrations.add_integrity(conn, old_install.trail.tables)
+    new = trail_on(engine, old_install.trail.schema)
+    with new.trail.context(ANN), new.factory() as session:
+        session.get(models.Doc, 1).title = "New"
+        session.commit()
+    yield new
+    new.trail.dispose()
+
+
+def seal_state(env: Env) -> list[tuple[str, bool, Any]]:
+    """``(verb, seal_erased IS NULL, seal_erased)`` of each activity row."""
+    table = env.trail.tables.activity
+    with env.engine.connect() as conn:
+        rows = conn.execute(
+            select(table.c.verb, table.c.seal_erased.is_(None), table.c.seal_erased)
+            .where(table.c.verb != "audit.scrubbed")
+            .order_by(table.c.id)
+        ).all()
+    return [tuple(row) for row in rows]
+
+
+def test_scrub_stamps_no_row_written_without_integrity(upgraded: Env) -> None:
+    with upgraded.trail.context(ADMIN):
+        result = upgraded.trail.scrub("Doc", "1")
+    assert result.activity_rows == 2
+    pointer = str(scrubbed_record(upgraded)["xid"])
+    old, new = seal_state(upgraded)
+    assert old == ("entity.created", True, None)
+    stamp = {"label": pointer, "changes": pointer, "payload": pointer}
+    assert new == ("entity.updated", False, stamp)
+    old_row = upgraded.activities()[0]
+    assert old_row["object_label"] is None
+    assert old_row["seal_salts"] is None
+
+
+def test_scrub_actor_stamps_no_row_written_without_integrity(upgraded: Env) -> None:
+    with upgraded.trail.context(ADMIN):
+        result = upgraded.trail.scrub_actor("ann")
+    assert result.transaction_rows == 2
+    assert result.activity_rows == 2
+    pointer = str(scrubbed_record(upgraded)["xid"])
+    old, new = seal_state(upgraded)
+    assert old == ("entity.created", True, None)
+    assert new == ("entity.updated", False, {"actor": pointer})
+    table = upgraded.trail.tables.transaction
+    with upgraded.engine.connect() as conn:
+        stamps = conn.execute(
+            select(table.c.seal_erased.is_(None), table.c.seal_erased)
+            .where(table.c.actor_id == "ann")
+            .order_by(table.c.id)
+        ).all()
+    assert [tuple(row) for row in stamps] == [(True, None), (False, {"actor": pointer})]
+
+
 def lock_parent(engine: Engine, schema: str) -> Connection:
     """A connection holding a lock that blocks ALTER TABLE on the activity parent."""
     blocker = engine.connect()

@@ -22,6 +22,7 @@ from sqlalchemy import (
     Text,
     Update,
     and_,
+    case,
     exists,
     false,
     func,
@@ -458,7 +459,10 @@ def _seal_erased(table: Table, groups: Sequence[str]) -> dict[str, ColumnElement
     it to the scrub's transaction id: the ``audit.scrubbed`` entry is written
     in the same transaction, so it has that ``xid`` and the stamp points to
     it. ``coalesce`` is needed because ``NULL || ...`` is ``NULL``, which
-    would lose the stamp. Nothing on a table without the integrity columns.
+    would lose the stamp. A row written without integrity (``NULL``
+    ``seal_commitments``) has nothing to stamp and is left as it is; a row
+    with commitments gets every group of the operation stamped, also one it
+    has no commitment for. Nothing on a table without the integrity columns.
     """
     if not integrity_schema.has_integrity(table):
         return {}
@@ -474,9 +478,13 @@ def _seal_erased(table: Table, groups: Sequence[str]) -> dict[str, ColumnElement
     erased = func.coalesce(
         table.c[integrity_schema.ERASED], literal_column("'{}'::jsonb"), type_=JSONB
     )
+    sealed = table.c[integrity_schema.COMMITMENTS].is_not(None)
     return {
         integrity_schema.SALTS: salts,
-        integrity_schema.ERASED: erased.op("||", return_type=JSONB)(stamps),
+        integrity_schema.ERASED: case(
+            (sealed, erased.op("||", return_type=JSONB)(stamps)),
+            else_=table.c[integrity_schema.ERASED],
+        ),
     }
 
 
