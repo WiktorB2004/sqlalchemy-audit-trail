@@ -54,6 +54,8 @@ from sqlalchemy.schema import CreateIndex, CreateTable
 
 from audit_trail import _pg
 from audit_trail.integrity import _schema as integrity_schema
+from audit_trail.integrity import _seal
+from audit_trail.integrity._seal import Genesis
 from audit_trail.tables import AuditTables
 
 logger = logging.getLogger(__name__)
@@ -486,6 +488,34 @@ def add_integrity_indexes(
         if not connection.invalidated:
             _pg.set_config(connection, "lock_timeout", previous, local=False)
     return builder.built
+
+
+def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
+    """Start the hash chain of the audit log with its genesis block.
+
+    The last step of turning integrity on, after ``add_integrity`` and
+    ``add_integrity_indexes``, and only once every writer runs with
+    ``Integrity``. The block records ``enforce_from``, the horizon
+    ``pg_snapshot_xmin(pg_current_snapshot())`` at this moment: rows with a
+    lower ``xid`` are out of scope, and every later row must carry
+    commitments. Calling it again returns the existing genesis block. It
+    takes the sealer's advisory lock and runs in the connection's current
+    transaction; the caller commits. Private for now.
+
+    Args:
+        connection: Connection that may insert into ``audit_seal_block``,
+            not in ``AUTOCOMMIT`` mode.
+        tables: Audit tables built with integrity.
+
+    Returns:
+        The genesis block, and whether this call wrote it.
+
+    Raises:
+        ValueError: The tables were built without integrity, the connection
+            is in ``AUTOCOMMIT`` mode, or the block table holds blocks but no
+            genesis block.
+    """
+    return _seal.write_genesis(connection, tables)
 
 
 _TABLE = text(
