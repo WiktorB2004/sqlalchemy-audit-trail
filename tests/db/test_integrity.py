@@ -632,7 +632,7 @@ def test_inet_text_matches_postgres(engine: Engine, address: tuple[Any, int]) ->
     assert inet_text(shown) == shown
 
 
-def test_create_tables_with_integrity_on_postgres_14_too(
+def test_create_tables_with_integrity_gives_partitions_the_columns(
     engine: Engine, schema: str
 ) -> None:
     tables = build_tables(schema=schema, integrity=True)
