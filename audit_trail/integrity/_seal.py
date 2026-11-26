@@ -27,7 +27,7 @@ from typing import Any, Literal
 from sqlalchemy import (
     BigInteger,
     Connection,
-    Select,
+    Integer,
     Table,
     func,
     insert,
@@ -37,6 +37,7 @@ from sqlalchemy import (
     union_all,
 )
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.sql.selectable import Subquery
 
 from audit_trail.integrity import _schema
 from audit_trail.integrity._block import (
@@ -63,6 +64,9 @@ DEFAULT_MAX_SEAL_LAG = timedelta(minutes=5)
 transactions."""
 
 _UNIQUE_VIOLATION = "23505"
+
+UNSEALED_ROWS_CAP = 10_000
+"""``health`` counts unsealed rows up to this many."""
 
 # Rows fetched per round trip while streaming a block's rows.
 _CHUNK = 2_000
@@ -130,8 +134,10 @@ class SealHealth:
         started: Whether the chain has a genesis block.
         sealed_to: The ``xid`` the chain is sealed up to (exclusive).
         last_sealed_at: When the block holding ``sealed_to`` was written.
-        unsealed_rows: Committed rows at or above ``sealed_to``.
-        seal_lag: Age of the oldest of them, ``None`` when there is none.
+        unsealed_rows: Committed rows at or above ``sealed_to``, counted up
+            to ``UNSEALED_ROWS_CAP``.
+        seal_lag: Age of the unsealed entry with the lowest ``xid`` in each
+            table, the older of the two, ``None`` when there is none.
         max_seal_lag: The threshold the report was made with.
         prepared: Global ids of prepared transactions in this database older
             than ``max_seal_lag``. Each holds the horizon back until it is
@@ -393,20 +399,24 @@ def seal_health(
         )
         return SealHealth(False, None, None, 0, None, max_seal_lag, prepared, problem)
     sealed_to = _xid_to(parse_body(horizon.body))
-    rows = 0
-    oldest: datetime | None = None
+    # Bounded, so each walks the (xid, id) indexes from sealed_to only.
+    columns = []
     for table, stamp in (
         (tables.transaction, tables.transaction.c.issued_at),
         (tables.activity, tables.activity.c.created_at),
     ):
-        unsealed = table.c[_schema.XID] >= sealed_to
-        count, first = connection.execute(
-            select(func.count(), func.min(stamp)).where(unsealed)
-        ).one()
-        rows += count
-        if first is not None and (oldest is None or first < oldest):
-            oldest = first
-    lag = None if oldest is None else max(now - oldest, timedelta(0))
+        xid = table.c[_schema.XID]
+        unsealed = select(literal_column("1", Integer)).where(xid >= sealed_to)
+        capped = unsealed.order_by(xid).limit(UNSEALED_ROWS_CAP).subquery()
+        columns.append(select(func.count()).select_from(capped).scalar_subquery())
+        lowest = select(stamp).where(xid >= sealed_to).order_by(xid).limit(1)
+        columns.append(lowest.scalar_subquery())
+    counted, first, counted_activity, first_activity = connection.execute(
+        select(*columns)
+    ).one()
+    rows = min(counted + counted_activity, UNSEALED_ROWS_CAP)
+    stamps = [stamp for stamp in (first, first_activity) if stamp is not None]
+    lag = max(now - min(stamps), timedelta(0)) if stamps else None
     return SealHealth(
         True, sealed_to, horizon.sealed_at, rows, lag, max_seal_lag, prepared
     )
@@ -472,21 +482,33 @@ def _xid_to(body: Mapping[str, Any]) -> int:
 
 
 def _xids(
-    tables: AuditTables, lower: int, upper: int, *, above: int | None = None
-) -> Select[Any]:
-    """Every row's ``xid`` in ``[lower, upper)`` of both tables, in order.
+    tables: AuditTables,
+    upper: int,
+    limit: int,
+    *,
+    lower: int | None = None,
+    above: int | None = None,
+) -> Subquery:
+    """The lowest ``limit`` row ``xid`` values below ``upper`` of each table.
 
-    With ``above``, only those greater than it.
+    Bounded below by ``lower`` (inclusive) or ``above`` (exclusive). Each
+    branch is an ordered ``LIMIT`` on its own table, so it reads at most
+    ``limit`` entries of the ``(xid, id)`` indexes (a Merge Append over the
+    partitions) instead of sorting the whole range; the smallest ``limit``
+    of both tables together are among them.
     """
     parts = []
     for table in (tables.transaction, tables.activity):
         xid = table.c[_schema.XID]
-        conditions = [xid >= lower, xid < upper]
+        conditions = [xid < upper]
+        if lower is not None:
+            conditions.append(xid >= lower)
         if above is not None:
             conditions.append(xid > above)
-        parts.append(select(xid.label("xid")).where(*conditions))
-    xids = union_all(*parts).subquery("xids")
-    return select(xids.c.xid).order_by(xids.c.xid)
+        branch = select(xid.label("xid")).where(*conditions)
+        ordered = branch.order_by(xid).limit(limit).subquery()
+        parts.append(select(ordered.c.xid))
+    return union_all(*parts).subquery("xids")
 
 
 def _cut(
@@ -498,23 +520,33 @@ def _cut(
 ) -> tuple[int | None, bool]:
     """The upper bound of the block and whether ``max_rows`` lowered it.
 
-    ``None`` when ``[lower, horizon)`` has no rows.
+    ``None`` when ``[lower, horizon)`` has no rows. Reads at most
+    ``max_rows + 1`` index entries per table.
     """
-    xids = _xids(tables, lower, horizon)
-    first: int | None = connection.execute(xids.limit(1)).scalar_one_or_none()
-    if first is None:
+    xids = _xids(tables, horizon, max_rows + 1, lower=lower)
+    # One pass over the merged branches: the first row and the one past
+    # max_rows.
+    number = func.row_number().over(order_by=xids.c.xid).label("number")
+    numbered = select(xids.c.xid, number).subquery("numbered")
+    found: list[int] = list(
+        connection.execute(
+            select(numbered.c.xid)
+            .where(numbered.c.number.in_((1, max_rows + 1)))
+            .order_by(numbered.c.number)
+        ).scalars()
+    )
+    if not found:
         return None, False
-    past: int | None = connection.execute(
-        xids.offset(max_rows).limit(1)
-    ).scalar_one_or_none()
-    if past is None:
+    if len(found) == 1:
         return horizon, False
+    first, past = found
     if past > first:
         return past, True
     # The first transaction alone has more than max_rows rows: seal it
     # whole, up to the next transaction's xid.
+    after = _xids(tables, horizon, 1, above=past)
     following: int | None = connection.execute(
-        _xids(tables, lower, horizon, above=past).limit(1)
+        select(after.c.xid).order_by(after.c.xid).limit(1)
     ).scalar_one_or_none()
     if following is None:
         return horizon, False

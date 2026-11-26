@@ -748,6 +748,32 @@ def test_seal_runs_at_repeatable_read(env: Env) -> None:
     assert "pg_snapshot_xmin(pg_current_snapshot())" in second
 
 
+def test_the_cut_and_health_read_bounded_index_ranges(env: Env) -> None:
+    write(env, 4)  # one transaction above max_rows: the cut looks past it
+    write(env)
+    tables = env.trail.tables
+    with record_statements(env.engine) as log:
+        log.recording = True
+        seal(env, max_rows=2)
+        env.trail.maintenance.health()
+    audit_reads = [
+        s
+        for s in log.statements
+        if "tableoid" not in s  # the leaf rows, read between the cut bounds
+        and (tables.transaction.name in s or tables.activity.name in s)
+    ]
+    assert len(audit_reads) == 3  # first cut, the transaction after it, health
+    for statement in audit_reads:
+        # Every read of an audit table is an ordered LIMIT, which walks its
+        # (xid, id) indexes instead of sorting or counting the whole range.
+        for segment in statement.split("FROM ")[1:]:
+            name = segment.split()[0].rsplit(".", 1)[-1]
+            if name in (tables.transaction.name, tables.activity.name):
+                branch = segment.split("UNION ALL")[0]
+                assert f"ORDER BY {segment.split()[0]}.xid" in branch, statement
+                assert "LIMIT" in branch, statement
+
+
 # -- integrity off ---------------------------------------------------------------
 
 
