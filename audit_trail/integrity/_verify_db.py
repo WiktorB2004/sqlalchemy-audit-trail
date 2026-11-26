@@ -82,6 +82,8 @@ class _Options:
     streams: dict[str, timedelta | None] | None
     system_severity: int | None
     chunk_rows: int
+    partitions: frozenset[str] | None = None
+    """Read only these partitions, by name; ``None`` reads every one."""
 
 
 def _options(
@@ -238,6 +240,7 @@ def _run(
         itertools.chain([first], blocks),
         retention=options.streams,
         system_severity=options.system_severity,
+        count_scrubs=options.partitions is None,
     )
     with _read_only(conn):
         horizon, xmax = (
@@ -256,6 +259,11 @@ def _run(
             if leaf.partition.table == TRANSACTION
             else (tables.activity)
         )
+        if options.partitions is not None and (
+            leaf.partition.name not in options.partitions
+        ):
+            verifier.skip_partition(leaf.partition)
+            continue
         table = _partition_table(parent, leaf)
         try:
             verifier.check_partition(
