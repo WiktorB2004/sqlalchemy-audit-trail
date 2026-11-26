@@ -13,7 +13,15 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, MetaData, insert, select, text, update
+from sqlalchemy import (
+    Engine,
+    MetaData,
+    create_engine,
+    insert,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 import audit_trail
@@ -28,7 +36,7 @@ from audit_trail import (
     migrations,
     privacy,
 )
-from audit_trail.integrity import _seal, _verify_db
+from audit_trail.integrity import _seal
 from audit_trail.integrity._block import (
     activity_stream,
     block_hash,
@@ -43,7 +51,7 @@ from audit_trail.integrity._verify import (
     Status,
     VerificationReport,
 )
-from audit_trail.integrity._verify_db import VerifyBusyError, acknowledge, verify
+from audit_trail.integrity._verify_db import acknowledge, verify
 from tests.db.listener_support import Env, make_env, record_statements
 
 pytestmark = pytest.mark.filterwarnings("ignore:Did not recognize type 'xid8'")
@@ -716,17 +724,17 @@ def test_acknowledge_refuses_what_it_cannot_waive(
         acknowledge(conn, env.trail.tables, kind, scope, "why")
 
 
-def test_one_verify_at_a_time(env: Env) -> None:
-    block = _seal.block_table(env.trail.tables)
-    with env.engine.connect() as holder:
-        holder.execute(
-            text("SELECT pg_advisory_lock(hashtext(:key))"),
-            {"key": _verify_db.verify_lock_key(block)},
-        )
-        with pytest.raises(VerifyBusyError):
-            run(env)
-        holder.execute(text("SELECT pg_advisory_unlock_all()"))
-    assert run(env).status is Status.VALID
+def test_verify_needs_one_connection(env: Env, database_url: str) -> None:
+    # It takes no lock and holds nothing between its short transactions, so
+    # a pool of one does, and two runs side by side do not block each other.
+    single = create_engine(database_url, pool_size=1, max_overflow=0, pool_timeout=5)
+    try:
+        assert verify(single, env.trail.tables).status is Status.VALID
+        with env.engine.connect() as other:
+            other.execute(text("SELECT 1"))
+            assert verify(single, env.trail.tables).status is Status.VALID
+    finally:
+        single.dispose()
 
 
 # -- integrity off ---------------------------------------------------------------

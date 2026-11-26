@@ -63,19 +63,33 @@ _BLOCK_CHUNK = 1_000
 _XMAX = text("SELECT pg_snapshot_xmax(pg_current_snapshot())::text")
 
 
-class VerifyBusyError(RuntimeError):
-    """Another ``verify`` of the same chain is running."""
-
-
 @dataclass(frozen=True)
 class _Leaf:
     partition: Partition
     schema: str
 
 
-def verify_lock_key(block: Table) -> str:
-    """Key of the advisory lock that lets one ``verify`` of a chain run."""
-    return f"audit_trail.verify:{block.schema}.{block.name}"
+@dataclass(frozen=True)
+class _Options:
+    """What a run takes besides the connection and the tables."""
+
+    streams: dict[str, timedelta | None] | None
+    system_severity: int | None
+    chunk_rows: int
+
+
+def _options(
+    retention: Mapping[int, timedelta | None] | None,
+    transaction_retention: timedelta | None,
+    system_severity: int | None,
+    chunk_rows: int,
+) -> _Options:
+    if chunk_rows < 1:
+        raise ValueError("chunk_rows must be at least 1")
+    streams = None
+    if retention is not None:
+        streams = stream_retention(retention, transaction_retention)
+    return _Options(streams, system_severity, chunk_rows)
 
 
 def verify(
@@ -89,12 +103,12 @@ def verify(
 ) -> VerificationReport:
     """Check the hash chain and every row it seals; report all failures.
 
-    Private for now. Runs on connections of its own from ``engine``. One
-    run per chain at a time: a session-level advisory try-lock is held on
-    one connection, which stays idle outside a transaction while the others
-    read. The chain and the catalog are read first, then each partition in
-    chunks of ``chunk_rows`` rows, each in its own short ``READ ONLY``
-    transaction, keyset-paged by ``(xid, id)``.
+    Private for now. Runs on one connection of its own from ``engine``,
+    which it holds only between short ``READ ONLY`` transactions; it takes
+    no lock, so runs side by side are fine and a pool of one does. The
+    chain and the catalog are read first, then each partition in chunks of
+    ``chunk_rows`` rows, each in its own transaction, keyset-paged by
+    ``(xid, id)``.
 
     Args:
         engine: An engine whose role can read the audit tables, the block
@@ -118,83 +132,59 @@ def verify(
     Raises:
         ValueError: The tables were built without integrity, the chain has
             no genesis block, or ``chunk_rows`` is below 1.
-        VerifyBusyError: Another ``verify`` of this chain is running.
     """
-    if chunk_rows < 1:
-        raise ValueError("chunk_rows must be at least 1")
+    options = _options(retention, transaction_retention, system_severity, chunk_rows)
     block = block_table(tables)
-    streams = None
-    if retention is not None:
-        streams = stream_retention(retention, transaction_retention)
-    with engine.connect() as lock:
-        key = verify_lock_key(block)
-        locked = lock.execute(
-            text("SELECT pg_try_advisory_lock(hashtext(:key))"), {"key": key}
-        ).scalar_one()
-        lock.commit()
-        if not locked:
-            raise VerifyBusyError("another verify of this chain is running")
-        try:
-            return _verify(engine, tables, block, streams, system_severity, chunk_rows)
-        finally:
-            lock.execute(
-                text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": key}
-            )
-            lock.commit()
+    with engine.connect() as conn:
+        return _verify(conn, tables, block, options)
 
 
 def _verify(
-    engine: Engine,
-    tables: AuditTables,
-    block: Table,
-    streams: dict[str, timedelta | None] | None,
-    system_severity: int | None,
-    chunk_rows: int,
+    conn: Connection, tables: AuditTables, block: Table, options: _Options
 ) -> VerificationReport:
-    with engine.connect() as conn:
-        with _read_only(conn):
-            horizon, xmax = (
-                int(value)
-                for value in conn.execute(
-                    text(
-                        "SELECT pg_snapshot_xmin(s)::text, pg_snapshot_xmax(s)::text "
-                        "FROM pg_current_snapshot() AS s"
-                    )
-                ).one()
-            )
-        stored = list(_blocks(conn, block))
-        if not stored:
-            raise ValueError(
-                f"{block.fullname} has no genesis block; run "
-                "migrations.write_genesis() first"
-            )
-        verifier = Verifier(
-            stored,
-            horizon=horizon,
-            xmax=xmax,
-            retention=streams,
-            system_severity=system_severity,
+    with _read_only(conn):
+        horizon, xmax = (
+            int(value)
+            for value in conn.execute(
+                text(
+                    "SELECT pg_snapshot_xmin(s)::text, pg_snapshot_xmax(s)::text "
+                    "FROM pg_current_snapshot() AS s"
+                )
+            ).one()
         )
+    stored = list(_blocks(conn, block))
+    if not stored:
+        raise ValueError(
+            f"{block.fullname} has no genesis block; run "
+            "migrations.write_genesis() first"
+        )
+    verifier = Verifier(
+        stored,
+        horizon=horizon,
+        xmax=xmax,
+        retention=options.streams,
+        system_severity=options.system_severity,
+    )
+    with _read_only(conn):
+        leaves, detached = _catalog(conn, tables)
+    for leaf in leaves:
+        parent = (
+            tables.transaction
+            if leaf.partition.table == TRANSACTION
+            else (tables.activity)
+        )
+        table = _partition_table(parent, leaf)
         with _read_only(conn):
-            leaves, detached = _catalog(conn, tables)
-        for leaf in leaves:
-            parent = (
-                tables.transaction
-                if leaf.partition.table == TRANSACTION
-                else (tables.activity)
-            )
-            table = _partition_table(parent, leaf)
-            with _read_only(conn):
-                nulls = conn.execute(
-                    select(func.count())
-                    .select_from(table)
-                    .where(table.c[_schema.XID].is_(None))
-                ).scalar_one()
-            verifier.null_xid_rows(leaf.partition, int(nulls))
-            verifier.check_partition(
-                leaf.partition, _rows(conn, table, chunk_rows, verifier)
-            )
-        verifier.schema(detached)
+            nulls = conn.execute(
+                select(func.count())
+                .select_from(table)
+                .where(table.c[_schema.XID].is_(None))
+            ).scalar_one()
+        verifier.null_xid_rows(leaf.partition, int(nulls))
+        verifier.check_partition(
+            leaf.partition, _rows(conn, table, options.chunk_rows, verifier)
+        )
+    verifier.schema(detached)
     return verifier.report()
 
 
