@@ -43,6 +43,7 @@ from audit_trail.migrations import (
     drop_audit_tables,
     qualified_name,
 )
+from audit_trail.query import _ACTIVITY_COLUMNS
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
@@ -406,7 +407,9 @@ def _search(
                 table.c.object_id == expected.obj.id,
             )
         )
-    statement = select(table).order_by(table.c.id)
+    statement = select(*(table.c[name] for name in _ACTIVITY_COLUMNS)).order_by(
+        table.c.id
+    )
     if near:
         statement = statement.where(or_(*near))
     candidates = [_activity(row) for row in bind.execute(statement).mappings()]

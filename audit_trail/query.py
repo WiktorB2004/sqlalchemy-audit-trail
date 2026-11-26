@@ -667,13 +667,17 @@ class AuditQuery:
             conditions.append(visibility.predicate(a))
         connection = audit_connection(session, self.tables)
         connection.execute(_CUSTOM_PLAN)
-        row = connection.execute(select(a).where(*conditions)).mappings().first()
+        row = (
+            connection.execute(select(*_read(a, _ACTIVITY_COLUMNS)).where(*conditions))
+            .mappings()
+            .first()
+        )
         if row is None:
             return None
         activity = _activity(row)
         header = (
             connection.execute(
-                select(t).where(
+                select(*_read(t, _HEADER_COLUMNS)).where(
                     t.c.id == activity["transaction_id"],
                     t.c.issued_at == activity["created_at"],
                 )
@@ -1204,14 +1208,20 @@ class AuditQuery:
         if scope is not None:
             conditions.append(scope)
         rows: dict[int, list[ActivityRow]] = {}
-        statement = select(a).where(*conditions).order_by(a.c.transaction_id, a.c.id)
+        statement = (
+            select(*_read(a, _ACTIVITY_COLUMNS))
+            .where(*conditions)
+            .order_by(a.c.transaction_id, a.c.id)
+        )
         for mapping in connection.execute(statement).mappings():
             activity = _activity(mapping)
             rows.setdefault(activity["transaction_id"], []).append(activity)
         headers = {
             mapping["id"]: mapping
             for mapping in connection.execute(
-                select(t).where(t.c.id.in_(ids), t.c.issued_at.between(low, high))
+                select(*_read(t, _HEADER_COLUMNS)).where(
+                    t.c.id.in_(ids), t.c.issued_at.between(low, high)
+                )
             ).mappings()
         }
 
@@ -1482,6 +1492,51 @@ def _referenced_ids(change: FieldChange) -> list[str] | None:
             return None
         ids.append(str(value))
     return ids
+
+
+_ACTIVITY_COLUMNS: tuple[str, ...] = (
+    "id",
+    "transaction_id",
+    "verb",
+    "severity",
+    "object_type",
+    "object_id",
+    "object_label",
+    "target_type",
+    "target_id",
+    "actor_id",
+    "scope_id",
+    "correlation_id",
+    "created_at",
+    "data",
+)
+"""The ``audit_activity`` columns an ``ActivityRow`` is read from.
+
+Reads list them instead of selecting the table, so they never return the
+integrity columns (salts among them) and work on tables without them.
+"""
+
+_HEADER_COLUMNS: tuple[str, ...] = (
+    "id",
+    "issued_at",
+    "actor_type",
+    "actor_id",
+    "actor_label",
+    "remote_addr",
+    "user_agent",
+    "method",
+    "path",
+    "channel",
+    "auth_method",
+    "request_id",
+    "correlation_id",
+    "meta",
+)
+"""The ``audit_transaction`` columns a ``TransactionHeader`` is read from."""
+
+
+def _read(table: Table, names: Sequence[str]) -> list[ColumnClause[Any]]:
+    return [table.c[name] for name in names]
 
 
 def _activity(row: RowMapping) -> ActivityRow:
