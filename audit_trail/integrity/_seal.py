@@ -137,7 +137,11 @@ class SealHealth:
         unsealed_rows: Committed rows at or above ``sealed_to``, counted up
             to ``UNSEALED_ROWS_CAP``.
         seal_lag: Age of the unsealed entry with the lowest ``xid`` in each
-            table, the older of the two, ``None`` when there is none.
+            table, the older of the two, ``None`` when there is none. Age is
+            measured from the entry's own time (``issued_at``,
+            ``created_at``), not from its commit, so a transaction that ran
+            longer than ``max_seal_lag`` is flagged briefly once it commits,
+            until the next seal.
         max_seal_lag: The threshold the report was made with.
         prepared: Global ids of prepared transactions in this database older
             than ``max_seal_lag``. Each holds the horizon back until it is
@@ -359,6 +363,10 @@ def seal_health(
     max_seal_lag: timedelta = DEFAULT_MAX_SEAL_LAG,
 ) -> SealHealth:
     """Report the sealing lag and prepared transactions holding it back.
+
+    Reads at most ``UNSEALED_ROWS_CAP`` index entries per table. The lag is
+    measured from the event time of the entries (see ``SealHealth``), so a
+    long-running transaction can raise a brief lag alarm after it commits.
 
     Args:
         connection: Connection that can read the audit tables, the block

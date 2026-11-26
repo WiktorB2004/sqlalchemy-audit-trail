@@ -449,7 +449,9 @@ def health(
         now: Reference time, timezone-aware. ``None`` uses the database's
             ``now()``.
         max_seal_lag: With integrity, unsealed rows and prepared
-            transactions older than this are flagged. Private for now.
+            transactions older than this are flagged. A row's age counts
+            from its event time, so a transaction that ran longer than this
+            is flagged until the next seal after its commit. Private for now.
 
     Returns:
         The report.
