@@ -36,6 +36,7 @@ from sqlalchemy import (
     text,
     union_all,
 )
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from audit_trail.integrity import _schema
 from audit_trail.integrity._block import (
@@ -60,6 +61,8 @@ DEFAULT_MAX_ROWS = 50_000
 DEFAULT_MAX_SEAL_LAG = timedelta(minutes=5)
 """Default age past which ``health`` flags unsealed rows and prepared
 transactions."""
+
+_UNIQUE_VIOLATION = "23505"
 
 # Rows fetched per round trip while streaming a block's rows.
 _CHUNK = 2_000
@@ -215,8 +218,9 @@ def seal(
 
     The snapshot is taken just before the lock is tried, so a sealer that
     started while another one was committing can get the lock without seeing
-    that block. Its ``INSERT`` then fails on the ``seq`` primary key with an
-    ``IntegrityError``, and nothing is written; the next run goes on.
+    that block. Its ``INSERT`` then fails on the ``seq`` primary key; the
+    transaction is rolled back, nothing is written, and the call returns
+    ``skipped="busy"`` as if it had not got the lock. The next run goes on.
 
     Args:
         connection: A connection that is not in a transaction and not in
@@ -225,8 +229,9 @@ def seal(
         max_rows: Soft cap on the rows of the block, at least 1.
 
     Returns:
-        What was sealed. On a standby, and while another sealer holds the
-        lock, nothing is attempted.
+        What was sealed. On a standby, while another sealer holds the lock,
+        and when another one committed a block this snapshot does not see,
+        nothing is written.
 
     Raises:
         ValueError: ``max_rows`` is below 1, the tables were built without
@@ -244,6 +249,20 @@ def seal(
             "seal runs its own REPEATABLE READ transaction; pass a connection "
             "that is not in a transaction"
         )
+    try:
+        return _seal(connection, tables, block, max_rows)
+    except _StaleSnapshotError:
+        # The transaction was rolled back on the way out.
+        return SealResult(0, 0, None, skipped="busy")
+
+
+class _StaleSnapshotError(Exception):
+    """Another sealer committed the block number this one tried to insert."""
+
+
+def _seal(
+    connection: Connection, tables: AuditTables, block: Table, max_rows: int
+) -> SealResult:
     with connection.begin():
         # Before any query, so the snapshot is taken at REPEATABLE READ.
         connection.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
@@ -285,7 +304,12 @@ def seal(
             builder.add(stream, partition, row)
         seq = last.seq + 1
         body = seal_body(chain, seq, xid_from, xid_to, builder.segments())
-        _insert(connection, block, seq, "seal", last.block_hash, body)
+        try:
+            _insert(connection, block, seq, "seal", last.block_hash, body)
+        except IntegrityError as exc:
+            if _sqlstate(exc) == _UNIQUE_VIOLATION:
+                raise _StaleSnapshotError from exc
+            raise
         return SealResult(1, builder.rows, xid_to, capped=capped)
 
 
@@ -346,6 +370,14 @@ def seal_health(
     return SealHealth(
         True, sealed_to, horizon.sealed_at, rows, lag, max_seal_lag, prepared
     )
+
+
+def _sqlstate(exc: DBAPIError) -> str | None:
+    orig = exc.orig
+    sqlstate: str | None = getattr(orig, "sqlstate", None) or getattr(
+        orig, "pgcode", None
+    )
+    return sqlstate
 
 
 def _check_transactional(connection: Connection, name: str) -> None:

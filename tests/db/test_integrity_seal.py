@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import Engine, create_engine, insert, inspect, select, text
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.orm import sessionmaker
 
@@ -361,6 +362,31 @@ def test_a_concurrent_sealer_returns_without_sealing(
             first.join(timeout=30)
     assert second == SealResult(0, 0, None, skipped="busy")
     assert results == [SealResult(1, 2, results[0].horizon)]
+    assert [b.kind for b in check_chain(env)] == ["genesis", "seal"]
+
+
+def test_a_sealer_with_a_stale_snapshot_returns_busy(env: Env) -> None:
+    write(env)
+    others: list[SealResult] = []
+
+    def stale(
+        conn: Any, cursor: Any, statement: str, *args: Any, **kwargs: Any
+    ) -> None:
+        if "pg_try_advisory_xact_lock" in statement and not others:
+            # Take this transaction's snapshot first, then let another
+            # sealer seal and commit before this one tries the lock.
+            cursor.execute("SELECT 1")
+            cursor.fetchall()
+            others.append(seal(env))
+
+    with env.engine.connect() as conn:
+        sqlalchemy_event.listen(conn, "before_cursor_execute", stale)
+        result = _seal.seal(conn, env.trail.tables)
+        # The connection is usable: the transaction was rolled back.
+        assert not conn.in_transaction()
+        assert conn.execute(text("SELECT 1")).scalar() == 1
+    assert others[0].blocks == 1
+    assert result == SealResult(0, 0, None, skipped="busy")
     assert [b.kind for b in check_chain(env)] == ["genesis", "seal"]
 
 
