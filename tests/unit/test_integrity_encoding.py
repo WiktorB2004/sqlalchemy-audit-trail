@@ -241,8 +241,37 @@ def test_transaction_groups_use_postgres_inet_text() -> None:
         ("::102:304", "::1.2.3.4"),
         ("2001:DB8::1/128", "2001:db8::1"),
         ("2001:db8::1/64", "2001:db8::1/64"),
-        ("not an address", "not an address"),
+        ("1.2.3.4/0", "1.2.3.4/0"),
     ],
 )
 def test_inet_text(value: str, text: str) -> None:
     assert inet_text(value) == text
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # PostgreSQL stores these differently from what they look like.
+        "01.2.3.4",
+        "1.2.3/24",
+        "10/8",
+        "1.2.3.4.",
+        "::1.2.3",
+        "1.2.3.4/024",
+        # PostgreSQL rejects these.
+        " 1.2.3.4",
+        "1.2.3.4\n",
+        "1.2.3.4/33",
+        "1.2.3.4/255.255.255.0",
+        "fe80::1%eth0",
+        "::1/0128",
+        "1.2.3.4/",
+        "not an address",
+        "",
+    ],
+)
+def test_inet_text_refuses_other_forms(value: str) -> None:
+    with pytest.raises(CanonicalEncodingError) as info:
+        inet_text(value)
+    if value:
+        assert value not in str(info.value)

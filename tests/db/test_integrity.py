@@ -48,7 +48,7 @@ from audit_trail import (
     migrations,
 )
 from audit_trail.integrity import _commit
-from audit_trail.integrity._canonical import canonical
+from audit_trail.integrity._canonical import CanonicalEncodingError, canonical
 from audit_trail.integrity._commit import (
     activity_groups,
     commitment,
@@ -630,6 +630,62 @@ def test_inet_text_matches_postgres(engine: Engine, address: tuple[Any, int]) ->
         ).scalar_one()
     assert inet_text(given_text) == shown
     assert inet_text(shown) == shown
+
+
+def inet_shown(engine: Engine, value: str) -> str | None:
+    """What PostgreSQL shows for ``value`` cast to inet, ``None`` if it rejects it."""
+    with engine.connect() as conn:
+        try:
+            shown: str = conn.execute(
+                text("SELECT format('%s', CAST(:v AS inet))"), {"v": value}
+            ).scalar_one()
+        except DBAPIError:
+            return None
+    return shown
+
+
+_octet = st.integers(0, 300).map(str) | st.integers(0, 255).map(lambda n: f"0{n}")
+_space = st.sampled_from(["", " ", "\t", "\n", "\u00a0"])
+_loose_v4 = st.builds(
+    lambda octets, dot: ".".join(octets) + dot,
+    st.lists(_octet, min_size=1, max_size=5),
+    st.sampled_from(["", "."]),
+)
+_loose_v6 = st.builds(
+    lambda ip, upper, tail: (str(ip).upper() if upper else str(ip)) + tail,
+    st.ip_addresses(v=6),
+    st.booleans(),
+    st.sampled_from(["", "%eth0", "%1", ".", ":", "::"]),
+)
+_loose_prefix = st.sampled_from(["", "/", "/0", "/00", "/8", "/024", "/32"]) | (
+    st.integers(-1, 130).map(lambda n: f"/{n}")
+)
+LOOSE_ADDRESSES = st.builds(
+    lambda lead, address, prefix, trail: lead + address + prefix + trail,
+    _space,
+    _loose_v4 | _loose_v6,
+    _loose_prefix | st.just("/255.255.255.0"),
+    _space,
+)
+
+
+@settings(max_examples=300, deadline=None)
+@given(value=LOOSE_ADDRESSES)
+@example(value="01.02.03.04")
+@example(value="1.2.3/24")
+@example(value="10/8")
+@example(value="1.2.3.4.")
+@example(value="::1.2.3")
+@example(value=" 1.2.3.4")
+@example(value="1.2.3.4/024")
+@example(value="::1/0128")
+def test_inet_text_never_commits_to_another_text(engine: Engine, value: str) -> None:
+    # Either the value is refused, or PostgreSQL stores exactly that text.
+    try:
+        committed = inet_text(value)
+    except CanonicalEncodingError:
+        return
+    assert inet_shown(engine, value) == committed
 
 
 def test_create_tables_with_integrity_gives_partitions_the_columns(

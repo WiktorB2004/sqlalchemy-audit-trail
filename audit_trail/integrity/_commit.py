@@ -36,7 +36,7 @@ import secrets
 from collections.abc import Mapping
 from typing import TypedDict
 
-from audit_trail.integrity._canonical import canonical
+from audit_trail.integrity._canonical import CanonicalEncodingError, canonical
 
 ACTOR_FIELDS: tuple[str, ...] = ("actor_label", "remote_addr", "user_agent", "meta")
 """The fields of the ``actor`` group; the same as ``privacy.ACTOR_FIELDS``."""
@@ -184,6 +184,10 @@ def transaction_groups(row: Mapping[str, object]) -> dict[str, object]:
 
     Returns:
         ``{"actor": ...}``, ``None`` when the group is not present.
+
+    Raises:
+        CanonicalEncodingError: ``remote_addr`` is not an address
+            ``inet_text`` accepts.
     """
     fields = {key: row.get(key) for key in ACTOR_FIELDS}
     remote_addr = fields["remote_addr"]
@@ -200,27 +204,52 @@ def inet_text(value: str) -> str:
     IPv4-mapped (``::ffff:a.b.c.d``) address ends in dotted IPv4. A prefix is
     shown unless it covers the whole address; host bits are kept.
 
+    Only an address in the strict form of ``ipaddress.ip_address``, with an
+    optional ``/prefix`` of plain decimal digits and no leading zero, is
+    accepted. PostgreSQL also accepts forms this function cannot match
+    safely, and stores them differently from what they look like
+    (``01.2.3.4`` is ``1.2.3.4``, ``10/8`` is ``10.0.0.0/8``, ``1.2.3.4.`` is
+    ``1.2.3.4``), so those are refused, as is anything PostgreSQL rejects.
+
     Args:
         value: An address as the host passed it, with or without a prefix.
 
     Returns:
-        The canonical text, or ``value`` unchanged when it is not an address
-        this function understands (PostgreSQL then rejects the insert, or
-        reads it its own way).
+        The canonical text.
+
+    Raises:
+        CanonicalEncodingError: The value is not an address in that form.
     """
+    address_text, slash, prefix_text = value.partition("/")
     try:
-        interface = ipaddress.ip_interface(value)
+        address = ipaddress.ip_address(address_text)
     except ValueError:
-        return value
-    address = interface.ip
-    prefix = interface.network.prefixlen
+        address = None
+    if address is None or (
+        isinstance(address, ipaddress.IPv6Address) and address.scope_id is not None
+    ):
+        raise CanonicalEncodingError(_NOT_AN_ADDRESS)
+    prefix: int = address.max_prefixlen
+    if slash:
+        if not (
+            prefix_text.isascii()
+            and prefix_text.isdigit()
+            and (prefix_text == "0" or not prefix_text.startswith("0"))
+            and int(prefix_text) <= address.max_prefixlen
+        ):
+            raise CanonicalEncodingError(_NOT_AN_ADDRESS)
+        prefix = int(prefix_text)
     if isinstance(address, ipaddress.IPv4Address):
         text = str(address)
     else:
-        if address.scope_id is not None:
-            return value
         text = _ipv6_text(address.packed)
     return text if prefix == address.max_prefixlen else f"{text}/{prefix}"
+
+
+_NOT_AN_ADDRESS = (
+    "cannot commit to a remote_addr that is not an IP address in strict form, "
+    "with an optional /prefix"
+)
 
 
 def _ipv6_text(packed: bytes) -> str:
