@@ -23,6 +23,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 import audit_trail
@@ -53,7 +54,12 @@ from audit_trail.integrity._verify import (
     Status,
     VerificationReport,
 )
-from audit_trail.integrity._verify_db import acknowledge, verify
+from audit_trail.integrity._verify_db import (
+    aacknowledge,
+    acknowledge,
+    averify,
+    verify,
+)
 from tests.db.listener_support import Env, make_env, record_statements
 
 pytestmark = pytest.mark.filterwarnings("ignore:Did not recognize type 'xid8'")
@@ -900,6 +906,46 @@ def test_verify_needs_one_connection(env: Env, database_url: str) -> None:
             assert verify(single, env.trail.tables).status is Status.VALID
     finally:
         single.dispose()
+
+
+# -- async ---------------------------------------------------------------------
+
+
+async def test_averify_and_aacknowledge_on_an_async_engine(
+    env: Env, async_engine: AsyncEngine
+) -> None:
+    tables = env.trail.tables
+    assert (await averify(async_engine, tables)).status is Status.VALID
+    activity = table_name(env, "activity")
+    row_id = first_id(env, "entity.created")
+    execute(env, f"UPDATE {activity} SET object_id = '9' WHERE id = :id", id=row_id)
+    assert failed(await averify(async_engine, tables)) == {FailureKind.ROOT_MISMATCH}
+    async with async_engine.connect() as conn:
+        seq = await aacknowledge(conn, tables, "ROOT_MISMATCH", {"seq": 2}, "why")
+    report = await averify(async_engine, tables)
+    assert report.failures == []
+    assert [(f.waived, f.ack) for f in report.notes] == [
+        (FailureKind.ROOT_MISMATCH, seq)
+    ]
+    assert report == run(env)
+    with pytest.raises(TypeError, match="use averify"):
+        verify(async_engine, tables)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="use verify"):
+        await averify(env.engine, tables)  # type: ignore[arg-type]
+
+
+async def test_averify_reads_a_dropped_partition_again(
+    env: Env, async_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The driver's error for a vanished relation is recognised.
+    def drop_expired() -> None:
+        retire(env, LONG_AGO)
+        drop_partition(env, "transaction")
+
+    after_catalog(monkeypatch, drop_expired)
+    report = await averify(async_engine, env.trail.tables)
+    assert report.failures == []
+    assert noted(report) == {NoteKind.RETIRED}
 
 
 # -- integrity off ---------------------------------------------------------------

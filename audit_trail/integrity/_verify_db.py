@@ -31,6 +31,7 @@ from sqlalchemy import (
     tuple_,
 )
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from audit_trail import _pg
 from audit_trail.integrity import _schema
@@ -139,13 +140,44 @@ def verify(
         The report.
 
     Raises:
+        TypeError: The engine is an ``AsyncEngine``; use ``averify``.
         ValueError: The tables were built without integrity, the chain has
             no genesis block, or ``chunk_rows`` is below 1.
     """
+    if not isinstance(engine, Engine):
+        raise TypeError("the engine is async; use averify")
     options = _options(retention, transaction_retention, system_severity, chunk_rows)
     block = block_table(tables)
     with engine.connect() as conn:
         return _verify(conn, tables, block, options)
+
+
+async def averify(
+    engine: AsyncEngine,
+    tables: AuditTables,
+    *,
+    retention: Mapping[int, timedelta | None] | None = None,
+    transaction_retention: timedelta | None = None,
+    system_severity: int | None = None,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+) -> VerificationReport:
+    """Async ``verify``, for an ``AsyncEngine``; the same arguments.
+
+    Private for now. Runs ``verify``'s reads on one connection through
+    ``run_sync``.
+
+    Raises:
+        TypeError: The engine is a sync ``Engine``; use ``verify``.
+        ValueError: As ``verify``.
+    """
+    if not isinstance(engine, AsyncEngine):
+        raise TypeError("the engine is sync; use verify")
+    options = _options(retention, transaction_retention, system_severity, chunk_rows)
+    block = block_table(tables)
+    async with engine.connect() as conn:
+        return await conn.run_sync(
+            lambda sync_conn: _verify(sync_conn, tables, block, options)
+        )
 
 
 class _Vanished(Exception):
@@ -455,3 +487,40 @@ def acknowledge(
         )
         _insert(connection, block, seq, "ack", bytes(last.block_hash), body)
     return seq
+
+
+async def aacknowledge(
+    connection: AsyncConnection,
+    tables: AuditTables,
+    kind: FailureKind | str,
+    scope: Mapping[str, object],
+    reason: str,
+    *,
+    retention: Mapping[int, timedelta | None] | None = None,
+    transaction_retention: timedelta | None = None,
+    system_severity: int | None = None,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+) -> int:
+    """Async ``acknowledge``, on an ``AsyncConnection``; the same arguments.
+
+    Private for now. Runs ``acknowledge`` through ``run_sync``.
+
+    Returns:
+        The ``seq`` of the ack block.
+
+    Raises:
+        ValueError: As ``acknowledge``.
+    """
+    return await connection.run_sync(
+        lambda sync_conn: acknowledge(
+            sync_conn,
+            tables,
+            kind,
+            scope,
+            reason,
+            retention=retention,
+            transaction_retention=transaction_retention,
+            system_severity=system_severity,
+            chunk_rows=chunk_rows,
+        )
+    )
