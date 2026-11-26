@@ -60,6 +60,7 @@ from audit_trail.integrity._types import Xid8
 from audit_trail.maintenance import ensure_partitions
 from audit_trail.migrations import create_audit_tables
 from audit_trail.tables import build_tables
+from audit_trail.writer import AuditWriteError
 from tests.db.listener_support import (
     SESSION_KINDS,
     Env,
@@ -83,11 +84,14 @@ ANN = AuditContext(
     extra={"tenant": 7, "ratio": -0.0},
 )
 ADMIN = AuditContext(actor_type="user", actor_id="admin", actor_label="Admin")
+# PostgreSQL stores 01.2.3.4 as 1.2.3.4, so no commitment is made to it.
+LOOSE_ADDR = AuditContext(actor_type="user", actor_id="ann", remote_addr="01.2.3.4")
 
 
 class IntegrityEvent(AuditEvent):
     NOTED = event("integrity_test.noted", Severity.INFO)
     KEPT = event("integrity_test.kept", Severity.INFO, durable=True)
+    GUARDED = event("integrity_test.guarded", Severity.INFO, fail_closed=True)
 
 
 @dataclass
@@ -281,6 +285,140 @@ def test_a_durable_retry_never_reuses_a_salt(
     assert len(set(drawn)) == 4
     check_transaction(transaction)
     check_activity(activity)
+
+
+# -- write failures follow on_error ---------------------------------------------
+
+
+def trail_on(engine: Engine, schema: str, **options: Any) -> Env:
+    """An installed ``AuditTrail`` on tables that already exist."""
+    trail = AuditTrail(engine, schema=schema, **{**OPTIONS, **options})
+    factory = sessionmaker(engine)
+    trail.install(factory)
+    return Env(engine, trail, factory)
+
+
+def doc_count(env: Env) -> int:
+    with env.engine.connect() as conn:
+        count: int = conn.execute(
+            text(f'SELECT count(*) FROM "{env.trail.schema}".doc')
+        ).scalar_one()
+    return count
+
+
+def test_an_encoder_refusal_is_logged_under_log(
+    env: Env, models: Models, caplog: pytest.LogCaptureFixture
+) -> None:
+    with env.trail.context(LOOSE_ADDR), env.factory() as session:
+        session.add(models.Doc(id=1, title="Kept"))
+        session.flush()
+        env.trail.log(session, IntegrityEvent.NOTED, payload={"a": 1})
+        session.commit()
+    assert doc_count(env) == 1
+    assert env.activities() == []
+    assert "Audit entries were not written" in caplog.text
+    assert "CanonicalEncodingError" in caplog.text
+
+
+def test_an_encoder_refusal_of_a_payload_is_logged(
+    env: Env, models: Models, caplog: pytest.LogCaptureFixture
+) -> None:
+    with env.trail.context(ANN), env.factory() as session:
+        session.add(models.Doc(id=1, title="Kept"))
+        env.trail.log(session, IntegrityEvent.NOTED, payload={"big": 10**4300})
+        session.commit()
+    assert doc_count(env) == 1
+    assert [row["verb"] for row in env.activities()] == ["entity.created"]
+    assert "more than 4300 digits" in caplog.text
+
+
+def test_an_encoder_refusal_raises_under_raise(
+    engine: Engine, schema: str, models: Models
+) -> None:
+    env = make_env(engine, schema, on_error="raise", **OPTIONS)
+    try:
+        with env.trail.context(LOOSE_ADDR), env.factory() as session:
+            session.add(models.Doc(id=1))
+            with pytest.raises(CanonicalEncodingError):
+                session.flush()
+    finally:
+        env.trail.dispose()
+    assert doc_count(env) == 0
+
+
+def test_a_durable_encoder_refusal_follows_on_error(
+    engine: Engine, schema: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    logged = make_env(engine, schema, **OPTIONS)
+    raising = trail_on(engine, schema, on_error="raise")
+    try:
+        with logged.trail.context(LOOSE_ADDR), logged.factory() as session:
+            logged.trail.log(session, IntegrityEvent.KEPT, payload={"a": 1})
+        assert "A durable audit entry was not written" in caplog.text
+        for writer, event_ in (
+            (raising, IntegrityEvent.KEPT),
+            (logged, IntegrityEvent.GUARDED),
+        ):
+            with (
+                writer.trail.context(LOOSE_ADDR),
+                writer.factory() as session,
+                pytest.raises(AuditWriteError) as info,
+            ):
+                writer.trail.log(session, event_, payload={"a": 1})
+            assert isinstance(info.value.__cause__, CanonicalEncodingError)
+    finally:
+        logged.trail.dispose()
+        raising.trail.dispose()
+    assert logged.transactions() == []
+
+
+@pytest.fixture
+def without_columns(engine: Engine, schema: str, models: Models) -> None:
+    """Audit tables created without the integrity columns."""
+    make_env(engine, schema, events=[IntegrityEvent], severities=Severity)
+
+
+@pytest.mark.usefixtures("without_columns")
+def test_missing_columns_name_add_integrity_under_log(
+    engine: Engine, schema: str, models: Models, caplog: pytest.LogCaptureFixture
+) -> None:
+    env = trail_on(engine, schema)
+    try:
+        with env.trail.context(ANN), env.factory() as session:
+            session.add(models.Doc(id=1))
+            session.commit()
+            env.trail.log(session, IntegrityEvent.KEPT, payload={"a": 1})
+    finally:
+        env.trail.dispose()
+    assert doc_count(env) == 1
+    assert caplog.text.count("migrations.add_integrity()") == 2
+
+
+@pytest.mark.usefixtures("without_columns")
+def test_missing_columns_name_add_integrity_under_raise(
+    engine: Engine, schema: str, models: Models
+) -> None:
+    env = trail_on(engine, schema, on_error="raise")
+    logged = trail_on(engine, schema)
+    try:
+        with env.trail.context(ANN), env.factory() as session:
+            session.add(models.Doc(id=1))
+            with pytest.raises(DBAPIError) as flushed:
+                session.flush()
+        assert any("migrations.add_integrity()" in n for n in flushed.value.__notes__)
+        for writer, event_ in (
+            (env, IntegrityEvent.KEPT),
+            (logged, IntegrityEvent.GUARDED),
+        ):
+            with (
+                writer.trail.context(ANN),
+                writer.factory() as session,
+                pytest.raises(AuditWriteError, match=r"add_integrity\(\)"),
+            ):
+                writer.trail.log(session, event_, payload={"a": 1})
+    finally:
+        env.trail.dispose()
+        logged.trail.dispose()
 
 
 def scrubbed_record(env: Env) -> RowMapping:

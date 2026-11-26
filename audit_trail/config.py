@@ -481,7 +481,12 @@ class AuditTrail:
                     auto_create_partitions=self.auto_create_partitions,
                 )
         except DURABLE_WRITE_ERRORS as exc:
-            handle_durable_failure(exc, self.on_error, entry.flags.fail_closed)
+            handle_durable_failure(
+                exc,
+                self.on_error,
+                entry.flags.fail_closed,
+                integrity=self.integrity is not None,
+            )
 
     @overload
     async def alog(
@@ -601,7 +606,12 @@ class AuditTrail:
                     auto_create_partitions=self.auto_create_partitions,
                 )
         except async_durable_write_errors() as exc:
-            handle_durable_failure(exc, self.on_error, entry.flags.fail_closed)
+            handle_durable_failure(
+                exc,
+                self.on_error,
+                entry.flags.fail_closed,
+                integrity=self.integrity is not None,
+            )
 
     def scrub(
         self,
