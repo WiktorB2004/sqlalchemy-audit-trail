@@ -297,6 +297,72 @@ def horizon_of(body: Mapping[str, Any]) -> int:
     return int(body["xid_to"])
 
 
+def ack_body(
+    chain: str, seq: int, *, failure: str, scope: Mapping[str, object], reason: str
+) -> bytes:
+    """Body of an ack block, which waives one kind of failure in a scope.
+
+    Args:
+        chain: The chain id.
+        seq: The block's number.
+        failure: Name of the failure kind it waives.
+        scope: The findings it covers, as the verifier matches them.
+        reason: Why, as the operator wrote it.
+    """
+    return _body(
+        {
+            "v": FORMAT_VERSION,
+            "kind": "ack",
+            "chain": chain,
+            "seq": seq,
+            "failure": failure,
+            "scope": dict(scope),
+            "reason": reason,
+        }
+    )
+
+
+def retire_body(
+    chain: str,
+    seq: int,
+    *,
+    stream: str,
+    partition: str,
+    upper_bound: datetime,
+    retention: int | None,
+    rows: int,
+    segments_digest: bytes,
+) -> bytes:
+    """Body of a retire block, written before a partition is dropped.
+
+    Args:
+        chain: The chain id.
+        seq: The block's number.
+        stream: The partition's stream.
+        partition: Name of the partition, without schema.
+        upper_bound: The partition's exclusive upper bound.
+        retention: The retention it was dropped under, in whole seconds;
+            ``None`` when it had none.
+        rows: Rows the partition held.
+        segments_digest: SHA-256 over the roots of its segments, in chain
+            order.
+    """
+    return _body(
+        {
+            "v": FORMAT_VERSION,
+            "kind": "retire",
+            "chain": chain,
+            "seq": seq,
+            "stream": stream,
+            "partition": partition,
+            "upper_bound": rfc3339(upper_bound),
+            "retention": retention,
+            "rows": rows,
+            "segments_digest": b64(segments_digest),
+        }
+    )
+
+
 def block_hash(prev_hash: bytes, body: bytes) -> bytes:
     """The hash chaining a block to the one before it."""
     if len(prev_hash) != 32:
