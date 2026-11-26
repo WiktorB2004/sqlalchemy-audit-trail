@@ -37,7 +37,6 @@ from sqlalchemy.orm import Session
 from audit_trail._compaction import ActivityRow
 from audit_trail.config import Target
 from audit_trail.diff import format_target, object_id_of, object_type_of
-from audit_trail.integrity._schema import block_table_of
 from audit_trail.maintenance import ensure_partitions
 from audit_trail.migrations import (
     create_audit_tables,
@@ -343,7 +342,7 @@ def clear_audit_entries(audit: AuditTrail, connection: Connection) -> None:
         audit: The ``AuditTrail`` whose tables are emptied.
         connection: Connection to run on.
     """
-    block = block_table_of(audit.tables.metadata)
+    block = audit.tables.seal_block
     names = ", ".join(
         qualified_name(table.schema, table.name)
         for table in (

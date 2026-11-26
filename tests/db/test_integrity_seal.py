@@ -43,7 +43,6 @@ from audit_trail.integrity._block import (
 )
 from audit_trail.integrity._commit import leaf_hash
 from audit_trail.integrity._options import Integrity
-from audit_trail.integrity._schema import block_table_of
 from audit_trail.integrity._seal import SealRefusedError, SealResult
 from audit_trail.maintenance import PartitionManager, health
 from audit_trail.migrations import create_sql
@@ -365,6 +364,43 @@ def test_a_concurrent_sealer_returns_without_sealing(
     assert [b.kind for b in check_chain(env)] == ["genesis", "seal"]
 
 
+def test_two_sets_of_tables_in_one_schema_seal_independently(
+    env: Env, schema: str
+) -> None:
+    other = build_tables(
+        schema=schema,
+        transaction_table="other_transaction",
+        activity_table="other_activity",
+        seal_block_table="other_seal_block",
+        integrity=True,
+    )
+    manager = PartitionManager(env.engine, other, Severity)
+    with env.engine.begin() as conn:
+        migrations.create_audit_tables(conn, other, Severity)
+    manager.ensure_partitions()
+    with env.engine.begin() as conn:
+        assert migrations.write_genesis(conn, other).created is True
+        insert_transaction(conn, other.transaction, transaction_values(ANN, None))
+    write(env)
+    own = _seal.block_table(env.trail.tables)
+    with env.engine.connect() as holder:
+        # The sealer lock of the first chain does not hold the other back.
+        holder.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {"key": _seal.lock_key(own)},
+        )
+        assert seal(env) == SealResult(0, 0, None, skipped="busy")
+        sealed = manager.seal()
+        holder.rollback()
+    assert (sealed.blocks, sealed.rows) == (1, 1)
+    assert seal(env).rows == 2
+    with env.engine.connect() as conn:
+        block = _seal.block_table(other)
+        kinds = conn.execute(select(block.c.kind).order_by(block.c.seq)).scalars()
+        assert list(kinds) == ["genesis", "seal"]
+    assert [b.kind for b in check_chain(env)] == ["genesis", "seal"]
+
+
 def qualified(table: Any) -> str:
     return f'"{table.schema}"."{table.name}"'
 
@@ -648,7 +684,7 @@ def test_seal_runs_at_repeatable_read(env: Env) -> None:
 def test_without_integrity_nothing_changes(engine: Engine, schema: str) -> None:
     env = make_env(engine, schema, events=[SealEvent], severities=Severity)
     tables = env.trail.tables
-    assert block_table_of(tables.metadata) is None
+    assert tables.seal_block is None
     assert "audit_seal_block" not in inspect(engine).get_table_names(schema=schema)
     assert "audit_seal_block" not in create_sql(tables, Severity)
     assert "audit_seal_block" not in migrations.drop_sql(tables)

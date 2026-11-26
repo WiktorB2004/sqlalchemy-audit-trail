@@ -210,7 +210,7 @@ def create_statements(tables: AuditTables, severities: Iterable[int]) -> list[st
         statements.append(
             f"CREATE SCHEMA IF NOT EXISTS {_PREPARER.quote_schema(schema)}"
         )
-    block = integrity_schema.block_table_of(tables.metadata)
+    block = tables.seal_block
     created = [tables.transaction, tables.activity, *([] if block is None else [block])]
     for table in created:
         statements.append(_compile(CreateTable(table)))
@@ -237,7 +237,7 @@ def drop_statements(tables: AuditTables) -> list[str]:
     Returns:
         The statements, in order, without trailing semicolons.
     """
-    block = integrity_schema.block_table_of(tables.metadata)
+    block = tables.seal_block
     return [
         f"DROP TABLE IF EXISTS {qualified_name(t.schema, t.name)}"
         for t in (
@@ -338,9 +338,9 @@ def add_integrity_statements(tables: AuditTables) -> list[str]:
             f"ALTER TABLE {name} ALTER COLUMN {integrity_schema.XID} "
             f"SET DEFAULT {integrity_schema.XID_DEFAULT}"
         )
-    block = integrity_schema.block_table_of(
-        tables.metadata
-    ) or integrity_schema.block_table(MetaData(schema=tables.transaction.schema))
+    block = tables.seal_block
+    if block is None:
+        block = integrity_schema.block_table(MetaData(schema=tables.transaction.schema))
     statements.append(_compile(CreateTable(block, if_not_exists=True)))
     statements.extend(
         _compile(CreateIndex(index, if_not_exists=True))

@@ -81,11 +81,14 @@ class AuditTables:
         metadata: Metadata holding both tables and the activity indexes.
         transaction: The ``audit_transaction`` table.
         activity: The ``audit_activity`` table.
+        seal_block: The ``audit_seal_block`` table of sealed blocks, declared
+            only with integrity, else ``None``.
     """
 
     metadata: MetaData
     transaction: Table
     activity: Table
+    seal_block: Table | None = None
 
 
 def audit_connection(
@@ -120,6 +123,7 @@ def build_tables(
     schema: str = "audit",
     transaction_table: str = "audit_transaction",
     activity_table: str = "audit_activity",
+    seal_block_table: str = integrity_schema.BLOCK_TABLE,
     indexes: Collection[str] | None = None,
     integrity: bool = False,
 ) -> AuditTables:
@@ -129,12 +133,15 @@ def build_tables(
         schema: Schema holding the tables.
         transaction_table: Name of the transaction (context) table.
         activity_table: Name of the activity (event) table.
+        seal_block_table: Name of the table of sealed blocks, declared only
+            with ``integrity``. Two sets of audit tables in one schema need
+            different names; each has a sealer and a hash chain of its own.
         indexes: Keys of the ``audit_activity`` indexes to create, from
             ``ALL_INDEXES``. ``None`` uses ``DEFAULT_INDEXES``. ``changes_gin``
             is a GIN index on ``data -> 'changes'`` and is off by default.
         integrity: Declare the integrity columns (``xid`` and the ``seal_*``
             columns) and their ``(xid, id)`` indexes on both tables, and the
-            ``audit_seal_block`` table in the same metadata. Private for now;
+            ``seal_block_table`` in the same metadata. Private for now;
             off by default, which leaves the tables as before.
 
     Returns:
@@ -148,8 +155,15 @@ def build_tables(
     _check_name(schema, "schema", 0)
     _check_name(transaction_table, "transaction_table", _PARTITION_SUFFIX_LENGTH)
     _check_name(activity_table, "activity_table", _PARTITION_SUFFIX_LENGTH)
+    _check_name(
+        seal_block_table, "seal_block_table", integrity_schema.BLOCK_SUFFIX_LENGTH
+    )
     if transaction_table == activity_table:
         raise ValueError("transaction_table and activity_table must differ")
+    if seal_block_table in (transaction_table, activity_table):
+        raise ValueError(
+            "seal_block_table must differ from transaction_table and activity_table"
+        )
     if indexes is None:
         index_keys = DEFAULT_INDEXES
     else:
@@ -210,11 +224,17 @@ def build_tables(
     )
     for key in sorted(index_keys):
         _activity_index(activity, key)
+    seal_block = None
     if integrity:
         integrity_schema.add_xid_index(transaction)
         integrity_schema.add_xid_index(activity)
-        integrity_schema.block_table(metadata)
-    return AuditTables(metadata=metadata, transaction=transaction, activity=activity)
+        seal_block = integrity_schema.block_table(metadata, seal_block_table)
+    return AuditTables(
+        metadata=metadata,
+        transaction=transaction,
+        activity=activity,
+        seal_block=seal_block,
+    )
 
 
 def _activity_index(table: Table, key: IndexKey) -> Index:

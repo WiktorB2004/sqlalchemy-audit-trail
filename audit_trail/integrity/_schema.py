@@ -74,7 +74,11 @@ def has_integrity(table: Table) -> bool:
 
 
 BLOCK_TABLE = "audit_seal_block"
-"""Name of the table of sealed blocks, in the schema of the audit tables."""
+"""Default name of the table of sealed blocks, in the schema of the audit
+tables."""
+
+# Longest suffix of a name derived from the block table's.
+BLOCK_SUFFIX_LENGTH = len("_retired_partition_key")
 
 BLOCK_KINDS: tuple[str, ...] = (
     "genesis",
@@ -87,8 +91,8 @@ BLOCK_KINDS: tuple[str, ...] = (
 """The kinds of block."""
 
 
-def block_table(metadata: MetaData) -> Table:
-    """Declare the ``audit_seal_block`` table in ``metadata``.
+def block_table(metadata: MetaData, name: str = BLOCK_TABLE) -> Table:
+    """Declare the table of sealed blocks, ``audit_seal_block``, in ``metadata``.
 
     One row per block of the hash chain, unpartitioned and small:
 
@@ -105,7 +109,7 @@ def block_table(metadata: MetaData) -> Table:
     """
     kinds = ", ".join(f"'{kind}'" for kind in BLOCK_KINDS)
     table = Table(
-        BLOCK_TABLE,
+        name,
         metadata,
         Column("seq", BigInteger, primary_key=True, autoincrement=False),
         Column("kind", Text, nullable=False),
@@ -122,19 +126,13 @@ def block_table(metadata: MetaData) -> Table:
             nullable=False,
             server_default=text("now()"),
         ),
-        CheckConstraint(f"kind IN ({kinds})", name=f"{BLOCK_TABLE}_kind_check"),
-        CheckConstraint("seq >= 1", name=f"{BLOCK_TABLE}_seq_check"),
+        CheckConstraint(f"kind IN ({kinds})", name=f"{name}_kind_check"),
+        CheckConstraint("seq >= 1", name=f"{name}_seq_check"),
     )
     Index(
-        f"{BLOCK_TABLE}_retired_partition_key",
+        f"{name}_retired_partition_key",
         table.c.retired_partition,
         unique=True,
         postgresql_where=table.c.retired_partition.is_not(None),
     )
     return table
-
-
-def block_table_of(metadata: MetaData) -> Table | None:
-    """The ``audit_seal_block`` table declared in ``metadata``, if any."""
-    key = BLOCK_TABLE if metadata.schema is None else f"{metadata.schema}.{BLOCK_TABLE}"
-    return metadata.tables.get(key)

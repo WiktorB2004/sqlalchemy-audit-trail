@@ -171,10 +171,11 @@ def test_every_read_column_reaches_the_row() -> None:
 
 
 def test_the_block_table_is_declared_only_with_integrity() -> None:
-    assert _schema.block_table_of(build_tables().metadata) is None
+    assert build_tables().seal_block is None
     tables = build_tables(integrity=True)
-    block = _schema.block_table_of(tables.metadata)
+    block = tables.seal_block
     assert block is not None
+    assert block.metadata is tables.metadata
     assert block.fullname == f"audit.{_schema.BLOCK_TABLE}"
     sql = migrations.create_sql(tables, [10])
     assert "CREATE TABLE audit.audit_seal_block" in sql
@@ -186,6 +187,32 @@ def test_the_block_table_is_declared_only_with_integrity() -> None:
     assert migrations.drop_sql(tables).startswith(
         "DROP TABLE IF EXISTS audit.audit_seal_block;"
     )
+
+
+def test_the_block_table_name_is_configurable() -> None:
+    tables = build_tables(schema="s", seal_block_table="chain", integrity=True)
+    assert tables.seal_block is not None
+    assert tables.seal_block.fullname == "s.chain"
+    sql = migrations.create_sql(tables, [10])
+    assert "CREATE TABLE s.chain" in sql
+    assert "CONSTRAINT chain_kind_check" in sql
+    assert "CREATE UNIQUE INDEX chain_retired_partition_key ON s.chain" in sql
+    assert "audit_seal_block" not in sql
+    assert "s.chain" in migrations.add_integrity_statements(tables)[-2]
+
+
+@pytest.mark.parametrize(
+    ("names", "message"),
+    [
+        ({"seal_block_table": ""}, "must not be empty"),
+        ({"seal_block_table": "b" * 42}, "longer than 41 bytes"),
+        ({"seal_block_table": "audit_activity"}, "must differ"),
+        ({"seal_block_table": "x", "transaction_table": "x"}, "must differ"),
+    ],
+)
+def test_the_block_table_name_is_checked(names: dict[str, str], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_tables(integrity=True, **names)
 
 
 def test_add_integrity_creates_the_block_table_if_missing() -> None:

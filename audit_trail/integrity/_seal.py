@@ -150,19 +150,18 @@ class SealHealth:
         return self.started and not lagging and not self.prepared
 
 
-def lock_key(tables: AuditTables) -> str:
-    """Key of the advisory lock that lets one sealer run at a time."""
-    parents = (f"{t.schema}.{t.name}" for t in (tables.transaction, tables.activity))
-    return "audit_trail.seal:" + ",".join(parents)
+def lock_key(block: Table) -> str:
+    """Key of the advisory lock that lets one sealer of a chain run at a time."""
+    return f"audit_trail.seal:{block.schema}.{block.name}"
 
 
 def block_table(tables: AuditTables) -> Table:
-    """The ``audit_seal_block`` table of tables built with integrity.
+    """The table of sealed blocks of tables built with integrity.
 
     Raises:
         ValueError: The tables were built without integrity.
     """
-    block = _schema.block_table_of(tables.metadata)
+    block = tables.seal_block
     if block is None or not _schema.has_integrity(tables.transaction):
         raise ValueError(
             "the audit tables were built without integrity; build them with "
@@ -177,7 +176,7 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
     _check_transactional(connection, "write_genesis")
     connection.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-        {"key": lock_key(tables)},
+        {"key": lock_key(block)},
     )
     first = connection.execute(
         select(block.c.kind, block.c.body).where(block.c.seq == 1)
@@ -254,7 +253,7 @@ def seal(
                 "pg_try_advisory_xact_lock(hashtext(:key)) AS locked, "
                 "pg_snapshot_xmin(pg_current_snapshot())::text AS horizon"
             ),
-            {"key": lock_key(tables)},
+            {"key": lock_key(block)},
         ).one()
         if start.standby:
             return SealResult(0, 0, None, skipped="standby")
