@@ -498,9 +498,10 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
     ``Integrity``. The block records ``enforce_from``, the horizon
     ``pg_snapshot_xmin(pg_current_snapshot())`` at this moment: rows with a
     lower ``xid`` are out of scope, and every later row must carry
-    commitments. Calling it again returns the existing genesis block. It
-    takes the sealer's advisory lock and runs in the connection's current
-    transaction; the caller commits. Private for now.
+    commitments. Calling it again returns the existing genesis block, also
+    when another call committed it after this transaction's snapshot was
+    taken. It takes the sealer's advisory lock and runs in the connection's
+    current transaction; the caller commits. Private for now.
 
     Args:
         connection: Connection that may insert into ``audit_seal_block``,

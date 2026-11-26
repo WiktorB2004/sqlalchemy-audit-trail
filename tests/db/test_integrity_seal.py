@@ -7,6 +7,7 @@ will do.
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 import uuid
@@ -226,6 +227,26 @@ def test_genesis_starts_the_chain_once(env: Env) -> None:
     }
     assert str(uuid.UUID(again.chain)) == again.chain
     assert again.enforce_from <= current_horizon(env.engine)
+
+
+def test_genesis_on_a_stale_snapshot_returns_the_committed_one(
+    engine: Engine, schema: str
+) -> None:
+    env = make_env(engine, schema, **OPTIONS)
+    tables = env.trail.tables
+    with engine.connect() as late:
+        late = late.execution_options(isolation_level="REPEATABLE READ")
+        late.execute(text("SELECT 1"))  # takes the snapshot
+        with engine.begin() as conn:
+            first = migrations.write_genesis(conn, tables)
+        again = migrations.write_genesis(late, tables)
+        # The caller's transaction is still usable.
+        assert late.execute(text("SELECT 1")).scalar() == 1
+        late.commit()
+    assert first.created is True
+    assert again == dataclasses.replace(first, created=False)
+    assert [b.kind for b in blocks(env)] == ["genesis"]
+    env.trail.dispose()
 
 
 def test_rows_below_enforce_from_are_never_sealed(engine: Engine, schema: str) -> None:

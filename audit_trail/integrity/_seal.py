@@ -181,20 +181,42 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
         {"key": lock_key(block)},
     )
-    first = connection.execute(
-        select(block.c.kind, block.c.body).where(block.c.seq == 1)
-    ).one_or_none()
-    if first is not None:
-        if first.kind != "genesis":
-            raise ValueError(f"block 1 of {block.fullname} is not a genesis block")
-        body = parse_body(first.body)
-        return Genesis(str(body["chain"]), int(body["enforce_from"]), created=False)
+    existing = _genesis(connection, block)
+    if existing is not None:
+        return existing
     if connection.execute(select(func.count()).select_from(block)).scalar_one():
         raise ValueError(f"{block.fullname} has blocks but no genesis block")
     horizon = _horizon(connection)
     chain = str(uuid.uuid4())
-    _insert(connection, block, 1, "genesis", ZERO_HASH, genesis_body(chain, horizon))
+    try:
+        # A savepoint, so a conflict leaves the caller's transaction usable.
+        with connection.begin_nested():
+            body = genesis_body(chain, horizon)
+            _insert(connection, block, 1, "genesis", ZERO_HASH, body)
+    except IntegrityError as exc:
+        if _sqlstate(exc) != _UNIQUE_VIOLATION:
+            raise
+        # Another call committed block 1 after this transaction's snapshot
+        # was taken (at REPEATABLE READ), so only a new snapshot sees it.
+        with connection.engine.connect() as fresh:
+            existing = _genesis(fresh, block)
+        if existing is None:
+            raise
+        return existing
     return Genesis(chain, horizon, created=True)
+
+
+def _genesis(connection: Connection, block: Table) -> Genesis | None:
+    """Block 1, as a genesis block that this call did not write."""
+    first = connection.execute(
+        select(block.c.kind, block.c.body).where(block.c.seq == 1)
+    ).one_or_none()
+    if first is None:
+        return None
+    if first.kind != "genesis":
+        raise ValueError(f"block 1 of {block.fullname} is not a genesis block")
+    body = parse_body(first.body)
+    return Genesis(str(body["chain"]), int(body["enforce_from"]), created=False)
 
 
 def seal(
