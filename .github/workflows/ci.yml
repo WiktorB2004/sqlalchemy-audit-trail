@@ -84,6 +84,20 @@ jobs:
       - name: Install
         run: uv sync --frozen
 
+      # The integrity tests prepare transactions; a service container takes
+      # no server options, so set it and restart.
+      - name: Enable prepared transactions
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "$PG_CONTAINER" psql -U postgres -c "ALTER SYSTEM SET max_prepared_transactions = 10"
+          docker restart "$PG_CONTAINER"
+          for _ in $(seq 30); do
+            docker exec "$PG_CONTAINER" pg_isready -U postgres && exit 0
+            sleep 1
+          done
+          exit 1
+
       # uv.lock pins the newest SQLAlchemy; older lines are swapped in here.
       - name: Install SQLAlchemy ${{ matrix.sqlalchemy }}
         if: matrix.sqlalchemy != '2.1'

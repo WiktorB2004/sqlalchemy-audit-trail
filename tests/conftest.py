@@ -3,7 +3,9 @@
 Tests under ``tests/db`` get the ``db`` marker and need PostgreSQL. They use
 ``AUDIT_TEST_DATABASE_URL`` when it is set (CI does this with a service
 container); otherwise a throwaway container is started with testcontainers.
-``AUDIT_TEST_PG_IMAGE`` picks its image (default ``postgres:18``).
+``AUDIT_TEST_PG_IMAGE`` picks its image (default ``postgres:18``). The
+server needs ``max_prepared_transactions > 0`` for the tests that prepare a
+transaction; they are skipped on a server without it.
 """
 
 from __future__ import annotations
@@ -18,6 +20,9 @@ from sqlalchemy import Engine, create_engine, make_url, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 DB_TESTS = Path(__file__).parent / "db"
+
+MAX_PREPARED_TRANSACTIONS = 10
+"""``max_prepared_transactions`` of the test server; CI sets the same."""
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -46,7 +51,11 @@ def database_url() -> Iterator[str]:
     from testcontainers.community.postgres import PostgresContainer
 
     image = os.environ.get("AUDIT_TEST_PG_IMAGE", "postgres:18")
-    with PostgresContainer(image, driver="psycopg") as pg:
+    container = PostgresContainer(image, driver="psycopg").with_command(
+        # The integrity tests prepare transactions.
+        f"postgres -c max_prepared_transactions={MAX_PREPARED_TRANSACTIONS}"
+    )
+    with container as pg:
         yield pg.get_connection_url()
 
 
