@@ -12,7 +12,9 @@ from sqlalchemy.schema import CreateTable
 
 from audit_trail import migrations
 from audit_trail._compaction import ActivityData
+from audit_trail.integrity import _schema
 from audit_trail.integrity._types import Xid8
+from audit_trail.query import _ACTIVITY_COLUMNS, _HEADER_COLUMNS
 from audit_trail.tables import build_tables
 from audit_trail.writer import Entry, TransactionRow, activity_rows
 
@@ -148,3 +150,18 @@ def test_xid8_binds_text_then_casts() -> None:
     processor = Xid8().bind_processor(DIALECT)
     assert processor is not None
     assert processor(5) == "5"
+
+
+@pytest.mark.parametrize("integrity", [False, True])
+def test_reads_list_every_column_but_the_integrity_ones(integrity: bool) -> None:
+    # A column added to a table later must be added to the read lists too, or
+    # reads silently drop it.
+    tables = build_tables(integrity=integrity)
+    left_out = {_schema.XID, *_schema.SEAL_COLUMNS}
+    for table, read in (
+        (tables.activity, _ACTIVITY_COLUMNS),
+        (tables.transaction, _HEADER_COLUMNS),
+    ):
+        names = [column.name for column in table.columns]
+        assert sorted(read) == sorted(set(names) - left_out)
+        assert len(set(read)) == len(read)

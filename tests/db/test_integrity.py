@@ -46,6 +46,7 @@ from audit_trail import (
     Severity,
     event,
     migrations,
+    testing,
 )
 from audit_trail.integrity import _commit
 from audit_trail.integrity._canonical import CanonicalEncodingError, canonical
@@ -518,6 +519,7 @@ def test_reads_never_select_integrity_columns(env: Env, models: Models) -> None:
         (group,) = page.groups
         activity = group.activities[0]
         detail = env.trail.query.get(session, activity["id"], activity["created_at"])
+        testing.assert_audited(env.trail, session, verb="entity.created")
         log.recording = False
     assert detail is not None
     selects = [s for s in log.statements if s.lstrip().upper().startswith("SELECT")]
