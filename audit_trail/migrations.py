@@ -47,7 +47,7 @@ import time
 from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, MetaData, text
 from sqlalchemy.dialects.postgresql.base import PGDialect
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.schema import CreateIndex, CreateTable
@@ -192,7 +192,8 @@ def create_statements(tables: AuditTables, severities: Iterable[int]) -> list[st
     ``audit_trail.maintenance.ensure_partitions`` before the first write, or
     every insert fails with SQLSTATE ``23514``. Indexes are created on the
     partitioned parents, so PostgreSQL adds them to every partition, including
-    the ones created later.
+    the ones created later. Tables built with integrity also get the
+    ``audit_seal_block`` table.
 
     Args:
         tables: The audit tables, from ``build_tables``.
@@ -207,13 +208,15 @@ def create_statements(tables: AuditTables, severities: Iterable[int]) -> list[st
         statements.append(
             f"CREATE SCHEMA IF NOT EXISTS {_PREPARER.quote_schema(schema)}"
         )
-    for table in (tables.transaction, tables.activity):
+    block = integrity_schema.block_table_of(tables.metadata)
+    created = [tables.transaction, tables.activity, *([] if block is None else [block])]
+    for table in created:
         statements.append(_compile(CreateTable(table)))
     statements.extend(
         create_severity_partition_sql(tables, value)
         for value in severity_values(severities)
     )
-    for table in (tables.transaction, tables.activity):
+    for table in created:
         statements.extend(
             _compile(CreateIndex(index))
             for index in sorted(table.indexes, key=lambda i: str(i.name))
@@ -232,9 +235,14 @@ def drop_statements(tables: AuditTables) -> list[str]:
     Returns:
         The statements, in order, without trailing semicolons.
     """
+    block = integrity_schema.block_table_of(tables.metadata)
     return [
         f"DROP TABLE IF EXISTS {qualified_name(t.schema, t.name)}"
-        for t in (tables.activity, tables.transaction)
+        for t in (
+            *([] if block is None else [block]),
+            tables.activity,
+            tables.transaction,
+        )
     ]
 
 
@@ -300,8 +308,10 @@ def add_integrity_statements(tables: AuditTables) -> list[str]:
     ``pg_current_xact_id()`` is ``STABLE``, so ``ADD COLUMN ... DEFAULT
     pg_current_xact_id()`` would stamp every existing row with the
     migration's own ``xid``. Existing rows keep ``xid`` ``NULL``, and the
-    column stays nullable. Every statement is idempotent. The ``(xid, id)``
-    indexes are not here: ``add_integrity_indexes`` builds them online.
+    column stays nullable. Last, the ``audit_seal_block`` table and its
+    index, in the schema of the transaction table. Every statement is
+    idempotent. The ``(xid, id)`` indexes are not here:
+    ``add_integrity_indexes`` builds them online.
 
     Args:
         tables: The audit tables.
@@ -326,6 +336,14 @@ def add_integrity_statements(tables: AuditTables) -> list[str]:
             f"ALTER TABLE {name} ALTER COLUMN {integrity_schema.XID} "
             f"SET DEFAULT {integrity_schema.XID_DEFAULT}"
         )
+    block = integrity_schema.block_table_of(
+        tables.metadata
+    ) or integrity_schema.block_table(MetaData(schema=tables.transaction.schema))
+    statements.append(_compile(CreateTable(block, if_not_exists=True)))
+    statements.extend(
+        _compile(CreateIndex(index, if_not_exists=True))
+        for index in sorted(block.indexes, key=lambda i: str(i.name))
+    )
     return statements
 
 

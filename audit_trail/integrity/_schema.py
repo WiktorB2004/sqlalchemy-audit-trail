@@ -8,8 +8,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import Column, Index, Table, text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    Column,
+    DateTime,
+    Index,
+    MetaData,
+    Table,
+    Text,
+    text,
+)
+from sqlalchemy.dialects.postgresql import BYTEA, JSONB
 
 from audit_trail.integrity._types import Xid8
 
@@ -61,3 +71,70 @@ def add_xid_index(table: Table) -> Index:
 def has_integrity(table: Table) -> bool:
     """Tell whether a table was built with the integrity columns."""
     return COMMITMENTS in table.c
+
+
+BLOCK_TABLE = "audit_seal_block"
+"""Name of the table of sealed blocks, in the schema of the audit tables."""
+
+BLOCK_KINDS: tuple[str, ...] = (
+    "genesis",
+    "seal",
+    "retire",
+    "checkpoint",
+    "ack",
+    "fork",
+)
+"""The kinds of block."""
+
+
+def block_table(metadata: MetaData) -> Table:
+    """Declare the ``audit_seal_block`` table in ``metadata``.
+
+    One row per block of the hash chain, unpartitioned and small:
+
+    - ``seq``: gapless from 1; the primary key keeps a second sealer from
+      committing a block with the same number.
+    - ``kind``: one of ``BLOCK_KINDS``; the body names it too, and only the
+      body is hashed.
+    - ``body``: the canonical bytes, stored exactly as hashed.
+    - ``prev_hash``, ``block_hash``: the chain (see ``_block.block_hash``).
+    - ``retired_partition``: set on ``retire`` blocks, unique where not null,
+      so retiring a partition twice adds no second block.
+    - ``signature``, ``key_id``, ``alg``: null unless block signing is on.
+    - ``sealed_at``: when the block was written; informational, not hashed.
+    """
+    kinds = ", ".join(f"'{kind}'" for kind in BLOCK_KINDS)
+    table = Table(
+        BLOCK_TABLE,
+        metadata,
+        Column("seq", BigInteger, primary_key=True, autoincrement=False),
+        Column("kind", Text, nullable=False),
+        Column("body", BYTEA, nullable=False),
+        Column("prev_hash", BYTEA, nullable=False),
+        Column("block_hash", BYTEA, nullable=False),
+        Column("retired_partition", Text),
+        Column("signature", BYTEA),
+        Column("key_id", Text),
+        Column("alg", Text),
+        Column(
+            "sealed_at",
+            DateTime(timezone=True),
+            nullable=False,
+            server_default=text("now()"),
+        ),
+        CheckConstraint(f"kind IN ({kinds})", name=f"{BLOCK_TABLE}_kind_check"),
+        CheckConstraint("seq >= 1", name=f"{BLOCK_TABLE}_seq_check"),
+    )
+    Index(
+        f"{BLOCK_TABLE}_retired_partition_key",
+        table.c.retired_partition,
+        unique=True,
+        postgresql_where=table.c.retired_partition.is_not(None),
+    )
+    return table
+
+
+def block_table_of(metadata: MetaData) -> Table | None:
+    """The ``audit_seal_block`` table declared in ``metadata``, if any."""
+    key = BLOCK_TABLE if metadata.schema is None else f"{metadata.schema}.{BLOCK_TABLE}"
+    return metadata.tables.get(key)

@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 from audit_trail._compaction import ActivityRow
 from audit_trail.config import Target
 from audit_trail.diff import format_target, object_id_of, object_type_of
+from audit_trail.integrity._schema import block_table_of
 from audit_trail.maintenance import ensure_partitions
 from audit_trail.migrations import (
     create_audit_tables,
@@ -336,13 +337,20 @@ def drop_test_tables(audit: AuditTrail, connection: Connection) -> None:
 def clear_audit_entries(audit: AuditTrail, connection: Connection) -> None:
     """Delete every audit entry and transaction row with ``TRUNCATE``.
 
+    With integrity on, the sealed blocks are deleted too.
+
     Args:
         audit: The ``AuditTrail`` whose tables are emptied.
         connection: Connection to run on.
     """
+    block = block_table_of(audit.tables.metadata)
     names = ", ".join(
         qualified_name(table.schema, table.name)
-        for table in (audit.tables.activity, audit.tables.transaction)
+        for table in (
+            audit.tables.activity,
+            audit.tables.transaction,
+            *([] if block is None else [block]),
+        )
     )
     connection.exec_driver_sql(
         f"TRUNCATE {names}", execution_options={"no_parameters": True}

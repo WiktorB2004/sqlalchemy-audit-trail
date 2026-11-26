@@ -165,3 +165,30 @@ def test_every_read_column_reaches_the_row() -> None:
     assert list(ActivityRow.__annotations__) == list(_ACTIVITY_COLUMNS)
     fields = {field.name for field in dataclasses.fields(TransactionHeader)}
     assert set(_HEADER_COLUMNS) <= fields
+
+
+# -- the block table ------------------------------------------------------------
+
+
+def test_the_block_table_is_declared_only_with_integrity() -> None:
+    assert _schema.block_table_of(build_tables().metadata) is None
+    tables = build_tables(integrity=True)
+    block = _schema.block_table_of(tables.metadata)
+    assert block is not None
+    assert block.fullname == f"audit.{_schema.BLOCK_TABLE}"
+    sql = migrations.create_sql(tables, [10])
+    assert "CREATE TABLE audit.audit_seal_block" in sql
+    assert "body BYTEA NOT NULL" in sql
+    assert (
+        "CREATE UNIQUE INDEX audit_seal_block_retired_partition_key ON "
+        "audit.audit_seal_block (retired_partition) WHERE retired_partition IS NOT NULL"
+    ) in sql
+    assert migrations.drop_sql(tables).startswith(
+        "DROP TABLE IF EXISTS audit.audit_seal_block;"
+    )
+
+
+def test_add_integrity_creates_the_block_table_if_missing() -> None:
+    statements = migrations.add_integrity_statements(build_tables(schema="s"))
+    assert "CREATE TABLE IF NOT EXISTS s.audit_seal_block" in statements[-2]
+    assert statements[-1].startswith("CREATE UNIQUE INDEX IF NOT EXISTS")

@@ -133,8 +133,9 @@ def build_tables(
             ``ALL_INDEXES``. ``None`` uses ``DEFAULT_INDEXES``. ``changes_gin``
             is a GIN index on ``data -> 'changes'`` and is off by default.
         integrity: Declare the integrity columns (``xid`` and the ``seal_*``
-            columns) and their ``(xid, id)`` indexes on both tables. Private
-            for now; off by default, which leaves the tables as before.
+            columns) and their ``(xid, id)`` indexes on both tables, and the
+            ``audit_seal_block`` table in the same metadata. Private for now;
+            off by default, which leaves the tables as before.
 
     Returns:
         The tables and their metadata.
@@ -212,6 +213,7 @@ def build_tables(
     if integrity:
         integrity_schema.add_xid_index(transaction)
         integrity_schema.add_xid_index(activity)
+        integrity_schema.block_table(metadata)
     return AuditTables(metadata=metadata, transaction=transaction, activity=activity)
 
 
