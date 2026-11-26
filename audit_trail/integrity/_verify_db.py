@@ -82,6 +82,7 @@ def verify(
     *,
     retention: Mapping[int, timedelta | None] | None = None,
     transaction_retention: timedelta | None = None,
+    system_severity: int | None = None,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
 ) -> VerificationReport:
     """Check the hash chain and every row it seals; report all failures.
@@ -102,6 +103,11 @@ def verify(
             retention is ``RETIRED_EARLY``.
         transaction_retention: Retention of the transaction table, as
             ``drop_expired`` takes it.
+        system_severity: Severity of the ``audit.scrubbed`` records, the
+            trail's ``system_severity``. Given, an erasure whose record was
+            sealed into a retired partition of that severity is
+            ``ERASED_RECEIPT_RETIRED``; otherwise it is
+            ``SCRUB_COUNT_MISMATCH``.
         chunk_rows: Rows read per transaction, at least 1.
 
     Returns:
@@ -127,7 +133,7 @@ def verify(
         if not locked:
             raise VerifyBusyError("another verify of this chain is running")
         try:
-            return _verify(engine, tables, block, streams, chunk_rows)
+            return _verify(engine, tables, block, streams, system_severity, chunk_rows)
         finally:
             lock.execute(
                 text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": key}
@@ -140,14 +146,19 @@ def _verify(
     tables: AuditTables,
     block: Table,
     streams: dict[str, timedelta | None] | None,
+    system_severity: int | None,
     chunk_rows: int,
 ) -> VerificationReport:
     with engine.connect() as conn:
         with _read_only(conn):
-            horizon = int(
-                conn.execute(
-                    text("SELECT pg_snapshot_xmin(pg_current_snapshot())::text")
-                ).scalar_one()
+            horizon, xmax = (
+                int(value)
+                for value in conn.execute(
+                    text(
+                        "SELECT pg_snapshot_xmin(s)::text, pg_snapshot_xmax(s)::text "
+                        "FROM pg_current_snapshot() AS s"
+                    )
+                ).one()
             )
         stored = list(_blocks(conn, block))
         if not stored:
@@ -155,7 +166,13 @@ def _verify(
                 f"{block.fullname} has no genesis block; run "
                 "migrations.write_genesis() first"
             )
-        verifier = Verifier(stored, horizon=horizon, retention=streams)
+        verifier = Verifier(
+            stored,
+            horizon=horizon,
+            xmax=xmax,
+            retention=streams,
+            system_severity=system_severity,
+        )
         with _read_only(conn):
             leaves, detached = _catalog(conn, tables)
         for leaf in leaves:

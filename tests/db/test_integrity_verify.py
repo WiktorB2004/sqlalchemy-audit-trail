@@ -460,9 +460,11 @@ def test_a_moved_pointer_is_scrub_count_mismatch(env: Env) -> None:
     )
     report = run(env)
     assert failed(report) == {FailureKind.SCRUB_COUNT_MISMATCH}
-    assert {(f.group, f.xid == 3) for f in report.failures} == {
-        ("changes", True),
-        ("changes", False),
+    # The stamp names a transaction before the row's own, and the scrub's
+    # record counts one row more than carry its stamp.
+    assert {(f.group, f.id) for f in report.failures} == {
+        ("changes", row_id),
+        ("changes", None),
     }
 
 

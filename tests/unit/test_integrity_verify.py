@@ -418,9 +418,85 @@ def test_scrubs_after_the_horizon_are_not_counted_yet() -> None:
     scrub(activities[0], 250)
     chain = Chain()
     chain.seal(240, [], activities)
-    # The scrub at 250 may still be running when the rows are read.
-    report = check(chain, [], activities, horizon=250)
+    # The scrub at 250 may still be running when the rows are read: noted,
+    # and counted by a later run.
+    report = check(chain, [], activities, horizon=250, xmax=260)
     assert report.failures == []
+    tail = [f for f in report.notes if f.kind is NoteKind.UNSEALED_TAIL]
+    assert sorted((f.xid, f.group, f.count) for f in tail) == [
+        (250, "changes", 1),
+        (250, "label", 1),
+        (250, "payload", 1),
+    ]
+
+
+def test_a_stamp_from_the_future_is_scrub_count_mismatch() -> None:
+    activities = [activity_row(1, 200)]
+    # No transaction with this xid has started: the stamp points nowhere.
+    scrub(activities[0], 10**15)
+    chain = Chain()
+    chain.seal(300, [], activities)
+    report = check(chain, [], activities)
+    assert failures(report) == {FailureKind.SCRUB_COUNT_MISMATCH}
+    assert {(f.id, f.group) for f in report.failures} == {
+        (1, "label"),
+        (1, "changes"),
+        (1, "payload"),
+    }
+    # Just below the snapshot's xmax it is a scrub still running.
+    activities = [activity_row(1, 200)]
+    scrub(activities[0], 10**15)
+    chain = Chain()
+    chain.seal(300, [], activities)
+    report = check(chain, [], activities, horizon=10**15, xmax=10**15 + 1)
+    assert report.failures == []
+
+
+def test_a_stamp_older_than_its_row_is_scrub_count_mismatch() -> None:
+    activities = [activity_row(1, 200)]
+    scrub(activities[0], 150)
+    scrubbed = record(3, 150, operation="scrub", activity_rows=1)
+    chain = Chain()
+    chain.seal(300, [], [*activities, scrubbed])
+    report = check(chain, [], [*activities, scrubbed])
+    assert failures(report) == {FailureKind.SCRUB_COUNT_MISMATCH}
+
+
+def test_a_record_before_genesis_is_no_receipt() -> None:
+    # A record written before the chain began explains no sealed erasure.
+    activities = [activity_row(1, 200)]
+    scrub(activities[0], 50)
+    scrubbed = record(900, 50, operation="scrub", activity_rows=1)
+    chain = Chain()
+    chain.seal(300, [], activities)
+    report = check(chain, [], [*activities, scrubbed])
+    assert failures(report) == {FailureKind.SCRUB_COUNT_MISMATCH}
+    assert {f.id for f in report.failures} == {1}
+
+
+def test_a_scrub_before_genesis_is_out_of_scope() -> None:
+    old = activity_row(1, 50)
+    scrub(old, 60)
+    scrubbed = record(2, 60, operation="scrub", activity_rows=1)
+    chain = Chain()
+    chain.seal(300, [], [])
+    report = check(chain, [], [old, scrubbed])
+    assert report.failures == []
+    assert {f.kind for f in report.notes} == {NoteKind.PRE_GENESIS}
+
+
+def test_a_scrub_after_genesis_counts_rows_from_before_it() -> None:
+    old = activity_row(1, 50)
+    scrub(old, 250)
+    scrubbed = record(2, 250, operation="scrub", activity_rows=1)
+    chain = Chain()
+    chain.seal(300, [], [scrubbed])
+    assert check(chain, [], [old, scrubbed]).failures == []
+    # Without the record, the stamp on the old row is unexplained.
+    assert failures(check(chain, [], [old])) == {
+        FailureKind.ROW_COUNT_MISMATCH,
+        FailureKind.SCRUB_COUNT_MISMATCH,
+    }
 
 
 def test_a_retired_receipt_is_a_note() -> None:
@@ -455,13 +531,49 @@ def test_a_retired_receipt_is_a_note() -> None:
             segments_digest=bytes(32),
         ),
     )
-    report = check(chain, [], activities)
+    report = check(chain, [], activities, system_severity=40)
     assert report.failures == []
     assert {f.kind for f in report.notes} == {
         NoteKind.ERASED,
         NoteKind.ERASED_RECEIPT_RETIRED,
         NoteKind.RETIRED,
     }
+    # The record's severity is 40: a retired partition of another stream,
+    # or no known severity, explains nothing.
+    for severity in (20, None):
+        report = check(chain, [], activities, system_severity=severity)
+        assert failures(report) == {FailureKind.SCRUB_COUNT_MISMATCH}
+
+
+def test_a_retired_receipt_must_be_in_the_records_stream() -> None:
+    activities = [activity_row(1, 200)]
+    scrub(activities[0], 250)
+    other = activity_row(3, 250)
+    other["severity"] = 30
+    chain = Chain()
+    builder = SegmentBuilder()
+    builder.add("activity.30", "audit_activity_30_p2026_01", activity_leaf_row(other))
+    segments = [*_segments_of(activities), *builder.segments()]
+    chain.add("seal", seal_body(CHAIN, chain.next, 100, 300, segments))
+    chain.sealed_to = 300
+    chain.add(
+        "retire",
+        retire_body(
+            CHAIN,
+            chain.next,
+            stream="activity.30",
+            partition="audit_activity_30_p2026_01",
+            upper_bound=datetime(2026, 2, 1, tzinfo=UTC),
+            retention=None,
+            rows=1,
+            segments_digest=bytes(32),
+        ),
+    )
+    # A retired partition of severity 30 sealed with the scrub, while the
+    # records are written at 40: the missing record is not explained.
+    report = check(chain, [], activities, system_severity=40)
+    assert failures(report) == {FailureKind.SCRUB_COUNT_MISMATCH}
+    assert NoteKind.ERASED_RECEIPT_RETIRED not in report.kinds()
 
 
 def _segments_of(activities: list[dict[str, Any]]) -> list[Any]:

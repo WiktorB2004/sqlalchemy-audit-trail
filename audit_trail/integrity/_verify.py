@@ -22,7 +22,11 @@ What it checks:
   removed, a stamp and the erased form (``ERASURE_UNEXPLAINED``); erased
   groups are counted in ``ERASED`` notes.
 - The ``audit.scrubbed`` records against the stamps that point to them, per
-  operation and group (``SCRUB_COUNT_MISMATCH``).
+  operation and group (``SCRUB_COUNT_MISMATCH``). A stamp must name a
+  transaction after its row's and before the snapshot's ``xmax``; a record
+  or stamp from before the genesis block is no receipt. Scrubs at or above
+  the horizon may still be running and are noted (``UNSEALED_TAIL``), to be
+  counted by a later run.
 - The partitions named by segments: present ones are checked, retired ones
   (a ``retire`` block) are accepted with a ``RETIRED`` note, detached or
   pending ones are ``DETACHED_PARTITION`` and absent ones
@@ -623,9 +627,15 @@ class Verifier:
         blocks: Every block of the chain, in ``seq`` order.
         horizon: ``pg_snapshot_xmin`` read before any row: every transaction
             below it had finished, so scrubs below it are counted.
+        xmax: ``pg_snapshot_xmax`` read with the horizon: no transaction at
+            or above it had started. ``None`` for the horizon itself, as on
+            an idle database.
         retention: Retention by stream (``transaction`` and
             ``activity.<severity>``), ``None`` for forever. Enables
             ``RETIRED_EARLY``; a stream without a key is not checked.
+        system_severity: Severity of the ``audit.scrubbed`` records. A
+            retired partition explains a missing record only in that
+            stream; ``None`` accepts no retired record.
     """
 
     def __init__(
@@ -633,12 +643,18 @@ class Verifier:
         blocks: Iterable[StoredBlock],
         *,
         horizon: int,
+        xmax: int | None = None,
         retention: Mapping[str, timedelta | None] | None = None,
+        system_severity: int | None = None,
     ) -> None:
         self._failures: list[Finding] = []
         self._notes: list[Finding] = []
         self._horizon = horizon
+        self._xmax = horizon if xmax is None else max(xmax, horizon)
         self._retention = retention
+        self._scrubbed_stream = (
+            None if system_severity is None else activity_stream(system_severity)
+        )
         self.incarnations: list[Incarnation] = []
         self._segments: dict[str, dict[tuple[int, str], ExpectedSegment]] = {}
         self._acks: list[Ack] = []
@@ -854,11 +870,6 @@ class Verifier:
             stream = TRANSACTION_STREAM
         else:
             stream = activity_stream(row["severity"])
-        self._count_stamps(table, row)
-        if table == ACTIVITY and row.get("verb") == SCRUBBED_VERB:
-            data = row.get("data")
-            payload = data.get("payload") if isinstance(data, Mapping) else None
-            self._records.append(_Record(xid, row_id, state.partition.name, payload))
         where = {
             "table": table,
             "partition": state.partition.name,
@@ -866,7 +877,19 @@ class Verifier:
             "xid": xid,
         }
         incarnation = self.incarnation_of(stream, row_id)
-        if incarnation is None or incarnation.is_pre_genesis(xid):
+        pre_genesis = incarnation is None or incarnation.is_pre_genesis(xid)
+        enforce_from = (incarnation or self.incarnations[0]).enforce_from
+        self._count_stamps(table, row, where, pre_genesis, enforce_from)
+        if (
+            table == ACTIVITY
+            and row.get("verb") == SCRUBBED_VERB
+            # A record from before the chain began is no receipt.
+            and not pre_genesis
+        ):
+            data = row.get("data")
+            payload = data.get("payload") if isinstance(data, Mapping) else None
+            self._records.append(_Record(xid, row_id, state.partition.name, payload))
+        if incarnation is None or pre_genesis:
             state.pre_genesis += 1
             return
         if incarnation.is_unsealed(xid):
@@ -902,14 +925,40 @@ class Verifier:
         if erased:
             state.erased += 1
 
-    def _count_stamps(self, table: str, row: Mapping[str, Any]) -> None:
+    def _count_stamps(
+        self,
+        table: str,
+        row: Mapping[str, Any],
+        where: Mapping[str, Any],
+        pre_genesis: bool,
+        enforce_from: int,
+    ) -> None:
+        """Count the stamps of a row by the scrub they name.
+
+        A scrub runs after the row was written and before the snapshot that
+        reads it; a stamp outside that names no real scrub, so no record can
+        explain it. A scrub of a row before genesis, itself before genesis,
+        is out of scope.
+        """
         stamps = row.get("seal_erased")
         if not isinstance(stamps, Mapping):
             return
         for group, value in stamps.items():
             xid = _stamp(value)
-            if xid is not None:
-                self._stamps[table][(str(group), xid)] += 1
+            if xid is None:
+                continue
+            if pre_genesis and xid < enforce_from:
+                continue
+            if xid < where["xid"] or xid >= self._xmax:
+                why = "older than its row" if xid < where["xid"] else "in the future"
+                self._fail(
+                    FailureKind.SCRUB_COUNT_MISMATCH,
+                    f"group {group}: the stamp names a scrub {why}",
+                    group=str(group),
+                    **where,
+                )
+                continue
+            self._stamps[table][(str(group), xid)] += 1
 
     def _close(
         self, state: _PartitionState, *, before: int | None = None, final: bool = False
@@ -1002,8 +1051,6 @@ class Verifier:
         recorded: Counter[tuple[str, str, int]] = Counter()
         seen: set[int] = set()
         for record in self._records:
-            if record.xid >= self._horizon:
-                continue
             seen.add(record.xid)
             counts = _record_counts(record.payload)
             where = {
@@ -1025,11 +1072,22 @@ class Verifier:
             (table, group, xid): count
             for table, stamps in self._stamps.items()
             for (group, xid), count in stamps.items()
-            if xid < self._horizon
         }
         for key in sorted(set(recorded) | set(stamped)):
             table, group, xid = key
             want, have = recorded.get(key, 0), stamped.get(key, 0)
+            if xid >= self._horizon:
+                # The scrub may still be running: its rows are not all
+                # visible yet. A later run, past it, counts them.
+                self._note(
+                    NoteKind.UNSEALED_TAIL,
+                    "a scrub not finished when verify started; not counted yet",
+                    table=table,
+                    xid=xid,
+                    group=group,
+                    count=have,
+                )
+                continue
             if want == have:
                 continue
             if xid not in seen and self._receipt_retired(xid):
@@ -1052,14 +1110,25 @@ class Verifier:
             )
 
     def _receipt_retired(self, xid: int) -> bool:
+        """Whether the record of the scrub at ``xid`` was sealed and retired.
+
+        The record has the xid of its scrub, so it was sealed by the block
+        whose range holds that xid, in the stream of its severity. A retired
+        partition with a segment of that block and stream attests it.
+        """
+        stream = self._scrubbed_stream
+        if stream is None:
+            return False
         for incarnation in self.incarnations:
             sealed = incarnation.seal_of(xid)
             if sealed is None:
                 continue
             for name, segments in self._segments.items():
-                if name in self._retired and any(
-                    seq == sealed.seq and stream.startswith(f"{ACTIVITY}.")
-                    for seq, stream in segments
+                retired = self._retired.get(name)
+                if (
+                    retired is not None
+                    and retired.stream == stream
+                    and (sealed.seq, stream) in segments
                 ):
                     return True
         return False
