@@ -672,13 +672,17 @@ def test_add_integrity_gives_up_after_its_attempts(
     monkeypatch.setattr(migrations, "_sleep", lambda seconds: None)
     blocker = lock_parent(engine, schema)
     try:
-        with engine.begin() as conn, pytest.raises(DBAPIError) as info:
-            migrations.add_integrity(
-                conn, old_install.trail.tables, lock_timeout="50ms", attempts=2
-            )
+        with engine.begin() as conn:
+            conn.execute(text("SET LOCAL lock_timeout = '7s'"))
+            with pytest.raises(DBAPIError) as info:
+                migrations.add_integrity(
+                    conn, old_install.trail.tables, lock_timeout="50ms", attempts=2
+                )
+            timeout = conn.execute(text("SHOW lock_timeout")).scalar()
     finally:
         blocker.close()
     assert getattr(info.value.orig, "sqlstate", None) == "55P03"
+    assert timeout == "7s"  # restored after the failure too
     # Nothing was changed, on the blocked table or the one before it.
     for table in ("audit_transaction", "audit_activity"):
         assert "xid" not in columns_of(engine, schema, table)
@@ -701,6 +705,7 @@ def test_add_integrity_retries_a_lock_timeout(
     monkeypatch.setattr(migrations, "_sleep", release)
     try:
         with engine.begin() as conn:
+            before = conn.execute(text("SHOW lock_timeout")).scalar()
             migrations.add_integrity(
                 conn, old_install.trail.tables, lock_timeout="50ms", attempts=3
             )
@@ -710,7 +715,7 @@ def test_add_integrity_retries_a_lock_timeout(
     assert len(pauses) == 1
     assert 0 <= pauses[0] <= 0.5
     assert "attempt 1 of 3" in caplog.text
-    assert timeout == "0"  # the session's setting is back
+    assert timeout == before  # the session's setting is back
     assert "xid" in columns_of(engine, schema, "audit_activity")
 
 

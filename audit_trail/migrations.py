@@ -350,8 +350,9 @@ def add_integrity(
     rewriting them. While one waits for that lock, new audit writes queue
     behind it, so the wait is capped by ``lock_timeout``; on a timeout
     (SQLSTATE ``55P03``) the savepoint is rolled back, which changes nothing,
-    and the statements are retried after a random pause. Running it again
-    later is safe.
+    and the statements are retried after a random pause. The transaction's
+    own ``lock_timeout`` is restored afterwards, also when this raises.
+    Running it again later is safe.
 
     Args:
         connection: Connection with DDL privileges, not in ``AUTOCOMMIT``.
@@ -371,28 +372,33 @@ def add_integrity(
     previous: str = connection.execute(
         text("SELECT current_setting('lock_timeout')")
     ).scalar_one()
-    _set_lock_timeout(connection, lock_timeout)
     statements = add_integrity_statements(tables)
-    for attempt in range(1, attempts + 1):
-        try:
-            with connection.begin_nested():
-                for statement in statements:
-                    _execute_ddl(connection, statement)
-            break
-        except DBAPIError as exc:
-            if attempt == attempts or not _is_lock_timeout(exc):
-                raise
-            pause = random.uniform(0, _RETRY_PAUSE * 2 ** (attempt - 1))
-            logger.warning(
-                "add_integrity: a lock was not granted within lock_timeout=%r "
-                "(attempt %d of %d); retrying in %.2f s.",
-                lock_timeout,
-                attempt,
-                attempts,
-                pause,
-            )
-            _sleep(pause)
-    _set_lock_timeout(connection, previous)
+    _set_lock_timeout(connection, lock_timeout)
+    try:
+        for attempt in range(1, attempts + 1):
+            try:
+                with connection.begin_nested():
+                    for statement in statements:
+                        _execute_ddl(connection, statement)
+                break
+            except DBAPIError as exc:
+                if attempt == attempts or not _is_lock_timeout(exc):
+                    raise
+                pause = random.uniform(0, _RETRY_PAUSE * 2 ** (attempt - 1))
+                logger.warning(
+                    "add_integrity: a lock was not granted within "
+                    "lock_timeout=%r (attempt %d of %d); retrying in %.2f s.",
+                    lock_timeout,
+                    attempt,
+                    attempts,
+                    pause,
+                )
+                _sleep(pause)
+    finally:
+        # A broken connection is discarded by the pool; touching it would
+        # hide the real error.
+        if not connection.invalidated:
+            _set_lock_timeout(connection, previous)
 
 
 # The first retry pauses up to this many seconds, each later one twice as long.
