@@ -673,8 +673,31 @@ def test_health_flags_a_chain_that_was_never_started(
     report = env.trail.maintenance.health()
     assert report.seal is not None
     assert report.seal.started is False
+    assert report.seal.problem is not None
+    assert "migrations.write_genesis()" in report.seal.problem
     assert not report.ok
     env.trail.dispose()
+
+
+def test_before_add_integrity_health_and_genesis_name_it(
+    engine: Engine, schema: str
+) -> None:
+    old = make_env(engine, schema, events=[SealEvent], severities=Severity)
+    old.trail.maintenance.ensure_partitions()
+    write(old)
+    old.trail.dispose()
+    tables = build_tables(schema=schema, integrity=True)
+    with engine.begin() as conn:
+        report = health(conn, tables, Severity).seal
+        assert report is not None
+        assert (report.started, report.ok) == (False, False)
+        assert report.problem is not None
+        assert "does not exist" in report.problem
+        assert "migrations.add_integrity()" in report.problem
+        with pytest.raises(ValueError, match=r"migrations\.add_integrity\(\)"):
+            migrations.write_genesis(conn, tables)
+        # Neither aborted the caller's transaction.
+        assert conn.execute(text("SELECT 1")).scalar() == 1
 
 
 # -- async ---------------------------------------------------------------------

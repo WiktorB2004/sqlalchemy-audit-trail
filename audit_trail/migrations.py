@@ -513,8 +513,9 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
 
     Raises:
         ValueError: The tables were built without integrity, the connection
-            is in ``AUTOCOMMIT`` mode, or the block table holds blocks but no
-            genesis block.
+            is in ``AUTOCOMMIT`` mode, the block table does not exist yet
+            (run ``add_integrity`` first), or it holds blocks but no genesis
+            block. The transaction stays usable.
     """
     return _seal.write_genesis(connection, tables)
 

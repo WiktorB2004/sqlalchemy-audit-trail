@@ -136,6 +136,10 @@ class SealHealth:
         prepared: Global ids of prepared transactions in this database older
             than ``max_seal_lag``. Each holds the horizon back until it is
             committed or rolled back, so sealing stalls behind it.
+        problem: Why the chain is not started, naming the step to run:
+            ``migrations.add_integrity()`` when the block table does not
+            exist, ``migrations.write_genesis()`` when it has no genesis
+            block; else ``None``.
     """
 
     started: bool
@@ -145,6 +149,7 @@ class SealHealth:
     seal_lag: timedelta | None
     max_seal_lag: timedelta
     prepared: list[str] = field(default_factory=list)
+    problem: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -177,10 +182,15 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
     """Start the chain, once; see ``migrations.write_genesis``."""
     block = block_table(tables)
     _check_transactional(connection, "write_genesis")
-    connection.execute(
-        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-        {"key": lock_key(block)},
-    )
+    start = connection.execute(
+        text(
+            "SELECT pg_advisory_xact_lock(hashtext(:key)) AS locked, "
+            "to_regclass(:block) IS NOT NULL AS created"
+        ),
+        {"key": lock_key(block), "block": _regclass(connection, block)},
+    ).one()
+    if not start.created:
+        raise ValueError(_missing(block))
     existing = _genesis(connection, block)
     if existing is not None:
         return existing
@@ -356,16 +366,20 @@ def seal_health(
         ValueError: The tables were built without integrity.
     """
     block = block_table(tables)
-    prepared = list(
-        connection.execute(
-            text(
-                "SELECT gid FROM pg_prepared_xacts "
-                "WHERE database = current_database() AND prepared < :cutoff "
-                "ORDER BY prepared, gid"
-            ),
-            {"cutoff": now - max_seal_lag},
-        ).scalars()
-    )
+    start = connection.execute(
+        text(
+            "SELECT to_regclass(:block) IS NOT NULL AS created, ARRAY("
+            "SELECT gid FROM pg_prepared_xacts "
+            "WHERE database = current_database() AND prepared < :cutoff "
+            "ORDER BY prepared, gid) AS prepared"
+        ),
+        {"block": _regclass(connection, block), "cutoff": now - max_seal_lag},
+    ).one()
+    prepared = list(start.prepared)
+    if not start.created:
+        return SealHealth(
+            False, None, None, 0, None, max_seal_lag, prepared, _missing(block)
+        )
     horizon = connection.execute(
         select(block.c.body, block.c.sealed_at)
         .where(block.c.kind.in_(("genesis", "seal")))
@@ -373,7 +387,11 @@ def seal_health(
         .limit(1)
     ).one_or_none()
     if horizon is None:
-        return SealHealth(False, None, None, 0, None, max_seal_lag, prepared)
+        problem = (
+            f"{block.fullname} has no genesis block; run "
+            "migrations.write_genesis() once every writer runs with integrity"
+        )
+        return SealHealth(False, None, None, 0, None, max_seal_lag, prepared, problem)
     sealed_to = _xid_to(parse_body(horizon.body))
     rows = 0
     oldest: datetime | None = None
@@ -400,6 +418,17 @@ def _sqlstate(exc: DBAPIError) -> str | None:
         orig, "pgcode", None
     )
     return sqlstate
+
+
+def _regclass(connection: Connection, table: Table) -> str:
+    return connection.dialect.identifier_preparer.format_table(table)
+
+
+def _missing(block: Table) -> str:
+    return (
+        f"the block table {block.fullname} does not exist; run "
+        "migrations.add_integrity() first"
+    )
 
 
 def _check_transactional(connection: Connection, name: str) -> None:
@@ -538,8 +567,9 @@ _LEAF_PARTITIONS = text(
 
 def _leaf_partitions(connection: Connection, table: Table) -> dict[int, str]:
     """Names of the partitions that hold the rows of a partitioned table."""
-    parent = connection.dialect.identifier_preparer.format_table(table)
-    rows = connection.execute(_LEAF_PARTITIONS, {"parent": parent}).all()
+    rows = connection.execute(
+        _LEAF_PARTITIONS, {"parent": _regclass(connection, table)}
+    ).all()
     return {int(oid): str(name) for oid, name in rows}
 
 
