@@ -305,6 +305,38 @@ def test_a_row_below_a_later_xmax_is_in_the_tail(sealed: Sealed) -> None:
     assert {(f.kind, f.count) for f in report.notes} == {(NoteKind.UNSEALED_TAIL, 1)}
 
 
+def test_a_partition_read_that_fails_leaves_nothing_behind(sealed: Sealed) -> None:
+    chain, transactions, activities = sealed
+    broken = [*activities, transaction_row(9, 10**15)]
+    scrub(activities[0], 250)
+    verifier = Verifier(chain.blocks, horizon=10_000)
+
+    def rows() -> Iterable[dict[str, Any]]:
+        yield from broken[:-1]
+        raise LookupError("the partition was dropped")
+
+    with pytest.raises(LookupError):
+        verifier.check_partition(Partition("activity", ACT_PART), rows())
+    # The partition is read again as if the first attempt never happened.
+    verifier.check_partition(Partition("transaction", TX_PART), transactions)
+    verifier.schema([])
+    report = verifier.report()
+    assert failures(report) == {FailureKind.SEGMENT_MISSING}
+    assert report.notes == []
+
+
+def test_the_horizon_can_be_given_after_the_chain(sealed: Sealed) -> None:
+    chain, transactions, activities = sealed
+    verifier = Verifier(chain.blocks)
+    verifier.set_horizon(10_000, 10_000)
+    verifier.check_partition(Partition("transaction", TX_PART), transactions)
+    verifier.check_partition(Partition("activity", ACT_PART), activities)
+    verifier.schema([])
+    assert verifier.report().status is Status.VALID
+    with pytest.raises(ValueError, match="horizon"):
+        Verifier(chain.blocks).report()
+
+
 def test_a_seal_that_does_not_start_where_the_last_ended_is_malformed(
     sealed: Sealed,
 ) -> None:

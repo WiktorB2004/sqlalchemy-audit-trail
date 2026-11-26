@@ -619,15 +619,18 @@ class _Record:
 class Verifier:
     """Checks a chain and the rows it seals.
 
-    Private for now. Use: build it with the blocks in ``seq`` order, call
+    Private for now. Use: build it with the blocks in ``seq`` order, give
+    the horizon (here or with ``set_horizon``, read after the blocks), call
     ``check_partition`` for every partition that holds rows (its rows in
     ``(xid, id)`` order), ``schema`` once with the detached partitions, and
     ``report`` last.
 
     Args:
-        blocks: Every block of the chain, in ``seq`` order.
-        horizon: ``pg_snapshot_xmin`` read before any row: every transaction
-            below it had finished, so scrubs below it are counted.
+        blocks: Every block of the chain, in ``seq`` order; read once, as
+            they come.
+        horizon: ``pg_snapshot_xmin`` read after the blocks and before any
+            row: every transaction below it had finished, so scrubs below it
+            are counted, and every seal block read is below it.
         xmax: ``pg_snapshot_xmax`` read with the horizon: no transaction at
             or above it had started. ``None`` for the horizon itself, as on
             an idle database.
@@ -643,15 +646,18 @@ class Verifier:
         self,
         blocks: Iterable[StoredBlock],
         *,
-        horizon: int,
+        horizon: int | None = None,
         xmax: int | None = None,
         retention: Mapping[str, timedelta | None] | None = None,
         system_severity: int | None = None,
     ) -> None:
         self._failures: list[Finding] = []
         self._notes: list[Finding] = []
-        self._horizon = horizon
-        self._xmax = horizon if xmax is None else max(xmax, horizon)
+        self._horizon = 0
+        self._xmax = 0
+        self._has_horizon = False
+        if horizon is not None:
+            self.set_horizon(horizon, xmax)
         self._retention = retention
         self._scrubbed_stream = (
             None if system_severity is None else activity_stream(system_severity)
@@ -812,6 +818,12 @@ class Verifier:
                 partition=retired.partition,
             )
 
+    def set_horizon(self, horizon: int, xmax: int | None = None) -> None:
+        """Give the horizon and ``xmax``, read after the blocks."""
+        self._horizon = horizon
+        self._xmax = max(self._xmax, horizon if xmax is None else max(xmax, horizon))
+        self._has_horizon = True
+
     # -- rows --
 
     def incarnation_of(self, stream: str, row_id: int) -> Incarnation | None:
@@ -827,11 +839,24 @@ class Verifier:
         """Check the rows of one partition, given in ``(xid, id)`` order.
 
         Rows with a ``NULL`` ``xid`` are left out; see ``null_xid_rows``.
+        When ``rows`` raises, the partition is left as if never checked, so
+        it can be checked again or reported as absent.
         """
+        if not self._has_horizon:
+            raise ValueError("set the horizon before checking rows")
+        marks = (len(self._failures), len(self._notes), len(self._records))
+        stamps = {table: Counter(counts) for table, counts in self._stamps.items()}
+        try:
+            state = _PartitionState(partition)
+            for row in rows:
+                self._row(state, row)
+        except BaseException:
+            del self._failures[marks[0] :]
+            del self._notes[marks[1] :]
+            del self._records[marks[2] :]
+            self._stamps = stamps
+            raise
         self._checked.add(partition.name)
-        state = _PartitionState(partition)
-        for row in rows:
-            self._row(state, row)
         self._close(state, final=True)
         where = {"table": partition.table, "partition": partition.name}
         if state.erased:
@@ -1157,6 +1182,8 @@ class Verifier:
 
     def report(self) -> VerificationReport:
         """Finish: the scrub counts and the horizon, then the report."""
+        if not self._has_horizon:
+            raise ValueError("set the horizon before the report")
         self._check_scrubs()
         current = self.incarnations[-1]
         if self._horizon < current.sealed_to:

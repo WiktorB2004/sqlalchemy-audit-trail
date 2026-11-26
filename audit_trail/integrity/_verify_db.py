@@ -1,15 +1,17 @@
 """``verify`` and ``acknowledge`` against the database.
 
-Private for now. ``verify`` reads the chain and then each partition in short
-``READ ONLY`` transactions, one per chunk of rows in ``(xid, id)`` order, and
-feeds them to the pure ``Verifier``. It never holds one snapshot over the
-whole log: a long snapshot would hold back vacuum and block ``DETACH ...
-CONCURRENTLY``, and sealed rows need none. ``acknowledge`` appends an ``ack``
-block to the chain, under the sealer's lock.
+Private for now. ``verify`` reads the catalog, the chain and then each
+partition in short ``READ ONLY`` transactions, one per chunk of rows in
+``(xid, id)`` order, and feeds them to the pure ``Verifier``. It never holds
+one snapshot over the whole log: a long snapshot would hold back vacuum and
+block ``DETACH ... CONCURRENTLY``, and sealed rows need none.
+``acknowledge`` appends an ``ack`` block to the chain, under the sealer's
+lock.
 """
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,6 +30,7 @@ from sqlalchemy import (
     text,
     tuple_,
 )
+from sqlalchemy.exc import DBAPIError
 
 from audit_trail import _pg
 from audit_trail.integrity import _schema
@@ -59,6 +62,8 @@ DEFAULT_CHUNK_ROWS = 2_000
 """Rows read per ``READ ONLY`` transaction."""
 
 _BLOCK_CHUNK = 1_000
+
+_UNDEFINED_TABLE = "42P01"
 
 _XMAX = text("SELECT pg_snapshot_xmax(pg_current_snapshot())::text")
 
@@ -105,10 +110,11 @@ def verify(
 
     Private for now. Runs on one connection of its own from ``engine``,
     which it holds only between short ``READ ONLY`` transactions; it takes
-    no lock, so runs side by side are fine and a pool of one does. The
-    chain and the catalog are read first, then each partition in chunks of
-    ``chunk_rows`` rows, each in its own transaction, keyset-paged by
-    ``(xid, id)``.
+    no lock, so runs side by side are fine and a pool of one does. It reads
+    the catalog, then the chain, then the horizon, then each partition in
+    chunks of ``chunk_rows`` rows, each in its own transaction, keyset-paged
+    by ``(xid, id)``. A partition dropped during the run is read again once
+    from the catalog; dropped again, it is reported as absent.
 
     Args:
         engine: An engine whose role can read the audit tables, the block
@@ -139,9 +145,53 @@ def verify(
         return _verify(conn, tables, block, options)
 
 
+class _Vanished(Exception):
+    """A partition in the catalog read was gone when its rows were read."""
+
+
 def _verify(
     conn: Connection, tables: AuditTables, block: Table, options: _Options
 ) -> VerificationReport:
+    """One run, read again from the catalog once if a partition vanishes.
+
+    ``drop_expired`` writes a retire block and then drops the partition; a
+    run that read the catalog before the drop finds the partition gone. A
+    second run reads the catalog without it and the chain with its retire
+    block. A partition that vanishes during the second run is not retried:
+    it is reported as absent, like one dropped before the run.
+    """
+    try:
+        return _run(conn, tables, block, options, retry=True)
+    except _Vanished:
+        return _run(conn, tables, block, options, retry=False)
+
+
+def _run(
+    conn: Connection,
+    tables: AuditTables,
+    block: Table,
+    options: _Options,
+    *,
+    retry: bool,
+) -> VerificationReport:
+    # The order matters. The catalog before the chain: a partition dropped
+    # after its retire block was read is still listed, and its read is
+    # retried. The chain before the horizon: every seal block read ends at
+    # or below an xmin taken after it.
+    with _read_only(conn):
+        leaves, detached = _catalog(conn, tables)
+    blocks = _blocks(conn, block)
+    first = next(blocks, None)
+    if first is None:
+        raise ValueError(
+            f"{block.fullname} has no genesis block; run "
+            "migrations.write_genesis() first"
+        )
+    verifier = Verifier(
+        itertools.chain([first], blocks),
+        retention=options.streams,
+        system_severity=options.system_severity,
+    )
     with _read_only(conn):
         horizon, xmax = (
             int(value)
@@ -152,21 +202,7 @@ def _verify(
                 )
             ).one()
         )
-    stored = list(_blocks(conn, block))
-    if not stored:
-        raise ValueError(
-            f"{block.fullname} has no genesis block; run "
-            "migrations.write_genesis() first"
-        )
-    verifier = Verifier(
-        stored,
-        horizon=horizon,
-        xmax=xmax,
-        retention=options.streams,
-        system_severity=options.system_severity,
-    )
-    with _read_only(conn):
-        leaves, detached = _catalog(conn, tables)
+    verifier.set_horizon(horizon, xmax)
     for leaf in leaves:
         parent = (
             tables.transaction
@@ -174,18 +210,32 @@ def _verify(
             else (tables.activity)
         )
         table = _partition_table(parent, leaf)
-        with _read_only(conn):
-            nulls = conn.execute(
-                select(func.count())
-                .select_from(table)
-                .where(table.c[_schema.XID].is_(None))
-            ).scalar_one()
+        try:
+            verifier.check_partition(
+                leaf.partition, _rows(conn, table, options.chunk_rows, verifier)
+            )
+            with _read_only(conn):
+                nulls = conn.execute(
+                    select(func.count())
+                    .select_from(table)
+                    .where(table.c[_schema.XID].is_(None))
+                ).scalar_one()
+        except DBAPIError as exc:
+            if not _is_undefined_table(exc):
+                raise
+            if retry:
+                raise _Vanished(leaf.partition.name) from exc
+            continue
         verifier.null_xid_rows(leaf.partition, int(nulls))
-        verifier.check_partition(
-            leaf.partition, _rows(conn, table, options.chunk_rows, verifier)
-        )
     verifier.schema(detached)
     return verifier.report()
+
+
+def _is_undefined_table(exc: DBAPIError) -> bool:
+    """Whether the statement failed on a relation that does not exist."""
+    orig = exc.orig
+    code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return code == _UNDEFINED_TABLE
 
 
 @contextmanager

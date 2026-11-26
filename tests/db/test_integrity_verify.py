@@ -36,7 +36,7 @@ from audit_trail import (
     migrations,
     privacy,
 )
-from audit_trail.integrity import _seal
+from audit_trail.integrity import _seal, _verify_db
 from audit_trail.integrity._block import (
     activity_stream,
     block_hash,
@@ -502,6 +502,99 @@ def test_a_detached_partition_is_detached_partition(env: Env) -> None:
     assert failed(report) == {FailureKind.DETACHED_PARTITION}
     (finding,) = report.failures
     assert finding.partition == partition
+
+
+def drop_partition(env: Env, which: str) -> str:
+    """Detach and drop the partition holding the first row of a table."""
+    table = getattr(env.trail.tables, which)
+    with env.engine.begin() as conn:
+        name, parent = conn.execute(
+            text(
+                "SELECT c.relname, i.inhparent::regclass::text FROM "
+                f'"{table.schema}"."{table.name}" t '
+                "JOIN pg_catalog.pg_class c ON c.oid = t.tableoid "
+                "JOIN pg_catalog.pg_inherits i ON i.inhrelid = c.oid "
+                "ORDER BY t.id LIMIT 1"
+            )
+        ).one()
+        child = f'"{table.schema}"."{name}"'
+        conn.execute(text(f"ALTER TABLE {parent} DETACH PARTITION {child}"))
+        conn.execute(text(f"DROP TABLE {child}"))
+    return str(name)
+
+
+def after_catalog(monkeypatch: pytest.MonkeyPatch, *hooks: Any) -> None:
+    """Run ``hooks[n]`` right after the ``n``-th catalog read of verify."""
+    read = _verify_db._catalog
+    pending = list(hooks)
+
+    def catalog(conn: Any, tables: Any) -> Any:
+        found = read(conn, tables)
+        if pending:
+            pending.pop(0)()
+        return found
+
+    monkeypatch.setattr(_verify_db, "_catalog", catalog)
+
+
+def test_a_partition_retired_and_dropped_mid_run_is_read_again(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_valid(env)
+    partition = transaction_partition(env)
+
+    def drop_expired() -> None:
+        # What drop_expired does: the retire block, then the drop.
+        retire(env, LONG_AGO)
+        assert drop_partition(env, "transaction") == partition
+
+    after_catalog(monkeypatch, drop_expired)
+    report = run(env)
+    assert report.failures == []
+    assert noted(report) == {NoteKind.RETIRED}
+    assert [f.partition for f in report.notes] == [partition]
+
+
+def test_a_partition_dropped_again_on_the_retry_is_reported(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_valid(env)
+    dropped: list[str] = []
+    after_catalog(
+        monkeypatch,
+        lambda: dropped.append(drop_partition(env, "transaction")),
+        lambda: dropped.append(drop_partition(env, "activity")),
+    )
+    report = run(env)
+    # Retried once; the second drop is reported, not retried again.
+    assert failed(report) == {FailureKind.SEGMENT_MISSING}
+    assert sorted(str(f.partition) for f in report.failures) == sorted(dropped)
+
+
+def test_a_seal_between_the_reads_is_no_rewind(
+    env: Env, models: Models, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The chain is read before the horizon: a seal that commits just before
+    # the chain is read is below the horizon read after it.
+    assert_valid(env)
+
+    def seal_more() -> None:
+        with env.trail.context(ANN), env.factory() as session:
+            env.trail.log(session, VerifyEvent.NOTED, payload={"n": 2})
+            session.commit()
+        seal(env)
+
+    read = _verify_db._blocks
+
+    def blocks(conn: Any, block: Any) -> Any:
+        seal_more()
+        yield from read(conn, block)
+
+    monkeypatch.setattr(_verify_db, "_blocks", blocks)
+    report = run(env)
+    assert report.failures == []
+    assert report.status is Status.VALID
+    assert report.verified_to == 3
 
 
 FLIP_FIRST_BYTE = "set_byte(block_hash, 0, get_byte(block_hash, 0) # 1)"
