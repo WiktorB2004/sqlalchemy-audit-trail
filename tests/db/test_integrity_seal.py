@@ -8,6 +8,7 @@ will do.
 from __future__ import annotations
 
 import dataclasses
+import os
 import threading
 import time
 import uuid
@@ -15,7 +16,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from sqlalchemy import Engine, create_engine, insert, inspect, select, text
@@ -353,8 +354,11 @@ def test_max_rows_cuts_between_transactions(env: Env) -> None:
     first = seal(env, max_rows=3)
     assert (first.rows, first.capped, first.horizon) == (2, True, xids[1])
     second = seal(env, max_rows=4)
-    assert (second.rows, second.capped, second.horizon) == (4, False, second.horizon)
-    check_chain(env)
+    assert (second.rows, second.capped) == (4, False)
+    assert second.horizon is not None
+    assert second.horizon > xids[2]
+    *_, last = check_chain(env)
+    assert last.body["xid_to"] == second.horizon
 
 
 def test_a_concurrent_sealer_returns_without_sealing(
@@ -505,12 +509,13 @@ def standby_url(
     """A server in recovery, with the audit tables and a genesis block.
 
     The image's init scripts create them and then add ``standby.signal``, so
-    the server starts as a hot standby that has no primary.
+    the server starts as a hot standby that has no primary. Skipped without
+    Docker, except in CI (``AUDIT_TEST_EXPECT_PG`` set), where it fails.
     """
     try:
         from testcontainers.community.postgres import PostgresContainer
     except ImportError:  # pragma: no cover
-        pytest.skip("testcontainers is not installed")
+        cannot_run("testcontainers is not installed")
     with engine.connect() as conn:
         version = int(conn.execute(text("SHOW server_version_num")).scalar_one())
     init = tmp_path_factory.mktemp("standby-init")
@@ -524,17 +529,23 @@ def standby_url(
     )
     write_init(init / "01-tables.sql", create_sql(tables, Severity) + genesis)
     write_init(init / "02-standby.sh", 'touch "$PGDATA/standby.signal"\n')
-    container = PostgresContainer(
-        f"postgres:{version // 10000}", driver="psycopg"
-    ).with_volume_mapping(str(init), "/docker-entrypoint-initdb.d", "ro")
     try:
+        container = PostgresContainer(
+            f"postgres:{version // 10000}", driver="psycopg"
+        ).with_volume_mapping(str(init), "/docker-entrypoint-initdb.d", "ro")
         container.start()
     except Exception as exc:  # no Docker
-        pytest.skip(f"cannot start a standby container: {exc}")
+        cannot_run(f"cannot start a standby container: {exc}")
     try:
         yield container.get_connection_url()
     finally:
         container.stop()
+
+
+def cannot_run(reason: str) -> NoReturn:
+    if os.environ.get("AUDIT_TEST_EXPECT_PG"):
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 def write_init(path: Path, content: str) -> None:
