@@ -92,7 +92,7 @@ BLOCK_KINDS: tuple[str, ...] = (
 
 
 def block_table(metadata: MetaData, name: str = BLOCK_TABLE) -> Table:
-    """Declare the table of sealed blocks, ``audit_seal_block``, in ``metadata``.
+    """Declare the table of sealed blocks, ``name``, in ``metadata``.
 
     One row per block of the hash chain, unpartitioned and small:
 

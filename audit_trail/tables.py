@@ -81,14 +81,17 @@ class AuditTables:
         metadata: Metadata holding both tables and the activity indexes.
         transaction: The ``audit_transaction`` table.
         activity: The ``audit_activity`` table.
-        seal_block: The ``audit_seal_block`` table of sealed blocks, declared
-            only with integrity, else ``None``.
+        seal_block: The table of sealed blocks, declared only with
+            integrity, else ``None``.
+        seal_block_table: Name of the table of sealed blocks, also without
+            integrity, for ``migrations.add_integrity``.
     """
 
     metadata: MetaData
     transaction: Table
     activity: Table
     seal_block: Table | None = None
+    seal_block_table: str = integrity_schema.BLOCK_TABLE
 
 
 def audit_connection(
@@ -234,6 +237,7 @@ def build_tables(
         transaction=transaction,
         activity=activity,
         seal_block=seal_block,
+        seal_block_table=seal_block_table,
     )
 
 

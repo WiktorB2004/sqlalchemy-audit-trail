@@ -219,3 +219,13 @@ def test_add_integrity_creates_the_block_table_if_missing() -> None:
     statements = migrations.add_integrity_statements(build_tables(schema="s"))
     assert "CREATE TABLE IF NOT EXISTS s.audit_seal_block" in statements[-2]
     assert statements[-1].startswith("CREATE UNIQUE INDEX IF NOT EXISTS")
+
+
+def test_add_integrity_names_the_block_table_also_without_integrity() -> None:
+    # The tables of an install that has no integrity yet.
+    tables = build_tables(schema="s", seal_block_table="chain")
+    assert tables.seal_block is None
+    statements = migrations.add_integrity_statements(tables)
+    assert "CREATE TABLE IF NOT EXISTS s.chain" in statements[-2]
+    assert "ON s.chain" in statements[-1]
+    assert not any("audit_seal_block" in s for s in statements)

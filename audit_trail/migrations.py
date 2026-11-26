@@ -194,8 +194,8 @@ def create_statements(tables: AuditTables, severities: Iterable[int]) -> list[st
     ``audit_trail.maintenance.ensure_partitions`` before the first write, or
     every insert fails with SQLSTATE ``23514``. Indexes are created on the
     partitioned parents, so PostgreSQL adds them to every partition, including
-    the ones created later. Tables built with integrity also get the
-    ``audit_seal_block`` table.
+    the ones created later. Tables built with integrity also get the table of
+    sealed blocks.
 
     Args:
         tables: The audit tables, from ``build_tables``.
@@ -310,9 +310,10 @@ def add_integrity_statements(tables: AuditTables) -> list[str]:
     ``pg_current_xact_id()`` is ``STABLE``, so ``ADD COLUMN ... DEFAULT
     pg_current_xact_id()`` would stamp every existing row with the
     migration's own ``xid``. Existing rows keep ``xid`` ``NULL``, and the
-    column stays nullable. Last, the ``audit_seal_block`` table and its
-    index, in the schema of the transaction table. Every statement is
-    idempotent. The ``(xid, id)`` indexes are not here:
+    column stays nullable. Last, the table of sealed blocks (named by
+    ``build_tables(seal_block_table=...)``, also for tables built without
+    integrity) and its index, in the schema of the transaction table. Every
+    statement is idempotent. The ``(xid, id)`` indexes are not here:
     ``add_integrity_indexes`` builds them online.
 
     Args:
@@ -340,7 +341,9 @@ def add_integrity_statements(tables: AuditTables) -> list[str]:
         )
     block = tables.seal_block
     if block is None:
-        block = integrity_schema.block_table(MetaData(schema=tables.transaction.schema))
+        block = integrity_schema.block_table(
+            MetaData(schema=tables.transaction.schema), tables.seal_block_table
+        )
     statements.append(_compile(CreateTable(block, if_not_exists=True)))
     statements.extend(
         _compile(CreateIndex(index, if_not_exists=True))
@@ -504,8 +507,8 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
     current transaction; the caller commits. Private for now.
 
     Args:
-        connection: Connection that may insert into ``audit_seal_block``,
-            not in ``AUTOCOMMIT`` mode.
+        connection: Connection that may insert into the block table, not in
+            ``AUTOCOMMIT`` mode.
         tables: Audit tables built with integrity.
 
     Returns:
