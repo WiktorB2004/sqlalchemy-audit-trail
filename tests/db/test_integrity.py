@@ -9,9 +9,10 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 from hypothesis import HealthCheck, example, given, settings
@@ -552,6 +553,9 @@ def test_fresh_install_has_a_not_null_xid(env: Env, schema: str) -> None:
         xid = columns_of(env.engine, schema, table)["xid"]
         assert xid["nullable"] is False
         assert "pg_current_xact_id()" in str(xid["default"])
+    check_index_tree(env.engine, schema)
+    with autocommit(env.engine) as auto:
+        assert migrations.add_integrity_indexes(auto, env.trail.tables) == []
 
 
 @pytest.fixture
@@ -565,24 +569,87 @@ def old_install(engine: Engine, schema: str, models: Models) -> Iterator[Env]:
     old.trail.dispose()
 
 
+class IndexRow(NamedTuple):
+    table: str
+    kind: str
+    index_name: str | None
+    valid: bool | None
+    parent_table: str | None
+    parent_index_table: str | None
+
+
+_XID_INDEXES = text(
+    r"""
+    SELECT t.relname, t.relkind::text, ic.relname, x.indisvalid, pt.relname,
+           pit.relname
+    FROM pg_class t
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    LEFT JOIN pg_index x
+        ON x.indrelid = t.oid
+       AND pg_get_indexdef(x.indexrelid) LIKE '%(xid, id)'
+    LEFT JOIN pg_class ic ON ic.oid = x.indexrelid
+    LEFT JOIN pg_inherits ti ON ti.inhrelid = t.oid
+    LEFT JOIN pg_class pt ON pt.oid = ti.inhparent
+    LEFT JOIN pg_inherits ii ON ii.inhrelid = x.indexrelid
+    LEFT JOIN pg_index px ON px.indexrelid = ii.inhparent
+    LEFT JOIN pg_class pit ON pit.oid = px.indrelid
+    WHERE n.nspname = :schema AND t.relkind IN ('r', 'p')
+      AND t.relname LIKE 'audit\_%'
+    ORDER BY t.relname
+    """
+)
+
+
+def xid_indexes(engine: Engine, schema: str) -> list[IndexRow]:
+    """Every audit table and partition with its ``(xid, id)`` index, if any."""
+    with engine.connect() as conn:
+        rows = conn.execute(_XID_INDEXES, {"schema": schema}).all()
+    return [IndexRow(*row) for row in rows]
+
+
+def check_index_tree(engine: Engine, schema: str) -> None:
+    """Every table has a valid index, attached to its parent's index."""
+    rows = xid_indexes(engine, schema)
+    assert {row.table for row in rows if row.parent_table is None} == {
+        "audit_transaction",
+        "audit_activity",
+    }
+    for row in rows:
+        assert row.index_name is not None, row
+        assert row.valid is True, row
+        assert row.parent_index_table == row.parent_table, row
+
+
+@contextmanager
+def autocommit(engine: Engine) -> Iterator[Connection]:
+    with engine.connect() as conn:
+        yield conn.execution_options(isolation_level="AUTOCOMMIT")
+
+
 def test_add_integrity_upgrades_an_existing_install(
     engine: Engine, schema: str, models: Models, old_install: Env
 ) -> None:
+    tables = old_install.trail.tables
     with engine.begin() as conn:
-        migrations.add_integrity(conn, old_install.trail.tables)
+        migrations.add_integrity(conn, tables)
     with engine.begin() as conn:  # idempotent
-        migrations.add_integrity(conn, old_install.trail.tables)
+        migrations.add_integrity(conn, tables)
 
     for table in ("audit_transaction", "audit_activity"):
         xid = columns_of(engine, schema, table)["xid"]
         assert xid["nullable"] is True
         assert "pg_current_xact_id()" in str(xid["default"])
-    indexes = {
-        index["name"]
-        for table in ("audit_transaction", "audit_activity")
-        for index in inspect(engine).get_indexes(table, schema=schema)
-    }
-    assert {"audit_transaction_xid_idx", "audit_activity_xid_idx"} <= indexes
+    # The ALTER step, which holds ACCESS EXCLUSIVE, builds no index.
+    assert all(row.index_name is None for row in xid_indexes(engine, schema))
+
+    with autocommit(engine) as auto:
+        before = auto.execute(text("SHOW lock_timeout")).scalar()
+        built = migrations.add_integrity_indexes(auto, tables)
+        assert migrations.add_integrity_indexes(auto, tables) == []  # idempotent
+        assert auto.execute(text("SHOW lock_timeout")).scalar() == before
+    leaves = [r for r in xid_indexes(engine, schema) if r.kind == "r"]
+    assert len(built) == len(leaves) > 2
+    check_index_tree(engine, schema)
 
     new = AuditTrail(engine, schema=schema, **OPTIONS)
     factory = sessionmaker(engine)
@@ -605,7 +672,9 @@ def upgraded(engine: Engine, models: Models, old_install: Env) -> Iterator[Env]:
         migrations.add_integrity(conn, old_install.trail.tables)
     new = trail_on(engine, old_install.trail.schema)
     with new.trail.context(ANN), new.factory() as session:
-        session.get(models.Doc, 1).title = "New"
+        doc = session.get(models.Doc, 1)
+        assert doc is not None
+        doc.title = "New"
         session.commit()
     yield new
     new.trail.dispose()
@@ -654,6 +723,78 @@ def test_scrub_actor_stamps_no_row_written_without_integrity(upgraded: Env) -> N
             .order_by(table.c.id)
         ).all()
     assert [tuple(row) for row in stamps] == [(True, None), (False, {"actor": pointer})]
+
+
+def test_add_integrity_indexes_needs_autocommit(
+    engine: Engine, old_install: Env
+) -> None:
+    with engine.begin() as conn, pytest.raises(ValueError, match="AUTOCOMMIT"):
+        migrations.add_integrity_indexes(conn, old_install.trail.tables)
+
+
+def test_add_integrity_indexes_rebuilds_a_failed_partition_build(
+    engine: Engine, schema: str, old_install: Env
+) -> None:
+    tables = old_install.trail.tables
+    with engine.begin() as conn:
+        migrations.add_integrity(conn, tables)
+    leaf = next(r.table for r in xid_indexes(engine, schema) if r.kind == "r")
+    # A concurrent build that times out waiting for an open transaction
+    # leaves an invalid index behind.
+    with engine.connect() as blocker, autocommit(engine) as auto:
+        # A REPEATABLE READ transaction keeps its snapshot while idle.
+        blocker.execution_options(isolation_level="REPEATABLE READ")
+        blocker.execute(text("SELECT 1"))
+        auto.execute(text("SET lock_timeout = '50ms'"))
+        with pytest.raises(DBAPIError):
+            auto.execute(
+                text(
+                    f'CREATE INDEX CONCURRENTLY "{leaf}_xid_idx" '
+                    f'ON "{schema}"."{leaf}" (xid, id)'
+                )
+            )
+        blocker.rollback()
+        (row,) = [r for r in xid_indexes(engine, schema) if r.table == leaf]
+        assert row.valid is False
+        built = migrations.add_integrity_indexes(auto, tables)
+    assert f"{schema}.{leaf}_xid_idx" in built
+    check_index_tree(engine, schema)
+
+
+def test_add_integrity_indexes_retries_a_lock_timeout(
+    engine: Engine,
+    schema: str,
+    old_install: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tables = old_install.trail.tables
+    with engine.begin() as conn:
+        migrations.add_integrity(conn, tables)
+    # An open transaction that wrote audit rows holds ROW EXCLUSIVE, which
+    # the SHARE lock of CREATE INDEX ... ON ONLY waits for.
+    blocker = engine.connect()
+    blocker.execute(
+        text(f'LOCK TABLE "{schema}".audit_transaction IN ROW EXCLUSIVE MODE')
+    )
+    pauses: list[float] = []
+
+    def release(seconds: float) -> None:
+        pauses.append(seconds)
+        blocker.rollback()
+
+    monkeypatch.setattr(migrations, "_sleep", release)
+    try:
+        with autocommit(engine) as auto:
+            migrations.add_integrity_indexes(
+                auto, tables, lock_timeout="50ms", attempts=3
+            )
+    finally:
+        blocker.close()
+    assert len(pauses) == 1
+    assert "add_integrity_indexes" in caplog.text
+    assert "attempt 1 of 3" in caplog.text
+    check_index_tree(engine, schema)
 
 
 def lock_parent(engine: Engine, schema: str) -> Connection:
