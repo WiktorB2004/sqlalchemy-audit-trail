@@ -17,6 +17,7 @@ from sqlalchemy import (
     Engine,
     MetaData,
     create_engine,
+    func,
     insert,
     select,
     text,
@@ -38,6 +39,7 @@ from audit_trail import (
 )
 from audit_trail.integrity import _seal, _verify_db
 from audit_trail.integrity._block import (
+    ack_body,
     activity_stream,
     block_hash,
     parse_body,
@@ -633,10 +635,18 @@ def test_a_relinked_block_is_prev_mismatch(env: Env) -> None:
 
 
 def test_a_block_kind_changed_is_malformed_block(env: Env) -> None:
-    with env.engine.connect() as conn:
-        seq = acknowledge(
-            conn, env.trail.tables, FailureKind.COMMITMENT_MISSING, {"xid": 1}, "x"
-        )
+    seq = append_block(
+        env,
+        "ack",
+        lambda chain, seq: ack_body(
+            chain,
+            seq,
+            failure="COMMITMENT_MISSING",
+            scope={"xid": 1},
+            waives=[{"table": "activity", "id": 1}],
+            reason="x",
+        ),
+    )
     assert_valid(env)
     block = _seal.block_table(env.trail.tables)
     with env.engine.begin() as conn:
@@ -725,11 +735,8 @@ def test_a_retired_partition_that_is_gone_is_a_note(env: Env) -> None:
 # -- a writer without Integrity, and acks ---------------------------------------
 
 
-def test_a_writer_without_integrity_is_commitment_missing_until_acknowledged(
-    env: Env, models: Models
-) -> None:
-    assert_valid(env)
-    # The same tables, written by a process configured without Integrity.
+def write_without_integrity(env: Env) -> int:
+    """One entry by a process configured without Integrity; its xid."""
     legacy = AuditTrail(
         env.engine, schema=env.trail.schema, events=[VerifyEvent], severities=Severity
     )
@@ -744,6 +751,19 @@ def test_a_writer_without_integrity_is_commitment_missing_until_acknowledged(
             session.commit()
     finally:
         legacy.dispose()
+    return xid
+
+
+def ack(env: Env, kind: FailureKind | str, scope: dict[str, object]) -> int:
+    with env.engine.connect() as conn:
+        return acknowledge(conn, env.trail.tables, kind, scope, "why")
+
+
+def test_a_writer_without_integrity_is_commitment_missing_until_acknowledged(
+    env: Env, models: Models
+) -> None:
+    assert_valid(env)
+    xid = write_without_integrity(env)
     seal(env)
     report = run(env)
     assert failed(report) == {FailureKind.COMMITMENT_MISSING}
@@ -775,46 +795,98 @@ def test_a_writer_without_integrity_is_commitment_missing_until_acknowledged(
     assert run(env).failures == []
 
 
+def test_a_row_ack_waives_only_the_rows_it_saw(env: Env) -> None:
+    first = write_without_integrity(env)
+    seal(env)
+    # A scope wide enough to take in later transactions too.
+    ack(env, FailureKind.COMMITMENT_MISSING, {"xid_from": first})
+    assert run(env).failures == []
+    later = write_without_integrity(env)
+    seal(env)
+    report = run(env)
+    assert failed(report) == {FailureKind.COMMITMENT_MISSING}
+    assert {f.xid for f in report.failures} == {later}
+    assert {f.xid for f in report.notes} == {first}
+
+
+def test_tampering_after_an_ack_is_reported_again(env: Env) -> None:
+    assert_valid(env)
+    activity = table_name(env, "activity")
+    row_id = first_id(env, "entity.created")
+    execute(env, f"UPDATE {activity} SET object_id = '9' WHERE id = :id", id=row_id)
+    seq = ack(env, FailureKind.ROOT_MISMATCH, {"seq": 2})
+    report = run(env)
+    assert report.failures == []
+    (note,) = report.notes
+    assert (note.waived, note.ack, note.seq) == (FailureKind.ROOT_MISMATCH, seq, 2)
+    # The ack pinned the root it saw; another change to the segment is new.
+    execute(env, f"UPDATE {activity} SET object_id = '8' WHERE id = :id", id=row_id)
+    report = run(env)
+    assert failed(report) == {FailureKind.ROOT_MISMATCH}
+    assert report.notes == []
+
+
 def test_an_ack_is_hashed_into_the_chain(env: Env) -> None:
-    with env.engine.connect() as conn:
-        seq = acknowledge(
-            conn, env.trail.tables, "COMMITMENT_MISSING", {"xid": 5}, "why"
-        )
+    activity = table_name(env, "activity")
+    row_id = first_id(env, "entity.created")
+    execute(env, f"UPDATE {activity} SET object_id = '9' WHERE id = :id", id=row_id)
+    (failure,) = run(env).failures
+    seq = ack(env, "ROOT_MISMATCH", {"seq": 2, "partition": str(failure.partition)})
     block = _seal.block_table(env.trail.tables)
     with env.engine.connect() as conn:
         rows = conn.execute(select(block).order_by(block.c.seq)).all()
     assert [r.kind for r in rows] == ["genesis", "seal", "ack"]
-    ack = rows[-1]
-    assert ack.seq == seq
-    assert bytes(ack.prev_hash) == bytes(rows[-2].block_hash)
-    assert bytes(ack.block_hash) == block_hash(bytes(ack.prev_hash), bytes(ack.body))
-    assert parse_body(bytes(ack.body)) == {
+    found = rows[-1]
+    assert found.seq == seq
+    assert bytes(found.prev_hash) == bytes(rows[-2].block_hash)
+    assert bytes(found.block_hash) == block_hash(
+        bytes(found.prev_hash), bytes(found.body)
+    )
+    assert parse_body(bytes(found.body)) == {
         "v": 1,
         "kind": "ack",
         "chain": parse_body(bytes(rows[0].body))["chain"],
         "seq": seq,
-        "failure": "COMMITMENT_MISSING",
-        "scope": {"xid": 5},
+        "failure": "ROOT_MISMATCH",
+        "scope": {"seq": 2, "partition": failure.partition},
+        "waives": [
+            {
+                "seq": 2,
+                "table": "activity",
+                "partition": failure.partition,
+                "stream": failure.stream,
+                "count": failure.count,
+                "root": failure.root,
+            }
+        ],
         "reason": "why",
     }
-    assert_valid(env)
+    report = run(env)
+    assert report.failures == []
+    assert noted(report) == {NoteKind.ACKNOWLEDGED}
 
 
 @pytest.mark.parametrize(
-    ("kind", "scope"),
+    ("kind", "scope", "match"),
     [
-        ("HASH_MISMATCH", {"xid": 1}),
-        ("NO_SUCH_KIND", {"xid": 1}),
-        ("COMMITMENT_MISSING", {}),
-        ("COMMITMENT_MISSING", {"salt": "x"}),
-        ("COMMITMENT_MISSING", {"xid": "1"}),
+        ("HASH_MISMATCH", {"xid": 1}, "cannot be acknowledged"),
+        ("NO_SUCH_KIND", {"xid": 1}, "not a failure kind"),
+        ("COMMITMENT_MISSING", {}, "needs a scope"),
+        ("COMMITMENT_MISSING", {"salt": "x"}, "unknown ack scope key"),
+        ("COMMITMENT_MISSING", {"xid": "1"}, "takes an integer"),
+        ("COMMITMENT_MISSING", {"table": "activity"}, "only table"),
+        # Nothing fails there: an ack would waive nothing.
+        ("COMMITMENT_MISSING", {"xid": 1}, "no COMMITMENT_MISSING failure"),
     ],
 )
 def test_acknowledge_refuses_what_it_cannot_waive(
-    env: Env, kind: str, scope: dict[str, object]
+    env: Env, kind: str, scope: dict[str, object], match: str
 ) -> None:
-    with env.engine.connect() as conn, pytest.raises(ValueError, match=r"."):
+    with env.engine.connect() as conn, pytest.raises(ValueError, match=match):
         acknowledge(conn, env.trail.tables, kind, scope, "why")
+    block = _seal.block_table(env.trail.tables)
+    with env.engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(block)).scalar() == 2
 
 
 def test_verify_needs_one_connection(env: Env, database_url: str) -> None:

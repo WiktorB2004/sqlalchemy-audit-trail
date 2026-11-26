@@ -42,8 +42,9 @@ in the ``UNSEALED_TAIL``, and anything between belongs to one of its seal
 blocks. There is one incarnation until forks exist; ``Incarnation`` holds
 what a fork will add (an ``id`` window).
 
-``ack`` blocks waive failures of one kind in a scope; such a failure is
-reported as an ``ACKNOWLEDGED`` note naming the ack. Every failure is
+``ack`` blocks waive failures of one kind in a scope, each pinned as it was
+observed (``pin``); such a failure is reported as an ``ACKNOWLEDGED`` note
+naming the ack, and a failure that changed since is reported again. Every failure is
 collected, never only the first. Findings name rows by table, ``id``,
 ``xid`` and partition, never by a value or a salt.
 """
@@ -187,6 +188,24 @@ has every field the scope names, with a matching value."""
 
 _TEXT_SCOPE_KEYS = frozenset({"table", "partition", "stream", "group"})
 
+ROW_KINDS: frozenset[FailureKind] = frozenset(
+    {
+        FailureKind.COMMITMENT_MISMATCH,
+        FailureKind.COMMITMENT_MISSING,
+        FailureKind.ERASURE_UNEXPLAINED,
+    }
+)
+"""Failures about one row; an ack pins them by the row's table, ``id`` and
+group."""
+
+PIN_FIELDS = ("seq", "table", "partition", "stream", "id", "xid", "group", "count")
+"""Fields of a finding an ack pins, with ``root``; a row kind pins only
+``table``, ``id`` and ``group``."""
+
+_TEXT_PIN_FIELDS = frozenset({"table", "partition", "stream", "group", "root"})
+
+PinKey = tuple[tuple[str, object], ...]
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -203,6 +222,8 @@ class Finding:
         xid: The row's ``xid``, or the scrub's for a count.
         group: The erasable group.
         count: How many rows a note or a count covers.
+        root: For a root or row count mismatch, the root rebuilt from the
+            rows, base64; a hash of leaves, never a value.
         waived: For an ``ACKNOWLEDGED`` note, the failure it stands for.
         ack: For an ``ACKNOWLEDGED`` note, the ``seq`` of the ack block.
     """
@@ -217,6 +238,7 @@ class Finding:
     xid: int | None = None
     group: str | None = None
     count: int | None = None
+    root: str | None = None
     waived: FailureKind | None = None
     ack: int | None = None
 
@@ -338,14 +360,27 @@ class Incarnation:
 
 @dataclass(frozen=True)
 class Ack:
-    """An ``ack`` block."""
+    """An ``ack`` block.
+
+    Attributes:
+        seq: Its block number.
+        failure: The kind it waives.
+        scope: The findings it covers, by ``SCOPE_KEYS``.
+        waives: The failures it waives, by ``pin_key``, as they were when it
+            was written.
+    """
 
     seq: int
     failure: FailureKind
     scope: Mapping[str, object]
+    waives: frozenset[PinKey] = frozenset()
 
     def covers(self, finding: Finding) -> bool:
-        """Whether the ack waives a failure."""
+        """Whether the ack waives a failure: in its scope, and as pinned."""
+        return self.in_scope(finding) and pin_key(finding) in self.waives
+
+    def in_scope(self, finding: Finding) -> bool:
+        """Whether a failure is of the ack's kind and in its scope."""
         if finding.kind != self.failure:
             return False
         for key, wanted in self.scope.items():
@@ -389,15 +424,67 @@ class Partition:
     pending: bool = False
 
 
+def pin(finding: Finding) -> dict[str, object]:
+    """What an ack stores of a failure it waives.
+
+    A row kind pins the row (``table``, ``id``, ``group``); any other kind
+    every field it has, with the ``count`` and ``root`` observed. A later
+    change to a pinned segment gives another root or count, so it is not
+    waived.
+    """
+    names = ("table", "id", "group") if finding.kind in ROW_KINDS else PIN_FIELDS
+    found = {name: getattr(finding, name) for name in (*names, "root")}
+    if finding.kind in ROW_KINDS:
+        del found["root"]
+    return {name: value for name, value in found.items() if value is not None}
+
+
+def pin_key(finding: Finding) -> PinKey:
+    """The pin of a failure, as ``Ack.waives`` holds it."""
+    return _pin_key(pin(finding))
+
+
+def _pin_key(pinned: Mapping[str, object]) -> PinKey:
+    return tuple(sorted(pinned.items()))
+
+
+def check_waives(value: object) -> frozenset[PinKey]:
+    """Validate the ``waives`` of an ack block.
+
+    Raises:
+        ValueError: Not a non-empty list of pins with known fields.
+    """
+    if not isinstance(value, list) or not value:
+        raise ValueError("an ack waives a non-empty list of failures")
+    keys: set[PinKey] = set()
+    for item in value:
+        if not isinstance(item, Mapping) or not item:
+            raise ValueError("an ack pin is a non-empty object")
+        for name, field_value in item.items():
+            if name not in (*PIN_FIELDS, "root"):
+                raise ValueError(f"unknown ack pin field {name!r}")
+            if name in _TEXT_PIN_FIELDS:
+                if not isinstance(field_value, str):
+                    raise ValueError(f"ack pin field {name!r} takes text")
+            elif not _is_int(field_value):
+                raise ValueError(f"ack pin field {name!r} takes an integer")
+        keys.add(_pin_key(item))
+    return frozenset(keys)
+
+
 def check_scope(scope: Mapping[str, object]) -> dict[str, object]:
     """Validate the scope of an ack.
 
     Raises:
-        ValueError: The scope is empty, has a key not in ``SCOPE_KEYS``, or a
-            value of the wrong type.
+        ValueError: The scope is empty or names only ``table``, has a key not
+            in ``SCOPE_KEYS``, or a value of the wrong type.
     """
     if not scope:
         raise ValueError("an ack needs a scope; an empty one would waive everything")
+    if set(scope) == {"table"}:
+        raise ValueError(
+            "an ack scope of only table would waive a whole table; narrow it"
+        )
     checked: dict[str, object] = {}
     for key, value in scope.items():
         if key not in SCOPE_KEYS:
@@ -784,9 +871,10 @@ class Verifier:
                 scope = body.get("scope")
                 if not isinstance(scope, Mapping):
                     raise ValueError("no scope")
-                self._acks.append(Ack(block.seq, failure, check_scope(scope)))
+                waives = check_waives(body.get("waives"))
+                self._acks.append(Ack(block.seq, failure, check_scope(scope), waives))
             except ValueError:
-                malformed("the ack block has no valid failure and scope")
+                malformed("the ack block has no valid failure, scope and pins")
         elif kind == "retire":
             stream, partition = body.get("stream"), body.get("partition")
             upper = _timestamp(body.get("upper_bound"))
@@ -1021,22 +1109,25 @@ class Verifier:
             state.closed.add(key)
             segment = expected.get(key)
             rows = 0 if segment is None else segment.rows
-            where = {"seq": key[0], "stream": key[1], "partition": name}
+            root = tree.root()
+            where = {
+                "seq": key[0],
+                "stream": key[1],
+                "partition": name,
+                "table": state.partition.table,
+                "count": tree.size,
+                "root": _b64(root),
+            }
             if tree.size != rows:
                 self._fail(
                     FailureKind.ROW_COUNT_MISMATCH,
                     f"the segment seals {rows} rows, the partition has {tree.size}",
-                    table=state.partition.table,
-                    count=tree.size,
                     **where,
                 )
-            elif segment is not None and not hmac.compare_digest(
-                tree.root(), segment.root
-            ):
+            elif segment is not None and not hmac.compare_digest(root, segment.root):
                 self._fail(
                     FailureKind.ROOT_MISMATCH,
                     "the rebuilt root differs from the sealed one",
-                    table=state.partition.table,
                     **where,
                 )
         if final:
@@ -1050,6 +1141,7 @@ class Verifier:
                         stream=segment.stream,
                         partition=name,
                         count=0,
+                        root=_b64(MerkleTree().root()),
                     )
 
     # -- schema and scrubs --
@@ -1227,6 +1319,7 @@ def _acknowledged(finding: Finding, ack: int) -> Finding:
         xid=finding.xid,
         group=finding.group,
         count=finding.count,
+        root=finding.root,
         waived=finding.kind,
         ack=ack,
     )
@@ -1285,6 +1378,10 @@ def _segments(seq: int, value: object) -> list[ExpectedSegment] | None:
         parsed.append(ExpectedSegment(seq, stream, partition, rows, root))
     keys = [(s.stream, s.partition) for s in parsed]
     return parsed if len(set(keys)) == len(keys) else None
+
+
+def _b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
 
 
 def _timestamp(value: object) -> datetime | None:

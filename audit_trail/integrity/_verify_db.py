@@ -46,6 +46,7 @@ from audit_trail.integrity._types import Xid8
 from audit_trail.integrity._verify import (
     ACTIVITY,
     TRANSACTION,
+    Ack,
     FailureKind,
     Partition,
     StoredBlock,
@@ -53,6 +54,8 @@ from audit_trail.integrity._verify import (
     Verifier,
     check_scope,
     failure_kind,
+    pin,
+    pin_key,
     stream_retention,
 )
 from audit_trail.maintenance import _children, _oid, _orphans, _qualified
@@ -356,15 +359,24 @@ def acknowledge(
     kind: FailureKind | str,
     scope: Mapping[str, object],
     reason: str,
+    *,
+    retention: Mapping[int, timedelta | None] | None = None,
+    transaction_retention: timedelta | None = None,
+    system_severity: int | None = None,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
 ) -> int:
     """Waive a known incident with an ``ack`` block in the chain.
 
-    Private for now. Later verifications report the failures of ``kind``
-    that ``scope`` matches as ``ACKNOWLEDGED`` notes naming this block,
-    instead of failing; the ack stays in the chain for every later reader.
-    Takes the sealer's advisory lock and appends the block after the last
-    one, hashed like every block, in a ``READ COMMITTED`` transaction of its
-    own that it commits.
+    Private for now. Runs ``verify`` on the connection first, and pins the
+    failures of ``kind`` that ``scope`` matches as it observed them: the
+    rows for a failure about a row, the root and row count for a segment,
+    every field for the rest. Later verifications report those failures as
+    ``ACKNOWLEDGED`` notes naming this block, instead of failing; a failure
+    that is new or changed since, in the same scope, is reported again. The
+    ack stays in the chain for every later reader. Takes the sealer's
+    advisory lock and appends the block after the last one, hashed like
+    every block, in a ``READ COMMITTED`` transaction of its own that it
+    commits.
 
     Args:
         connection: A connection that may insert into the block table, not
@@ -372,22 +384,27 @@ def acknowledge(
         tables: Audit tables built with integrity.
         kind: The failure kind to waive; only those about rows and
             partitions (``ACKNOWLEDGEABLE``).
-        scope: What it covers; keys from ``SCOPE_KEYS``, at least one, such
-            as ``{"xid_from": a, "xid_to": b}`` for a writer that ran
-            without ``Integrity``.
+        scope: What it covers; keys from ``SCOPE_KEYS``, at least one other
+            than ``table``, such as ``{"xid_from": a, "xid_to": b}`` for a
+            writer that ran without ``Integrity``.
         reason: Why, for whoever reads the chain; it is stored in clear.
+        retention: As ``verify`` takes it, to observe ``RETIRED_EARLY``.
+        transaction_retention: As ``verify`` takes it.
+        system_severity: As ``verify`` takes it.
+        chunk_rows: As ``verify`` takes it.
 
     Returns:
         The ``seq`` of the ack block.
 
     Raises:
-        ValueError: The kind cannot be waived, the scope is invalid, the
-            tables were built without integrity, the chain has no genesis
-            block, or the connection is in a transaction or ``AUTOCOMMIT``
-            mode.
+        ValueError: The kind cannot be waived, the scope is invalid, no
+            failure of the kind is in the scope, the tables were built
+            without integrity, the chain has no genesis block, or the
+            connection is in a transaction or ``AUTOCOMMIT`` mode.
     """
     failure = failure_kind(str(kind))
     checked = check_scope(scope)
+    options = _options(retention, transaction_retention, system_severity, chunk_rows)
     block = block_table(tables)
     if getattr(connection.connection.dbapi_connection, "autocommit", False):
         raise ValueError("acknowledge needs a transaction, not AUTOCOMMIT")
@@ -396,6 +413,14 @@ def acknowledge(
             "acknowledge runs its own transaction; pass a connection that is "
             "not in a transaction"
         )
+    report = _verify(connection, tables, block, options)
+    wanted = Ack(0, failure, checked)
+    pins = {pin_key(f): pin(f) for f in report.failures if wanted.in_scope(f)}
+    if not pins:
+        raise ValueError(
+            f"no {failure} failure in this scope; an ack would waive nothing"
+        )
+    waives = [pins[key] for key in sorted(pins, key=repr)]
     with connection.begin():
         connection.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
         # Blocks until no sealer runs; later statements see its block.
@@ -420,6 +445,13 @@ def acknowledge(
             )
         chain = str(parse_body(bytes(genesis.body))["chain"])
         seq = int(last.seq) + 1
-        body = ack_body(chain, seq, failure=failure.value, scope=checked, reason=reason)
+        body = ack_body(
+            chain,
+            seq,
+            failure=failure.value,
+            scope=checked,
+            waives=waives,
+            reason=reason,
+        )
         _insert(connection, block, seq, "ack", bytes(last.block_hash), body)
     return seq

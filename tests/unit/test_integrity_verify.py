@@ -698,6 +698,7 @@ def test_an_ack_turns_failures_into_notes() -> None:
             chain.next,
             failure="COMMITMENT_MISSING",
             scope={"table": "activity", "xid_from": 200, "xid_to": 201},
+            waives=[{"table": "activity", "id": 1}],
             reason="deploy",
         ),
     )
@@ -720,6 +721,7 @@ def test_an_ack_of_a_chain_failure_is_malformed(sealed: Sealed) -> None:
             chain.next,
             failure="HASH_MISMATCH",
             scope={"seq": 2},
+            waives=[{"seq": 2}],
             reason="no",
         ),
     )
@@ -731,16 +733,120 @@ def test_an_ack_of_a_chain_failure_is_malformed(sealed: Sealed) -> None:
 def test_ack_scope_ranges_are_half_open() -> None:
     ack = Ack(9, FailureKind.COMMITMENT_MISSING, {"xid_from": 10, "xid_to": 20})
     found = Finding(FailureKind.COMMITMENT_MISSING, "", xid=10)
+    assert ack.in_scope(found)
+    assert not ack.in_scope(dataclasses.replace(found, xid=20))
+    assert not ack.in_scope(dataclasses.replace(found, xid=None))
+    ack = dataclasses.replace(ack, waives=frozenset({_verify.pin_key(found)}))
     assert ack.covers(found)
     assert not ack.covers(dataclasses.replace(found, xid=20))
     assert not ack.covers(dataclasses.replace(found, xid=None))
     assert not ack.covers(dataclasses.replace(found, kind=FailureKind.ROOT_MISMATCH))
 
 
-@pytest.mark.parametrize("scope", [{}, {"salt": "x"}, {"xid": "1"}, {"table": 1}])
+@pytest.mark.parametrize(
+    "scope",
+    [{}, {"salt": "x"}, {"xid": "1"}, {"table": 1}, {"table": "activity"}],
+)
 def test_check_scope_refuses_bad_scopes(scope: dict[str, object]) -> None:
     with pytest.raises(ValueError, match="scope"):
         check_scope(scope)
+
+
+def broken_segment(sealed: Sealed) -> None:
+    """Change a sealed column of the first activity row."""
+    _chain, _transactions, activities = sealed
+    activities[0]["verb"] = "changed"
+
+
+def ack_of(chain: Chain, failure: str, scope: dict[str, Any], *found: Any) -> int:
+    pins = [_verify.pin(f) for f in found if f.kind == failure]
+    return chain.add(
+        "ack",
+        ack_body(
+            CHAIN, chain.next, failure=failure, scope=scope, waives=pins, reason="x"
+        ),
+    )
+
+
+def test_a_segment_ack_pins_the_root_and_count(sealed: Sealed) -> None:
+    chain, transactions, activities = sealed
+    broken_segment(sealed)
+    (found,) = check(chain, transactions, activities).failures
+    assert found.kind is FailureKind.ROOT_MISMATCH
+    assert found.root is not None
+    assert found.count == 2
+    ack = ack_of(chain, "ROOT_MISMATCH", {"seq": 2}, found)
+    report = check(chain, transactions, activities)
+    assert report.failures == []
+    assert [(f.waived, f.ack) for f in report.notes] == [
+        (FailureKind.ROOT_MISMATCH, ack)
+    ]
+    # Another change to the same segment is not the one acknowledged.
+    activities[1]["verb"] = "changed too"
+    report = check(chain, transactions, activities)
+    assert failures(report) == {FailureKind.ROOT_MISMATCH}
+    # Nor is a row deleted from it, though its count was acknowledged.
+    activities.pop()
+    assert failures(check(chain, transactions, activities)) == {
+        FailureKind.ROW_COUNT_MISMATCH
+    }
+
+
+def test_a_count_ack_pins_the_rows_left(sealed: Sealed) -> None:
+    chain, transactions, activities = sealed
+    activities.pop()
+    (found,) = check(chain, transactions, activities).failures
+    assert found.kind is FailureKind.ROW_COUNT_MISMATCH
+    ack_of(chain, "ROW_COUNT_MISMATCH", {"seq": 2, "table": "activity"}, found)
+    assert check(chain, transactions, activities).failures == []
+    # The one row left changed: same count, another root.
+    activities[0]["verb"] = "changed"
+    assert failures(check(chain, transactions, activities)) == {
+        FailureKind.ROW_COUNT_MISMATCH
+    }
+
+
+def test_a_row_ack_pins_the_row_ids() -> None:
+    # Written without Integrity, and sealed so.
+    activities = [activity_row(1, 200), activity_row(2, 200)]
+    for row in activities:
+        row.update(seal_commitments=None, seal_salts=None)
+    chain = Chain()
+    chain.seal(300, [], activities)
+    first, second = check(chain, [], activities).failures
+    # The ack saw only the first row fail.
+    ack_of(chain, "COMMITMENT_MISSING", {"seq": 2}, first)
+    report = check(chain, [], activities)
+    assert [(f.kind, f.id) for f in report.failures] == [
+        (FailureKind.COMMITMENT_MISSING, second.id)
+    ]
+    assert [f.id for f in report.notes] == [first.id]
+
+
+@pytest.mark.parametrize(
+    "waives",
+    [None, [], [{"id": "1"}], [{"salt": "x"}], ["x"], [{"count": True}]],
+)
+def test_an_ack_without_valid_pins_is_malformed(sealed: Sealed, waives: Any) -> None:
+    chain, transactions, activities = sealed
+    body = parse_body(
+        ack_body(
+            CHAIN,
+            chain.next,
+            failure="ROOT_MISMATCH",
+            scope={"seq": 2},
+            waives=[],
+            reason="x",
+        )
+    )
+    if waives is None:
+        del body["waives"]
+    else:
+        body["waives"] = waives
+    chain.add("ack", canonical(body))
+    assert failures(check(chain, transactions, activities)) == {
+        FailureKind.MALFORMED_BLOCK
+    }
 
 
 def test_retention_by_stream() -> None:

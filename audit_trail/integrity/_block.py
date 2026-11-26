@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -298,15 +298,23 @@ def horizon_of(body: Mapping[str, Any]) -> int:
 
 
 def ack_body(
-    chain: str, seq: int, *, failure: str, scope: Mapping[str, object], reason: str
+    chain: str,
+    seq: int,
+    *,
+    failure: str,
+    scope: Mapping[str, object],
+    waives: Sequence[Mapping[str, object]],
+    reason: str,
 ) -> bytes:
-    """Body of an ack block, which waives one kind of failure in a scope.
+    """Body of an ack block, which waives failures of one kind in a scope.
 
     Args:
         chain: The chain id.
         seq: The block's number.
         failure: Name of the failure kind it waives.
         scope: The findings it covers, as the verifier matches them.
+        waives: The failures it waives, each pinned as it was observed: the
+            row for a row, the root and count for a segment.
         reason: Why, as the operator wrote it.
     """
     return _body(
@@ -317,6 +325,7 @@ def ack_body(
             "seq": seq,
             "failure": failure,
             "scope": dict(scope),
+            "waives": [dict(pin) for pin in waives],
             "reason": reason,
         }
     )
