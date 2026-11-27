@@ -41,7 +41,7 @@ from sqlalchemy import (
     union_all,
 )
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.sql.selectable import Subquery
+from sqlalchemy.sql.selectable import Select, Subquery
 
 from audit_trail import _pg
 from audit_trail.integrity import _schema
@@ -619,6 +619,26 @@ def _windows(
 def check_floor(connection: Connection, tables: AuditTables, window: Window) -> None:
     """Refuse to seal when new rows may have ids at or below the floor.
 
+    Rows a fork left at or below the id floor belong to the incarnations
+    before it, so a new row that gets such an id (after an identity reset)
+    would never be sealed. Two checks catch that:
+
+    - the sequence: a table's identity sequence below the highest floor of
+      its streams (cheap, one read per table);
+    - the count: a stream with more rows at or below its floor than the
+      fork counted (``id_count``), for a sequence that was reset and has
+      climbed past the floor again. It reads at most ``id_count + 1``
+      entries of the primary key, so it runs only while the sequence is
+      within ``id_count`` of the floor. Past that the sequence check alone
+      remains: a reset is missed only if more than ``id_count`` ids were
+      drawn between two seals, or the sequence was set far above the floor
+      (``setval``) while rows with ids at or below it were left behind.
+
+    Retention weakens the count (not fixed): ``drop_expired`` drops rows at
+    or below the floor that the fork counted, so later more new rows can
+    hide under ``id_count`` before it refuses. The sequence check does not
+    depend on it.
+
     Raises:
         SealRefusedError: ``ID_FLOOR_VIOLATION``: a table's identity
             sequence is below the highest floor of its streams, or a stream
@@ -627,6 +647,7 @@ def check_floor(connection: Connection, tables: AuditTables, window: Window) -> 
     floors, counts = window.id_floor, window.id_count
     if floors is None or counts is None:
         return
+    values: dict[str, int | None] = {}
     for table in (tables.transaction, tables.activity):
         streams = [
             limit
@@ -635,7 +656,7 @@ def check_floor(connection: Connection, tables: AuditTables, window: Window) -> 
         ]
         if not streams:
             continue
-        value = sequence_value(connection, table)
+        value = values[table.name] = sequence_value(connection, table)
         if value is not None and value < max(streams):
             raise SealRefusedError(
                 "ID_FLOOR_VIOLATION",
@@ -645,19 +666,12 @@ def check_floor(connection: Connection, tables: AuditTables, window: Window) -> 
             )
     for stream, limit in floors.items():
         table = tables.transaction if stream == TRANSACTION_STREAM else tables.activity
-        condition = [table.c.id <= limit]
-        if stream != TRANSACTION_STREAM:
-            condition.append(table.c.severity == int(stream.removeprefix("activity.")))
         allowed = counts.get(stream, 0)
-        capped = (
-            select(literal_column("1", Integer))
-            .select_from(table)
-            .where(*condition)
-            .limit(allowed + 1)
-            .subquery()
-        )
+        value = values.get(table.name)
+        if value is not None and value > limit + allowed:
+            continue
         found = connection.execute(
-            select(func.count()).select_from(capped)
+            floor_count(table, stream, limit, allowed)
         ).scalar_one()
         if found > allowed:
             raise SealRefusedError(
@@ -666,6 +680,26 @@ def check_floor(connection: Connection, tables: AuditTables, window: Window) -> 
                 f"{allowed} the fork counted: new rows got ids of restored "
                 "rows (an identity reset?) and would never be sealed",
             )
+
+
+def floor_count(table: Table, stream: str, limit: int, allowed: int) -> Select[Any]:
+    """Rows of ``stream`` with ``id <= limit``, counted up to ``allowed + 1``.
+
+    Ordered by ``id`` so that the planner reads the primary key (``id``
+    first) from the floor down and stops after ``allowed + 1`` entries,
+    instead of scanning the table.
+    """
+    condition = [table.c.id <= limit]
+    if stream != TRANSACTION_STREAM:
+        condition.append(table.c.severity == int(stream.removeprefix("activity.")))
+    capped = (
+        select(table.c.id)
+        .where(*condition)
+        .order_by(table.c.id.desc())
+        .limit(allowed + 1)
+        .subquery()
+    )
+    return select(func.count()).select_from(capped)
 
 
 def sequence_value(connection: Connection, table: Table) -> int | None:

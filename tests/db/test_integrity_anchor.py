@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import Engine, delete, select, text
+from sqlalchemy import event as sa_event
 
 from audit_trail import AuditEvent, Severity, event, migrations
 from audit_trail.integrity import _seal
@@ -398,14 +399,46 @@ def test_a_reset_that_climbed_past_the_floor_is_refused_by_count(env: Env) -> No
         execute(env, f"ALTER TABLE {qualified(env, which)} ALTER COLUMN id RESTART")
     write(env, 1)  # ids 1 again: at or below the floor
     for which in ("transaction", "activity"):
+        # Past the floor (3), within id_count (3) of it.
         execute(
             env,
-            f"ALTER TABLE {qualified(env, which)} ALTER COLUMN id RESTART WITH 1000",
+            f"ALTER TABLE {qualified(env, which)} ALTER COLUMN id RESTART WITH 5",
         )
     with pytest.raises(SealRefusedError) as info:
         env.trail.maintenance.seal()
     assert info.value.reason == "ID_FLOOR_VIOLATION"
     assert "more rows" in str(info.value)
+
+
+def floor_counts(env: Env) -> int:
+    """How many id-floor counts one seal runs."""
+    statements: list[str] = []
+
+    def record(*args: Any) -> None:
+        statements.append(str(args[2]))
+
+    sa_event.listen(env.engine, "before_cursor_execute", record)
+    try:
+        env.trail.maintenance.seal(signer=OLD)
+    finally:
+        sa_event.remove(env.engine, "before_cursor_execute", record)
+    return sum("count(*)" in sql and ".id <= " in sql for sql in statements)
+
+
+def test_the_floor_count_runs_only_near_the_floor(env: Env) -> None:
+    window_fork(env)
+    # Floor 3 and id_count 3 for each stream: the count reads at most 4
+    # entries, while the sequence is within 3 of the floor.
+    write(env, 1)
+    assert floor_counts(env) == 2
+    for which in ("transaction", "activity"):
+        execute(
+            env,
+            f"ALTER TABLE {qualified(env, which)} ALTER COLUMN id RESTART WITH 100",
+        )
+    write(env, 1)
+    assert floor_counts(env) == 0
+    assert run(env, verifier=BOTH).failures == []
 
 
 def test_a_fork_is_refused_while_a_sequence_is_behind(env: Env) -> None:
