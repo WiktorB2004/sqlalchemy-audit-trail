@@ -39,7 +39,11 @@ from typing import TypedDict
 from audit_trail.integrity._canonical import CanonicalEncodingError, canonical
 
 ACTOR_FIELDS: tuple[str, ...] = ("actor_label", "remote_addr", "user_agent", "meta")
-"""The fields of the ``actor`` group; the same as ``privacy.ACTOR_FIELDS``."""
+"""The fields of the ``actor`` group: the columns of ``audit_transaction``,
+and keys of ``data.context``, that ``privacy.scrub_actor`` clears.
+
+Defined here, in a module that imports no SQLAlchemy, so the verifier can
+use it; ``privacy.ACTOR_FIELDS`` is the same tuple."""
 
 ACTIVITY_GROUPS: tuple[str, ...] = ("label", "changes", "payload", "actor")
 """The groups of an ``audit_activity`` row."""

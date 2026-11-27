@@ -38,6 +38,7 @@ from audit_trail.context import AuditContext, current_context
 from audit_trail.diff import ERASED
 from audit_trail.events import AuditSystem
 from audit_trail.integrity import _schema as integrity_schema
+from audit_trail.integrity._commit import ACTOR_FIELDS as _ACTOR_FIELDS
 from audit_trail.query import _check_collection, _member_of
 from audit_trail.writer import (
     ENVELOPE_VERSION,
@@ -52,7 +53,7 @@ if TYPE_CHECKING:
     from audit_trail.serialization import JSONValue
     from audit_trail.tables import AuditTables
 
-ACTOR_FIELDS: tuple[str, ...] = ("actor_label", "remote_addr", "user_agent", "meta")
+ACTOR_FIELDS = _ACTOR_FIELDS
 """Columns of ``audit_transaction`` and keys of ``data.context`` that
 ``scrub_actor`` clears."""
 
