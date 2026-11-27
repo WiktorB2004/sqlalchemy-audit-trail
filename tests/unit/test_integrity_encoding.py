@@ -67,6 +67,11 @@ def no_int_limit() -> Iterator[None]:
     sys.set_int_max_str_digits(previous)
 
 
+def test_int_digit_limit_is_pinned() -> None:
+    # Taken from Python's default; a Python that changes it changes the format.
+    assert MAX_INT_DIGITS == 4300
+
+
 def test_int_digit_limit() -> None:
     assert canonical(10 ** (MAX_INT_DIGITS - 1)) == b"1" + b"0" * (MAX_INT_DIGITS - 1)
     with pytest.raises(CanonicalEncodingError, match="4300 digits"):

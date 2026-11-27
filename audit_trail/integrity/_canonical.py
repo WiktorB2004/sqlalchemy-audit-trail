@@ -27,11 +27,16 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 
-MAX_INT_DIGITS = 4300
-"""Most digits of an encoded int or ``Decimal``, Python's default ``str()`` limit."""
+MAX_INT_DIGITS = sys.int_info.default_max_str_digits
+"""Most digits of an encoded int or ``Decimal``, Python's default ``str()`` limit.
+
+It is 4300 on every supported Python; a test pins it, since a change would
+change which values have an encoding.
+"""
 
 
 class CanonicalEncodingError(ValueError):
