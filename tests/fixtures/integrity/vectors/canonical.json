@@ -1,0 +1,145 @@
+{
+  "encode": [
+    {
+      "name": "negative zero float",
+      "input": "-0.0",
+      "canonical": "0"
+    },
+    {
+      "name": "negative zero with fraction digits",
+      "input": "-0.000",
+      "canonical": "0"
+    },
+    {
+      "name": "integral float 1e16 reads back as an int",
+      "input": "1e16",
+      "canonical": "10000000000000000"
+    },
+    {
+      "name": "same value as an int",
+      "input": "10000000000000000",
+      "canonical": "10000000000000000"
+    },
+    {
+      "name": "float with trailing zero",
+      "input": "2.50",
+      "canonical": "2.5"
+    },
+    {
+      "name": "integral float",
+      "input": "100.0",
+      "canonical": "100"
+    },
+    {
+      "name": "small float",
+      "input": "1e-7",
+      "canonical": "0.0000001"
+    },
+    {
+      "name": "float 0.1",
+      "input": "0.1",
+      "canonical": "0.1"
+    },
+    {
+      "name": "large float",
+      "input": "12345678901234567890.0",
+      "canonical": "12345678901234567000"
+    },
+    {
+      "name": "largest exponent",
+      "input": "1e300",
+      "canonical": "1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "smallest subnormal",
+      "input": "5e-324",
+      "canonical": "0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005"
+    },
+    {
+      "name": "negative float",
+      "input": "-1.25",
+      "canonical": "-1.25"
+    },
+    {
+      "name": "2^60 as an int",
+      "input": "1152921504606846976",
+      "canonical": "1152921504606846976"
+    },
+    {
+      "name": "2^60 as a string",
+      "input": "\"1152921504606846976\"",
+      "canonical": "\"1152921504606846976\""
+    },
+    {
+      "name": "int above 2^64",
+      "input": "123456789012345678901234567890123456789",
+      "canonical": "123456789012345678901234567890123456789"
+    },
+    {
+      "name": "negative int",
+      "input": "-42",
+      "canonical": "-42"
+    },
+    {
+      "name": "null",
+      "input": "null",
+      "canonical": "null"
+    },
+    {
+      "name": "booleans",
+      "input": "[true,false]",
+      "canonical": "[true,false]"
+    },
+    {
+      "name": "empty object and array",
+      "input": "{\"a\":{},\"b\":[]}",
+      "canonical": "{\"a\":{},\"b\":[]}"
+    },
+    {
+      "name": "keys in UTF-16 order: supplementary plane before U+E000",
+      "input": "{\"\\ue000\": 1, \"\\ud83d\\ude00\": 2, \"a\": 3, \"\\u00e9\": 4}",
+      "canonical": "{\"a\":3,\"\u00e9\":4,\"\ud83d\ude00\":2,\"\ue000\":1}"
+    },
+    {
+      "name": "string escapes",
+      "input": "\"q\\\"b\\\\n\\nt\\tc\\u0001d\\u007fl\\u2028e\\u00e9\"",
+      "canonical": "\"q\\\"b\\\\n\\nt\\tc\\u0001d\u007fl\u2028e\u00e9\""
+    },
+    {
+      "name": "short escapes",
+      "input": "\"\\b\\f\\r/\"",
+      "canonical": "\"\\b\\f\\r/\""
+    },
+    {
+      "name": "nested values sorted and normalised",
+      "input": "{\"b\": [1, 2.50, {\"z\": null, \"a\": true}], \"a\": false}",
+      "canonical": "{\"a\":false,\"b\":[1,2.5,{\"a\":true,\"z\":null}]}"
+    }
+  ],
+  "refuse": [
+    {
+      "name": "NUL in a string",
+      "input": "\"a\\u0000b\""
+    },
+    {
+      "name": "NUL in a key",
+      "input": "{\"\\u0000\": 1}"
+    },
+    {
+      "name": "lone high surrogate",
+      "input": "\"\\ud800\""
+    },
+    {
+      "name": "lone low surrogate in a key",
+      "input": "{\"\\udc00\": 1}"
+    },
+    {
+      "name": "NaN",
+      "input": "NaN"
+    },
+    {
+      "name": "infinity",
+      "input": "-Infinity"
+    }
+  ]
+}

@@ -27,9 +27,17 @@ from sqlalchemy import Connection, Table, insert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+from audit_trail import _pg
 from audit_trail._compaction import ActivityData
 from audit_trail.context import AuditContext, ContextSnapshot, context_snapshot
 from audit_trail.events import PayloadError
+from audit_trail.integrity._canonical import CanonicalEncodingError
+from audit_trail.integrity._commit import (
+    activity_groups,
+    seal_columns,
+    transaction_groups,
+)
+from audit_trail.integrity._schema import has_integrity
 from audit_trail.maintenance import PartitionError, ensure_partitions
 from audit_trail.serialization import (
     JSONValue,
@@ -49,7 +57,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-CHECK_VIOLATION = "23514"
+CHECK_VIOLATION = _pg.CHECK_VIOLATION
+UNDEFINED_COLUMN = _pg.UNDEFINED_COLUMN
+
+MISSING_INTEGRITY_COLUMNS = (
+    "Integrity is on, but the audit tables lack a column it writes; "
+    "run migrations.add_integrity() on them"
+)
+"""What a write with integrity on reports when a column is missing."""
 """SQLSTATE of a row that fits no partition (and of other CHECK violations)."""
 
 ENVELOPE_VERSION = 1
@@ -68,7 +83,8 @@ class AuditWriteError(Exception):
 
     Raised for ``fail_closed`` events, and for other durable writes with
     ``on_error="raise"``. The original error (a ``DBAPIError``, the pool's
-    ``sqlalchemy.exc.TimeoutError``, a ``PartitionError`` or, from ``alog``,
+    ``sqlalchemy.exc.TimeoutError``, a ``PartitionError``, a
+    ``CanonicalEncodingError`` of an integrity commitment or, from ``alog``,
     a connection error the async driver raised unwrapped) is the
     ``__cause__``. Nothing of the entry was committed.
     """
@@ -274,6 +290,9 @@ def insert_transaction(
 ) -> TransactionRow:
     """Insert an ``audit_transaction`` row.
 
+    On a table with the integrity columns, the row gets fresh commitments and
+    salts on every call, so a retried write never reuses a salt.
+
     Args:
         connection: Connection in the transaction being audited.
         table: The ``audit_transaction`` table.
@@ -285,7 +304,10 @@ def insert_transaction(
     statement = insert(table).returning(
         table.c.id, table.c.issued_at, table.c.correlation_id
     )
-    row_id, issued_at, correlation_id = connection.execute(statement, values).one()
+    row: Mapping[str, object] = values
+    if has_integrity(table):
+        row = {**values, **seal_columns(transaction_groups(values))}
+    row_id, issued_at, correlation_id = connection.execute(statement, row).one()
     return TransactionRow(row_id, issued_at, correlation_id)
 
 
@@ -308,49 +330,93 @@ def insert_activities(
     """
     if not entries:
         return
-    rows: list[ActivityValues] = [
-        {
+    connection.execute(insert(table), activity_rows(table, transaction, entries))
+
+
+def activity_rows(
+    table: Table, transaction: TransactionRow, entries: Sequence[Entry]
+) -> list[dict[str, object]]:
+    """Build the ``audit_activity`` rows of ``insert_activities``.
+
+    Every row has the same keys: ``executemany`` takes its column list from
+    the first row, raises for a later row that lacks a key and silently drops
+    a key the first row does not have. On a table with the integrity columns
+    each row also gets ``SealColumns``, with fresh salts.
+
+    Args:
+        table: The ``audit_activity`` table.
+        transaction: The transaction row the entries belong to.
+        entries: The entries.
+
+    Returns:
+        The rows, in the order of ``entries``.
+
+    Raises:
+        CanonicalEncodingError: An erasable value has no canonical encoding.
+    """
+    sealed = has_integrity(table)
+    rows: list[dict[str, object]] = []
+    for entry in entries:
+        values: ActivityValues = {
             **entry,
             "transaction_id": transaction.id,
             "correlation_id": transaction.correlation_id,
             "created_at": transaction.issued_at,
         }
-        for entry in entries
-    ]
-    connection.execute(insert(table), rows)
+        row: dict[str, object] = dict(values)
+        if sealed:
+            groups = activity_groups(entry["object_label"], entry["data"])
+            row.update(seal_columns(groups))
+        rows.append(row)
+    return rows
 
 
 def run_isolated(
-    connection: Connection, on_error: OnError, work: Callable[[], _T]
+    connection: Connection,
+    on_error: OnError,
+    work: Callable[[], _T],
+    *,
+    integrity: bool = False,
 ) -> _T | None:
     """Run an audit write according to the ``on_error`` policy.
 
     ``"raise"`` runs ``work`` directly; any error propagates and fails the
     caller's transaction. ``"log"`` runs it inside a savepoint on the
     connection (never a ``Session`` savepoint, which would snapshot and later
-    restore the unit of work in the middle of a flush). A ``DBAPIError`` rolls
-    the savepoint back, is logged and swallowed, so the caller's transaction
-    continues without the audit rows. A missing partition (SQLSTATE
-    ``23514``) is logged as such; it is not retried. Other exceptions always
-    propagate.
+    restore the unit of work in the middle of a flush). A ``DBAPIError``, or
+    a ``CanonicalEncodingError`` refusing a value an integrity commitment
+    cannot encode, rolls the savepoint back, is logged and swallowed, so the
+    caller's transaction continues without the audit rows. A missing
+    partition (SQLSTATE ``23514``) is logged as such; it is not retried.
+    Other exceptions always propagate.
+
+    With ``integrity``, a missing column (SQLSTATE ``42703``) is reported as
+    ``MISSING_INTEGRITY_COLUMNS``: in the log message, or as a note on the
+    raised error.
 
     Args:
         connection: Connection in the transaction being audited.
         on_error: The write policy.
         work: The inserts to run.
+        integrity: The audit tables were built with the integrity columns.
 
     Returns:
-        What ``work`` returned, or ``None`` when a database error was logged.
+        What ``work`` returned, or ``None`` when a failure was logged.
     """
     match on_error:
         case "raise":
-            return work()
+            try:
+                return work()
+            except DBAPIError as exc:
+                if is_missing_integrity_column(exc, integrity):
+                    exc.add_note(MISSING_INTEGRITY_COLUMNS)
+                raise
         case "log":
             try:
                 with connection.begin_nested():
                     return work()
-            except DBAPIError as exc:
-                _log_failure(exc)
+            except (DBAPIError, CanonicalEncodingError) as exc:
+                _log_failure(exc, integrity)
                 return None
         case _:
             assert_never(on_error)
@@ -366,17 +432,41 @@ def is_missing_partition(exc: DBAPIError) -> bool:
         ``True`` for SQLSTATE ``23514`` with PostgreSQL's "no partition of
         relation" message.
     """
-    orig = exc.orig
-    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
-    return sqlstate == CHECK_VIOLATION and _NO_PARTITION in str(orig)
+    return _pg.is_sqlstate(exc, CHECK_VIOLATION) and _NO_PARTITION in str(exc.orig)
 
 
-def _log_failure(exc: DBAPIError) -> None:
-    if is_missing_partition(exc):
+def is_missing_integrity_column(exc: BaseException, integrity: bool) -> bool:
+    """Tell whether a write with integrity on failed on a missing column.
+
+    It looks only at the error; the write path runs no extra query.
+
+    Args:
+        exc: The error.
+        integrity: The audit tables were built with the integrity columns.
+
+    Returns:
+        ``True`` for SQLSTATE ``42703`` when ``integrity`` is set.
+    """
+    return (
+        integrity
+        and isinstance(exc, DBAPIError)
+        and _pg.is_sqlstate(exc, UNDEFINED_COLUMN)
+    )
+
+
+def _log_failure(exc: DBAPIError | CanonicalEncodingError, integrity: bool) -> None:
+    if isinstance(exc, DBAPIError) and is_missing_partition(exc):
         logger.error(
             "Audit entries were not written: no partition for the row (%s). "
             "Run ensure_partitions; the business transaction continues.",
             str(exc.orig).strip(),
+        )
+        return
+    if is_missing_integrity_column(exc, integrity):
+        logger.error(
+            "Audit entries were not written: %s. The business transaction continues.",
+            MISSING_INTEGRITY_COLUMNS,
+            exc_info=exc,
         )
         return
     logger.error(
@@ -417,6 +507,8 @@ def write_durable(
         DBAPIError: An insert failed (on the retry, when there was one).
         PartitionError: Creating the partitions failed, for example
             ``PartitionLockTimeoutError``.
+        CanonicalEncodingError: An integrity commitment cannot encode a
+            value of the entry; nothing was inserted.
     """
 
     def insert_all() -> TransactionRow:
@@ -446,7 +538,12 @@ def write_durable(
     return insert_all()
 
 
-DURABLE_WRITE_ERRORS = (DBAPIError, PoolTimeoutError, PartitionError)
+DURABLE_WRITE_ERRORS = (
+    DBAPIError,
+    PoolTimeoutError,
+    PartitionError,
+    CanonicalEncodingError,
+)
 """Failures of a durable write that the write policy handles."""
 
 
@@ -482,26 +579,38 @@ def handle_durable_failure(
     exc: Exception,
     on_error: OnError,
     fail_closed: bool,
+    *,
+    integrity: bool = False,
 ) -> None:
     """Apply the write policy to a failed durable write.
 
     A ``fail_closed`` write, or any durable write with ``on_error="raise"``,
-    raises ``AuditWriteError``; otherwise the failure is logged.
+    raises ``AuditWriteError``; otherwise the failure is logged. With
+    ``integrity``, a missing column (SQLSTATE ``42703``) is reported as
+    ``MISSING_INTEGRITY_COLUMNS`` in the error or the log message.
 
     Args:
         exc: The failure, one of ``DURABLE_WRITE_ERRORS`` or, from ``alog``,
             ``async_durable_write_errors()``.
         on_error: The write policy.
         fail_closed: The entry must not be lost; always raise.
+        integrity: The audit tables were built with the integrity columns.
 
     Raises:
         AuditWriteError: The policy says to raise; ``exc`` is the cause.
     """
+    hint = ""
+    if is_missing_integrity_column(exc, integrity):
+        hint = f": {MISSING_INTEGRITY_COLUMNS}"
     if fail_closed:
-        raise AuditWriteError("a fail_closed audit entry was not written") from exc
+        raise AuditWriteError(
+            f"a fail_closed audit entry was not written{hint}"
+        ) from exc
     match on_error:
         case "raise":
-            raise AuditWriteError("a durable audit entry was not written") from exc
+            raise AuditWriteError(
+                f"a durable audit entry was not written{hint}"
+            ) from exc
         case "log":
             if isinstance(exc, DBAPIError) and is_missing_partition(exc):
                 logger.error(
@@ -510,6 +619,8 @@ def handle_durable_failure(
                     str(exc.orig).strip(),
                 )
             else:
-                logger.error("A durable audit entry was not written.", exc_info=exc)
+                logger.error(
+                    "A durable audit entry was not written%s.", hint, exc_info=exc
+                )
         case _:
             assert_never(on_error)

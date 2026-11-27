@@ -1,0 +1,14 @@
+[
+  {
+    "name": "empty row",
+    "row": "{}",
+    "canonical": "{}",
+    "leaf": "e8108c5900a84a2c132db7d61cceb77ace1a21406ab88969cfae62613c4b3429"
+  },
+  {
+    "name": "row with an xid and a commitment",
+    "row": "{\"id\": 7, \"xid\": 123456789, \"verb\": \"entity.updated\", \"seal_commitments\": {\"label\": \"AAAA\"}, \"created_at\": \"2026-01-10T12:00:00.000000Z\"}",
+    "canonical": "{\"created_at\":\"2026-01-10T12:00:00.000000Z\",\"id\":7,\"seal_commitments\":{\"label\":\"AAAA\"},\"verb\":\"entity.updated\",\"xid\":123456789}",
+    "leaf": "5347aa7e6afe77ae686e8116d1140c129279b5565853d0168f509b6829b116a0"
+  }
+]

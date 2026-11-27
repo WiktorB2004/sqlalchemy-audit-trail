@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
     from sqlalchemy.orm import Session, sessionmaker
 
+    from audit_trail.integrity._options import Integrity
     from audit_trail.privacy import ScrubbedRecord, ScrubResult
     from audit_trail.writer import Entry, TransactionValues
 
@@ -156,6 +157,8 @@ class AuditTrail:
             it is not given ``since``, for example ``timedelta(days=30)``;
             ``since=ALL_HISTORY`` still lists the whole log. ``None`` reads
             the whole log, which gets slower as it grows.
+        integrity: Tamper-evidence settings of this writer, or ``None`` (the
+            default) to leave the audit tables as they are. Private for now.
 
     Attributes:
         severities: The severity enum in use.
@@ -201,6 +204,7 @@ class AuditTrail:
         auto_create_partitions: bool = False,
         allow_scrub: bool = False,
         default_query_window: timedelta | None = None,
+        integrity: Integrity | None = None,
     ) -> None:
         self.engine = engine
         self.schema = schema
@@ -228,7 +232,10 @@ class AuditTrail:
         self.auto_create_partitions = auto_create_partitions
         self.allow_scrub = allow_scrub
         self.keys = None if pseudonymize_key is None else KeyRing(pseudonymize_key)
-        self.tables = build_tables(schema=schema, indexes=indexes)
+        self.integrity = integrity
+        self.tables = build_tables(
+            schema=schema, indexes=indexes, integrity=integrity is not None
+        )
         self.maintenance = PartitionManager(engine, self.tables, self.severities)
         from audit_trail.query import AuditQuery
 
@@ -474,7 +481,12 @@ class AuditTrail:
                     auto_create_partitions=self.auto_create_partitions,
                 )
         except DURABLE_WRITE_ERRORS as exc:
-            handle_durable_failure(exc, self.on_error, entry.flags.fail_closed)
+            handle_durable_failure(
+                exc,
+                self.on_error,
+                entry.flags.fail_closed,
+                integrity=self.integrity is not None,
+            )
 
     @overload
     async def alog(
@@ -594,7 +606,12 @@ class AuditTrail:
                     auto_create_partitions=self.auto_create_partitions,
                 )
         except async_durable_write_errors() as exc:
-            handle_durable_failure(exc, self.on_error, entry.flags.fail_closed)
+            handle_durable_failure(
+                exc,
+                self.on_error,
+                entry.flags.fail_closed,
+                integrity=self.integrity is not None,
+            )
 
     def scrub(
         self,

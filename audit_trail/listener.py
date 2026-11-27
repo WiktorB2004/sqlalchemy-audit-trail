@@ -607,7 +607,9 @@ def _write_group(
         insert_activities(connection, trail.tables.activity, row, entries)
         return row
 
-    row = run_isolated(connection, trail.on_error, work)
+    row = run_isolated(
+        connection, trail.on_error, work, integrity=trail.integrity is not None
+    )
     if row is not None and cached is None:
         owner = session.get_nested_transaction() or session.get_transaction()
         assert owner is not None  # session.connection() began one

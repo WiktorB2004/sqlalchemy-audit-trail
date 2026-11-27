@@ -1,0 +1,37 @@
+[
+  {
+    "group": "label",
+    "salt": "000102030405060708090a0b0c0d0e0f",
+    "value": "\"Doc One\"",
+    "canonical": "\"Doc One\"",
+    "commitment": "d6757a9b93c9bc702ad9a6eba65517c1f2c8de83f5398893b28cad79b04b7567"
+  },
+  {
+    "group": "changes",
+    "salt": "ffeeddccbbaa99887766554433221100",
+    "value": "{\"title\": [\"Old title\", \"New title\"], \"size\": [-0.0, 1e16]}",
+    "canonical": "{\"size\":[0,10000000000000000],\"title\":[\"Old title\",\"New title\"]}",
+    "commitment": "b63f715c0d34e8337d7d95460407e7a037890b895c6e7e715d34ee4d4e2753d4"
+  },
+  {
+    "group": "payload",
+    "salt": "00000000000000000000000000000000",
+    "value": "{\"email\": \"ann@example.com\", \"\\ud83d\\ude00\": \"x\", \"\\ue000\": 1.50}",
+    "canonical": "{\"email\":\"ann@example.com\",\"\ud83d\ude00\":\"x\",\"\ue000\":1.5}",
+    "commitment": "47db8f7774154ea389d06788da4b79d0f0647b8a3c4b2f240547895493aae166"
+  },
+  {
+    "group": "actor",
+    "salt": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+    "value": "{\"actor_label\": \"Ann\", \"remote_addr\": \"10.0.0.1\", \"meta\": {\"tenant\": 7}}",
+    "canonical": "{\"actor_label\":\"Ann\",\"meta\":{\"tenant\":7},\"remote_addr\":\"10.0.0.1\"}",
+    "commitment": "f46851f3b83f577136000e617492f542c5814fac7ba75d8d3a5586223a93a81d"
+  },
+  {
+    "group": "label2",
+    "salt": "000102030405060708090a0b0c0d0e0f",
+    "value": "\"Doc One\"",
+    "canonical": "\"Doc One\"",
+    "commitment": "9345cf758b04cacafc815a1d0b7ddbddc98c130bd6fd35727c77b288bcf7287b"
+  }
+]

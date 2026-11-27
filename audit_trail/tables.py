@@ -37,6 +37,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 from sqlalchemy.exc import UnboundExecutionError
 
+from audit_trail.integrity import _schema as integrity_schema
+
 if TYPE_CHECKING:
     from sqlalchemy import Connection
     from sqlalchemy.orm import Session
@@ -119,6 +121,7 @@ def build_tables(
     transaction_table: str = "audit_transaction",
     activity_table: str = "audit_activity",
     indexes: Collection[str] | None = None,
+    integrity: bool = False,
 ) -> AuditTables:
     """Build the audit tables in a new ``MetaData``.
 
@@ -129,6 +132,9 @@ def build_tables(
         indexes: Keys of the ``audit_activity`` indexes to create, from
             ``ALL_INDEXES``. ``None`` uses ``DEFAULT_INDEXES``. ``changes_gin``
             is a GIN index on ``data -> 'changes'`` and is off by default.
+        integrity: Declare the integrity columns (``xid`` and the ``seal_*``
+            columns) and their ``(xid, id)`` indexes on both tables. Private
+            for now; off by default, which leaves the tables as before.
 
     Returns:
         The tables and their metadata.
@@ -174,6 +180,7 @@ def build_tables(
         Column("request_id", UUID(as_uuid=True)),
         Column("correlation_id", UUID(as_uuid=True)),
         Column("meta", JSONB),
+        *(integrity_schema.columns() if integrity else ()),
         PrimaryKeyConstraint("id", "issued_at", name=f"{transaction_table}_pkey"),
         postgresql_partition_by="RANGE (issued_at)",
     )
@@ -194,6 +201,7 @@ def build_tables(
         Column("correlation_id", UUID(as_uuid=True)),
         Column("created_at", DateTime(timezone=True), nullable=False),
         Column("data", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
+        *(integrity_schema.columns() if integrity else ()),
         PrimaryKeyConstraint(
             "id", "severity", "created_at", name=f"{activity_table}_pkey"
         ),
@@ -201,6 +209,9 @@ def build_tables(
     )
     for key in sorted(index_keys):
         _activity_index(activity, key)
+    if integrity:
+        integrity_schema.add_xid_index(transaction)
+        integrity_schema.add_xid_index(activity)
     return AuditTables(metadata=metadata, transaction=transaction, activity=activity)
 
 

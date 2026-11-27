@@ -11,16 +11,18 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from datetime import datetime
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from sqlalchemy import (
     ColumnElement,
     Connection,
+    Table,
     Text,
     Update,
     and_,
+    case,
     exists,
     false,
     func,
@@ -35,6 +37,8 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from audit_trail.context import AuditContext, current_context
 from audit_trail.diff import ERASED
 from audit_trail.events import AuditSystem
+from audit_trail.integrity import _schema as integrity_schema
+from audit_trail.integrity._commit import ACTOR_FIELDS as _ACTOR_FIELDS
 from audit_trail.query import _check_collection, _member_of
 from audit_trail.writer import (
     ENVELOPE_VERSION,
@@ -49,7 +53,7 @@ if TYPE_CHECKING:
     from audit_trail.serialization import JSONValue
     from audit_trail.tables import AuditTables
 
-ACTOR_FIELDS: tuple[str, ...] = ("actor_label", "remote_addr", "user_agent", "meta")
+ACTOR_FIELDS = _ACTOR_FIELDS
 """Columns of ``audit_transaction`` and keys of ``data.context`` that
 ``scrub_actor`` clears."""
 
@@ -103,6 +107,11 @@ _ERASED_DATA = (
     f"jsonb_set(jsonb_set(data, '{{changes}}', {_ERASED_CHANGES}, false), "
     f"'{{payload}}', {_ERASED_PAYLOAD}, false)"
 )
+
+# The integrity groups each operation erases; scrub always stamps all three
+# together, also for a row without a label or payload.
+_SCRUB_GROUPS = ("label", "changes", "payload")
+_ACTOR_GROUPS = ("actor",)
 
 _ACTOR_KEYS = "ARRAY[" + ", ".join(f"'{key}'" for key in ACTOR_FIELDS) + "]"
 
@@ -239,7 +248,11 @@ def scrub_statement(
     return (
         update(tables.activity)
         .where(*conditions)
-        .values(object_label=null(), data=erased)
+        .values(
+            object_label=null(),
+            data=erased,
+            **_seal_erased(tables.activity, _SCRUB_GROUPS),
+        )
     )
 
 
@@ -380,7 +393,12 @@ def scrub_actor(
     cleared = connection.execute(
         update(transaction)
         .where(*tx_conditions)
-        .values({name: null() for name in ACTOR_FIELDS})
+        .values(
+            {
+                **{name: null() for name in ACTOR_FIELDS},
+                **_seal_erased(transaction, _ACTOR_GROUPS),
+            }
+        )
     ).rowcount
 
     keys = literal_column(_ACTOR_KEYS, ARRAY(Text))
@@ -395,7 +413,8 @@ def scrub_actor(
                 context.op("-", return_type=JSONB)(keys),
                 false(),
                 type_=JSONB,
-            )
+            ),
+            **_seal_erased(activity, _ACTOR_GROUPS),
         )
     ).rowcount
 
@@ -432,6 +451,42 @@ def _all_entries_match(
     of_row = activity.c.transaction_id == tables.transaction.c.id
     outside = or_(activity.c.scope_id.is_(None), not_(in_scope))
     return and_(exists().where(of_row), ~exists().where(of_row, outside))
+
+
+def _seal_erased(table: Table, groups: Sequence[str]) -> dict[str, ColumnElement[Any]]:
+    """The integrity column updates of a scrub erasing ``groups`` of a row.
+
+    Each group's salt is removed from ``seal_salts``, and ``seal_erased`` maps
+    it to the scrub's transaction id: the ``audit.scrubbed`` entry is written
+    in the same transaction, so it has that ``xid`` and the stamp points to
+    it. ``coalesce`` is needed because ``NULL || ...`` is ``NULL``, which
+    would lose the stamp. A row written without integrity (``NULL``
+    ``seal_commitments``) has nothing to stamp and is left as it is; a row
+    with commitments gets every group of the operation stamped, also one it
+    has no commitment for. Nothing on a table without the integrity columns.
+    """
+    if not integrity_schema.has_integrity(table):
+        return {}
+    # The group names are constants, never bound values.
+    names = [literal_column(f"'{group}'::text", Text) for group in groups]
+    salts: ColumnElement[Any] = table.c[integrity_schema.SALTS]
+    for name in names:
+        salts = salts.op("-", return_type=JSONB)(name)
+    xid = func.pg_current_xact_id().cast(Text)
+    stamps = func.jsonb_build_object(
+        *(item for name in names for item in (name, xid)), type_=JSONB
+    )
+    erased = func.coalesce(
+        table.c[integrity_schema.ERASED], literal_column("'{}'::jsonb"), type_=JSONB
+    )
+    sealed = table.c[integrity_schema.COMMITMENTS].is_not(None)
+    return {
+        integrity_schema.SALTS: salts,
+        integrity_schema.ERASED: case(
+            (sealed, erased.op("||", return_type=JSONB)(stamps)),
+            else_=table.c[integrity_schema.ERASED],
+        ),
+    }
 
 
 def _recorded(scope_ids: Collection[str] | None) -> JSONValue:

@@ -60,8 +60,9 @@ from sqlalchemy.exc import NoReferenceError
 from audit_trail._compaction import ActivityData, ActivityRow, FieldChange, compact_rows
 from audit_trail.checks import _registry_of
 from audit_trail.diff import REDACTED, UNKNOWN, field_policy, options_of
+from audit_trail.integrity import _schema as integrity_schema
 from audit_trail.serialization import JSONValue
-from audit_trail.tables import AuditTables, audit_connection
+from audit_trail.tables import AuditTables, audit_connection, build_tables
 
 if TYPE_CHECKING:
     from sqlalchemy import ColumnClause, Connection, Table
@@ -667,13 +668,17 @@ class AuditQuery:
             conditions.append(visibility.predicate(a))
         connection = audit_connection(session, self.tables)
         connection.execute(_CUSTOM_PLAN)
-        row = connection.execute(select(a).where(*conditions)).mappings().first()
+        row = (
+            connection.execute(select(*_read(a, _ACTIVITY_COLUMNS)).where(*conditions))
+            .mappings()
+            .first()
+        )
         if row is None:
             return None
         activity = _activity(row)
         header = (
             connection.execute(
-                select(t).where(
+                select(*_read(t, _HEADER_COLUMNS)).where(
                     t.c.id == activity["transaction_id"],
                     t.c.issued_at == activity["created_at"],
                 )
@@ -1204,14 +1209,20 @@ class AuditQuery:
         if scope is not None:
             conditions.append(scope)
         rows: dict[int, list[ActivityRow]] = {}
-        statement = select(a).where(*conditions).order_by(a.c.transaction_id, a.c.id)
+        statement = (
+            select(*_read(a, _ACTIVITY_COLUMNS))
+            .where(*conditions)
+            .order_by(a.c.transaction_id, a.c.id)
+        )
         for mapping in connection.execute(statement).mappings():
             activity = _activity(mapping)
             rows.setdefault(activity["transaction_id"], []).append(activity)
         headers = {
             mapping["id"]: mapping
             for mapping in connection.execute(
-                select(t).where(t.c.id.in_(ids), t.c.issued_at.between(low, high))
+                select(*_read(t, _HEADER_COLUMNS)).where(
+                    t.c.id.in_(ids), t.c.issued_at.between(low, high)
+                )
             ).mappings()
         }
 
@@ -1482,6 +1493,30 @@ def _referenced_ids(change: FieldChange) -> list[str] | None:
             return None
         ids.append(str(value))
     return ids
+
+
+def _entry_columns(table: Table) -> tuple[str, ...]:
+    return tuple(
+        column.name
+        for column in table.columns
+        if column.name not in integrity_schema.INTEGRITY_COLUMNS
+    )
+
+
+_ACTIVITY_COLUMNS = _entry_columns(build_tables().activity)
+"""The ``audit_activity`` columns an ``ActivityRow`` is read from.
+
+Every column but the integrity ones. Reads list them instead of selecting
+the table, so they never return the integrity columns (salts among them)
+and work on tables without them.
+"""
+
+_HEADER_COLUMNS = _entry_columns(build_tables().transaction)
+"""The ``audit_transaction`` columns a ``TransactionHeader`` is read from."""
+
+
+def _read(table: Table, names: Sequence[str]) -> list[ColumnClause[Any]]:
+    return [table.c[name] for name in names]
 
 
 def _activity(row: RowMapping) -> ActivityRow:

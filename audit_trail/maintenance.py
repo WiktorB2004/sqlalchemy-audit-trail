@@ -68,8 +68,8 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, TypeVar
 from sqlalchemy import Connection, Engine, Table, bindparam, text
 from sqlalchemy.exc import DBAPIError
 
+from audit_trail import _pg
 from audit_trail.migrations import (
-    _execute_ddl,
     create_month_partition_sql,
     create_severity_partition_sql,
     month_bounds,
@@ -83,7 +83,7 @@ from audit_trail.tables import MAX_IDENTIFIER_LENGTH, AuditTables
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-LOCK_NOT_AVAILABLE = "55P03"
+LOCK_NOT_AVAILABLE = _pg.LOCK_NOT_AVAILABLE
 """SQLSTATE raised when ``lock_timeout`` expires."""
 
 logger = logging.getLogger(__name__)
@@ -252,7 +252,7 @@ def ensure_partitions(
             lock_timeout,
         )
     except DBAPIError as exc:
-        if getattr(exc.orig, "sqlstate", None) == LOCK_NOT_AVAILABLE:
+        if _pg.is_sqlstate(exc, LOCK_NOT_AVAILABLE):
             raise PartitionLockTimeoutError(
                 f"partitions were not created: a lock was not granted within "
                 f"lock_timeout={lock_timeout!r}, which applies to each lock "
@@ -400,7 +400,7 @@ def drop_expired(
             connection, tables, retention, transaction_retention, now, lock_timeout
         )
     except DBAPIError as exc:
-        if getattr(exc.orig, "sqlstate", None) == LOCK_NOT_AVAILABLE:
+        if _pg.is_sqlstate(exc, LOCK_NOT_AVAILABLE):
             raise PartitionLockTimeoutError(
                 f"expired partitions were not all dropped: a lock was not "
                 f"granted within lock_timeout={lock_timeout!r}, which applies to "
@@ -700,7 +700,9 @@ def _ensure(
     parents = [_qualified(t) for t in (transaction, activity)]
     previous_timeout: str | None = None
     if lock_timeout is not None:
-        previous_timeout = _set_local(conn, "lock_timeout", lock_timeout)
+        previous_timeout = _pg.set_config(
+            conn, "lock_timeout", lock_timeout, local=True
+        )
     conn.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
         {"key": _lock_key(tables)},
@@ -729,7 +731,7 @@ def _ensure(
         child = by_severity.get(value)
         if child is None:
             name = severity_partition_name(activity.name, value)
-            _execute_ddl(conn, create_severity_partition_sql(tables, value, name))
+            _pg.execute_ddl(conn, create_severity_partition_sql(tables, value, name))
             created.append(_name(activity_schema, name))
             created += _ensure_months(
                 conn, activity.schema, activity_schema, name, None, months
@@ -741,7 +743,7 @@ def _ensure(
         # A severity partition that is a plain table takes any date.
 
     if previous_timeout is not None:
-        _set_local(conn, "lock_timeout", previous_timeout)
+        _pg.set_config(conn, "lock_timeout", previous_timeout, local=True)
     return created
 
 
@@ -767,7 +769,7 @@ def _ensure_months(
                 f"{name!r} is longer than {MAX_IDENTIFIER_LENGTH} bytes and "
                 "PostgreSQL would truncate it; rename the parent partition"
             )
-        _execute_ddl(conn, create_month_partition_sql(schema, parent, month, name))
+        _pg.execute_ddl(conn, create_month_partition_sql(schema, parent, month, name))
         created.append(_name(shown_schema, name))
     return created
 
@@ -794,18 +796,6 @@ def _months(now: datetime, months_ahead: int) -> list[date]:
     return [
         date(i // 12, i % 12 + 1, 1) for i in range(index, index + months_ahead + 1)
     ]
-
-
-def _set_local(conn: Connection, setting: str, value: str) -> str:
-    """Set ``setting`` for the rest of the transaction; return the old value."""
-    previous: str = conn.execute(
-        text("SELECT current_setting(:name)"), {"name": setting}
-    ).scalar_one()
-    conn.execute(
-        text("SELECT set_config(:name, :value, true)"),
-        {"name": setting, "value": value},
-    )
-    return previous
 
 
 _DetachMode = Literal["CONCURRENTLY", "FINALIZE"]
@@ -929,7 +919,7 @@ def _drop_months(
     # At most one partition per parent can be pending; finish it first.
     for child in (c for c in children if c.pending):
         session.check()
-        _execute_ddl(conn, _detach_sql(target.parent, child, "FINALIZE"))
+        _pg.execute_ddl(conn, _detach_sql(target.parent, child, "FINALIZE"))
         if expired(child):
             session.check()
             dropped.append(_drop_table(conn, child))
@@ -942,14 +932,14 @@ def _drop_months(
     live = [c for c in children if not c.pending and expired(c)]
     for child in sorted(live, key=lambda c: c.upper or now):
         session.check()
-        _execute_ddl(conn, _detach_sql(target.parent, child, "CONCURRENTLY"))
+        _pg.execute_ddl(conn, _detach_sql(target.parent, child, "CONCURRENTLY"))
         session.check()
         dropped.append(_drop_table(conn, child))
     return dropped
 
 
 def _drop_table(conn: Connection, child: _Child) -> str:
-    _execute_ddl(conn, f"DROP TABLE {child.qualified}")
+    _pg.execute_ddl(conn, f"DROP TABLE {child.qualified}")
     logger.info("dropped expired partition %s", child.display)
     return child.display
 
