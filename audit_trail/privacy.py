@@ -40,6 +40,7 @@ from audit_trail.diff import ERASED
 from audit_trail.events import AuditSystem
 from audit_trail.integrity import _schema as integrity_schema
 from audit_trail.integrity._commit import ACTOR_FIELDS as _ACTOR_FIELDS
+from audit_trail.integrity._commit import SCRUB_GROUPS
 from audit_trail.query import _check_collection, _member_of
 from audit_trail.writer import (
     ENVELOPE_VERSION,
@@ -109,9 +110,7 @@ _ERASED_DATA = (
     f"'{{payload}}', {_ERASED_PAYLOAD}, false)"
 )
 
-# The integrity groups each operation erases; scrub always stamps all three
-# together, also for a row without a label or payload.
-_SCRUB_GROUPS = ("label", "changes", "payload")
+# The integrity groups scrub_actor erases.
 _ACTOR_GROUPS = ("actor",)
 
 _ACTOR_KEYS = "ARRAY[" + ", ".join(f"'{key}'" for key in ACTOR_FIELDS) + "]"
@@ -252,7 +251,7 @@ def scrub_statement(
         .values(
             object_label=null(),
             data=erased,
-            **_seal_erased(tables.activity, _SCRUB_GROUPS),
+            **_seal_erased(tables.activity, SCRUB_GROUPS),
         )
     )
 

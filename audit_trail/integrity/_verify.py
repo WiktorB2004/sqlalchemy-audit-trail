@@ -75,6 +75,7 @@ from audit_trail.integrity._codec import b64, decode_strict, is_int, parse_rfc33
 from audit_trail.integrity._commit import (
     ACTIVITY_GROUPS,
     ACTOR_FIELDS,
+    SCRUB_GROUPS,
     TRANSACTION_GROUPS,
     activity_groups,
     commitment,
@@ -94,9 +95,6 @@ TRANSACTION = "transaction"
 
 ACTIVITY = "activity"
 """``table`` of a finding about an ``audit_activity`` row."""
-
-# The groups each scrub operation stamps, by the table whose rows it counts.
-_SCRUB_GROUPS = ("label", "changes", "payload")
 
 
 class FailureKind(StrEnum):
@@ -1328,7 +1326,7 @@ def _record_counts(payload: object) -> dict[tuple[str, str], int] | None:
         activity = count("activity_rows")
         if activity is None:
             return None
-        return {(ACTIVITY, group): activity for group in _SCRUB_GROUPS}
+        return {(ACTIVITY, group): activity for group in SCRUB_GROUPS}
     if operation == "scrub_actor":
         activity, transaction = count("activity_rows"), count("transaction_rows")
         if activity is None or transaction is None:
