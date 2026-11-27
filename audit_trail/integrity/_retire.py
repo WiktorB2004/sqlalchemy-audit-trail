@@ -41,6 +41,7 @@ from types import TracebackType
 
 from sqlalchemy import (
     AssertionPool,
+    BigInteger,
     Column,
     Connection,
     Engine,
@@ -48,6 +49,7 @@ from sqlalchemy import (
     MetaData,
     QueuePool,
     SingletonThreadPool,
+    SmallInteger,
     StaticPool,
     Table,
     bindparam,
@@ -74,12 +76,14 @@ from audit_trail.integrity._block import (
 )
 from audit_trail.integrity._codec import rfc3339
 from audit_trail.integrity._seal import (
+    _window,
     block_table,
     last_block,
     seal,
     sealed_horizon,
     signature_columns,
     snapshot_horizon,
+    window_clause,
 )
 from audit_trail.integrity._sign import Signer
 from audit_trail.integrity._types import Xid8
@@ -185,6 +189,9 @@ class Retirer:
         self._sealed: dict[str, dict[tuple[int, str], SealedSegment]] = {}
         self._retired: dict[str, _RetireBlock] = {}
         self._scanned = 0
+        # ``transaction`` or ``activity``, of each partition seen by
+        # ``retire`` or ``check_orphan``.
+        self._tables_of: dict[str, str] = {}
 
     def __enter__(self) -> Retirer:
         _check_free_slot(self._engine)
@@ -294,6 +301,7 @@ class Retirer:
                     "migrations.write_genesis() first"
                 )
             chain, sealed_to = sealed
+            self._tables_of[child.name] = _table_streams(target)[0]
             if self._unsealed(conn, child, sealed_to):
                 return self._skip(
                     SkippedPartition(
@@ -367,6 +375,7 @@ class Retirer:
         table and streams of ``target`` and the bound of ``child``, and
         covers exactly the segments of the partition sealed before it.
         """
+        self._tables_of[child.name] = _table_streams(target)[0]
         retired = self._retired.get(child.name)
         if retired is None or not _covers(retired, target, child, self._sealed):
             return self._skip(
@@ -414,17 +423,23 @@ class Retirer:
         return False
 
     def _unsealed(self, conn: Connection, child: _Child, sealed_to: int) -> bool:
-        table = Table(
-            child.name,
-            MetaData(),
-            Column(_schema.XID, Xid8()),
-            schema=child.schema,
-        )
+        """Whether the partition holds a row of the current incarnation that
+        is not sealed yet; rows of an earlier one (at or below the id floor
+        of a fork) are sealed, whatever their ``xid``."""
+        columns = [Column(_schema.XID, Xid8()), Column("id", BigInteger)]
+        if self._tables_of.get(child.name) == ACTIVITY:
+            columns.append(Column("severity", SmallInteger))
+        table = Table(child.name, MetaData(), *columns, schema=child.schema)
         xid = table.c[_schema.XID]
+        floors = _window(conn, self._block).id_floor
+        window = window_clause(table, floors, above=True)
         found = conn.execute(
             select(literal_column("1", Integer))
             .select_from(table)
-            .where(xid >= bindparam("sealed_to", sealed_to, type_=Xid8()))
+            .where(
+                xid >= bindparam("sealed_to", sealed_to, type_=Xid8()),
+                *([] if window is None else [window]),
+            )
             .limit(1)
         ).first()
         return found is not None

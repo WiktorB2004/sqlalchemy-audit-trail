@@ -19,19 +19,22 @@ sealer never updates an audit row.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from sqlalchemy import (
     BigInteger,
+    ColumnElement,
     Connection,
     Integer,
     Table,
+    and_,
     func,
     insert,
     literal_column,
+    or_,
     select,
     text,
     union_all,
@@ -69,7 +72,7 @@ transactions."""
 UNSEALED_ROWS_CAP = 10_000
 """``health`` counts unsealed rows up to this many."""
 
-SealRefusal = Literal["XID_REWIND", "NO_GENESIS"]
+SealRefusal = Literal["XID_REWIND", "NO_GENESIS", "ID_FLOOR_VIOLATION"]
 
 
 class SealRefusedError(Exception):
@@ -80,6 +83,11 @@ class SealRefusedError(Exception):
             the database was restored from a dump or is a logical replica,
             and its transaction ids repeat sealed ranges. ``NO_GENESIS``: the
             chain has not been started with ``write_genesis``.
+            ``ID_FLOOR_VIOLATION``: after a fork with an id window, an
+            identity sequence is behind the floor, or a stream has more rows
+            at or below the floor than the fork counted: new rows got ids of
+            the restored ones (``ALTER ... RESTART``, or a data-only restore
+            without the sequence values) and would never be sealed.
     """
 
     def __init__(self, reason: SealRefusal, message: str) -> None:
@@ -354,13 +362,18 @@ def _seal(
                 "replica), so new rows would repeat sealed ranges. Never seal "
                 "on a logical replica; after a restore, declare a fork",
             )
+        window = _window(connection, block)
+        check_floor(connection, tables, window)
+        windows = _windows(tables, window.id_floor)
         if up_to is not None:
             horizon = max(min(horizon, up_to), xid_from)
-        xid_to, capped = _cut(connection, tables, xid_from, horizon, max_rows)
+        xid_to, capped = _cut(connection, tables, xid_from, horizon, max_rows, windows)
         if xid_to is None:
             return SealResult(0, 0, xid_from)
         builder = SegmentBuilder()
-        for stream, partition, row in _rows(connection, tables, xid_from, xid_to):
+        for stream, partition, row in _rows(
+            connection, tables, xid_from, xid_to, windows
+        ):
             builder.add(stream, partition, row)
         seq = last.seq + 1
         body = seal_body(chain, seq, xid_from, xid_to, builder.segments())
@@ -421,7 +434,7 @@ def seal_health(
         )
     horizon = connection.execute(
         select(block.c.body, block.c.sealed_at)
-        .where(block.c.kind.in_(("genesis", "seal")))
+        .where(block.c.kind.in_(HORIZON_KINDS))
         .order_by(block.c.seq.desc())
         .limit(1)
     ).one_or_none()
@@ -432,6 +445,8 @@ def seal_health(
         )
         return SealHealth(False, None, None, 0, None, max_seal_lag, prepared, problem)
     sealed_to = horizon_of(parse_body(horizon.body))
+    # Rows of an earlier incarnation are sealed, whatever their xid.
+    windows = _windows(tables, _window(connection, block).id_floor)
     # Bounded, so each walks the (xid, id) indexes from sealed_to only.
     columns = []
     for table, stamp in (
@@ -439,10 +454,11 @@ def seal_health(
         (tables.activity, tables.activity.c.created_at),
     ):
         xid = table.c[_schema.XID]
-        unsealed = select(literal_column("1", Integer)).where(xid >= sealed_to)
+        where = [xid >= sealed_to, *windows[table.name]]
+        unsealed = select(literal_column("1", Integer)).where(*where)
         capped = unsealed.order_by(xid).limit(UNSEALED_ROWS_CAP).subquery()
         columns.append(select(func.count()).select_from(capped).scalar_subquery())
-        lowest = select(stamp).where(xid >= sealed_to).order_by(xid).limit(1)
+        lowest = select(stamp).where(*where).order_by(xid).limit(1)
         columns.append(lowest.scalar_subquery())
     counted, first, counted_activity, first_activity = connection.execute(
         select(*columns)
@@ -485,11 +501,15 @@ def last_block(connection: Connection, block: Table) -> Any:
     ).one_or_none()
 
 
+HORIZON_KINDS = ("genesis", "seal", "fork")
+"""Blocks that move the sealed horizon: a fork restarts it at ``xid_at_fork``."""
+
+
 def sealed_horizon(connection: Connection, block: Table) -> tuple[str, int] | None:
-    """The chain id and the horizon of the newest genesis or seal block."""
+    """The chain id and the horizon of the newest genesis, seal or fork block."""
     body = connection.execute(
         select(block.c.body)
-        .where(block.c.kind.in_(("genesis", "seal")))
+        .where(block.c.kind.in_(HORIZON_KINDS))
         .order_by(block.c.seq.desc())
         .limit(1)
     ).scalar_one_or_none()
@@ -499,6 +519,165 @@ def sealed_horizon(connection: Connection, block: Table) -> tuple[str, int] | No
     return str(parsed["chain"]), horizon_of(parsed)
 
 
+@dataclass(frozen=True)
+class Window:
+    """The ``id`` window of the current incarnation, from its forks.
+
+    Attributes:
+        incarnation: Its number, 1 before any fork.
+        id_floor: Rows of a stream with ``id`` at or below this are of an
+            earlier incarnation; ``None`` before a fork with an id window.
+        id_count: Rows of each stream at or below the floor at the fork.
+    """
+
+    incarnation: int = 1
+    id_floor: dict[str, int] | None = None
+    id_count: dict[str, int] | None = None
+
+
+def _window(connection: Connection, block: Table) -> Window:
+    """The id window of the current incarnation: of the newest fork with one.
+
+    A fork without an id window keeps the one before it.
+    """
+    incarnation: int | None = None
+    for body in connection.execute(
+        select(block.c.body).where(block.c.kind == "fork").order_by(block.c.seq.desc())
+    ).scalars():
+        parsed = parse_body(body)
+        if incarnation is None:
+            incarnation = int(parsed["incarnation"])
+        if parsed.get("id_floor") is not None:
+            floors = {str(k): int(v) for k, v in parsed["id_floor"].items()}
+            counts = {str(k): int(v) for k, v in parsed["id_count"].items()}
+            return Window(incarnation, floors, counts)
+    return Window(incarnation or 1)
+
+
+def window_clause(
+    table: Table, floors: Mapping[str, int] | None, *, above: bool
+) -> ColumnElement[bool] | None:
+    """The rows of ``table`` above (or at or below) the id floor of each stream.
+
+    ``table`` is the transaction table, or the activity table (one with a
+    ``severity`` column), or a partition of either.
+
+    ``None`` when there is no floor. A stream the floor does not name had no
+    row at the fork and is not bounded.
+    """
+    if floors is None:
+        return None
+    row_id = table.c.id
+
+    def bound(limit: int) -> ColumnElement[bool]:
+        return row_id > limit if above else row_id <= limit
+
+    if "severity" not in table.c:
+        limit = floors.get(TRANSACTION_STREAM)
+        return None if limit is None else bound(limit)
+    severities = {
+        int(stream.removeprefix("activity.")): limit
+        for stream, limit in floors.items()
+        if stream.startswith("activity.")
+    }
+    if not severities:
+        return None
+    severity = table.c.severity
+    return or_(
+        *(and_(severity == value, bound(limit)) for value, limit in severities.items()),
+        severity.not_in(list(severities)),
+    )
+
+
+def _windows(
+    tables: AuditTables,
+    lower: Mapping[str, int] | None,
+    upper: Mapping[str, int] | None = None,
+) -> dict[str, list[ColumnElement[bool]]]:
+    """The window conditions of each table, by table name."""
+    found: dict[str, list[ColumnElement[bool]]] = {}
+    for table in (tables.transaction, tables.activity):
+        conditions = [
+            clause
+            for clause in (
+                window_clause(table, lower, above=True),
+                window_clause(table, upper, above=False),
+            )
+            if clause is not None
+        ]
+        found[table.name] = conditions
+    return found
+
+
+def check_floor(connection: Connection, tables: AuditTables, window: Window) -> None:
+    """Refuse to seal when new rows may have ids at or below the floor.
+
+    Raises:
+        SealRefusedError: ``ID_FLOOR_VIOLATION``: a table's identity
+            sequence is below the highest floor of its streams, or a stream
+            has more rows at or below its floor than the fork counted.
+    """
+    floors, counts = window.id_floor, window.id_count
+    if floors is None or counts is None:
+        return
+    for table in (tables.transaction, tables.activity):
+        streams = [
+            limit
+            for stream, limit in floors.items()
+            if (stream == TRANSACTION_STREAM) == (table is tables.transaction)
+        ]
+        if not streams:
+            continue
+        value = sequence_value(connection, table)
+        if value is not None and value < max(streams):
+            raise SealRefusedError(
+                "ID_FLOOR_VIOLATION",
+                f"the id sequence of {table.fullname} is at {value}, below the "
+                f"fork's id floor {max(streams)}: new rows would get ids of "
+                "restored rows. Set it above the floor with setval()",
+            )
+    for stream, limit in floors.items():
+        table = tables.transaction if stream == TRANSACTION_STREAM else tables.activity
+        condition = [table.c.id <= limit]
+        if stream != TRANSACTION_STREAM:
+            condition.append(table.c.severity == int(stream.removeprefix("activity.")))
+        allowed = counts.get(stream, 0)
+        capped = (
+            select(literal_column("1", Integer))
+            .select_from(table)
+            .where(*condition)
+            .limit(allowed + 1)
+            .subquery()
+        )
+        found = connection.execute(
+            select(func.count()).select_from(capped)
+        ).scalar_one()
+        if found > allowed:
+            raise SealRefusedError(
+                "ID_FLOOR_VIOLATION",
+                f"stream {stream} has more rows with id <= {limit} than the "
+                f"{allowed} the fork counted: new rows got ids of restored "
+                "rows (an identity reset?) and would never be sealed",
+            )
+
+
+def sequence_value(connection: Connection, table: Table) -> int | None:
+    """The last id the identity sequence of ``table`` gave, or ``None``.
+
+    ``last_value``, or ``last_value - 1`` when the sequence was never called
+    (a fresh one, or one set with ``setval(..., false)``). ``None`` when the
+    table's ``id`` has no sequence.
+    """
+    name = connection.execute(
+        text("SELECT pg_get_serial_sequence(:table, 'id')"),
+        {"table": _pg.regclass(connection, table)},
+    ).scalar_one_or_none()
+    if name is None:
+        return None
+    row = connection.execute(text(f"SELECT last_value, is_called FROM {name}")).one()
+    return int(row.last_value) if row.is_called else int(row.last_value) - 1
+
+
 def _xids(
     tables: AuditTables,
     upper: int,
@@ -506,6 +685,7 @@ def _xids(
     *,
     lower: int | None = None,
     above: int | None = None,
+    windows: Mapping[str, list[ColumnElement[bool]]] | None = None,
 ) -> Subquery:
     """The lowest ``limit`` row ``xid`` values below ``upper`` of each table.
 
@@ -523,6 +703,8 @@ def _xids(
             conditions.append(xid >= lower)
         if above is not None:
             conditions.append(xid > above)
+        if windows is not None:
+            conditions.extend(windows[table.name])
         branch = select(xid.label("xid")).where(*conditions)
         ordered = branch.order_by(xid).limit(limit).subquery()
         parts.append(select(ordered.c.xid))
@@ -535,13 +717,14 @@ def _cut(
     lower: int,
     horizon: int,
     max_rows: int,
+    windows: Mapping[str, list[ColumnElement[bool]]] | None = None,
 ) -> tuple[int | None, bool]:
     """The upper bound of the block and whether ``max_rows`` lowered it.
 
     ``None`` when ``[lower, horizon)`` has no rows. Reads at most
     ``max_rows + 1`` index entries per table.
     """
-    xids = _xids(tables, horizon, max_rows + 1, lower=lower)
+    xids = _xids(tables, horizon, max_rows + 1, lower=lower, windows=windows)
     # One pass over the merged branches: the first row and the one past
     # max_rows.
     number = func.row_number().over(order_by=xids.c.xid).label("number")
@@ -562,7 +745,7 @@ def _cut(
         return past, True
     # The first transaction alone has more than max_rows rows: seal it
     # whole, up to the next transaction's xid.
-    after = _xids(tables, horizon, 1, above=past)
+    after = _xids(tables, horizon, 1, above=past, windows=windows)
     following: int | None = connection.execute(
         select(after.c.xid).order_by(after.c.xid).limit(1)
     ).scalar_one_or_none()
@@ -572,9 +755,16 @@ def _cut(
 
 
 def _rows(
-    connection: Connection, tables: AuditTables, lower: int, upper: int
+    connection: Connection,
+    tables: AuditTables,
+    lower: int,
+    upper: int,
+    windows: Mapping[str, list[ColumnElement[bool]]] | None = None,
 ) -> Iterator[tuple[str, str, dict[str, object]]]:
-    """``(stream, partition, leaf row)`` of every row in ``[lower, upper)``."""
+    """``(stream, partition, leaf row)`` of every row in ``[lower, upper)``.
+
+    Only rows in the id window, given as conditions by table name.
+    """
     for table, columns in (
         (tables.transaction, TRANSACTION_LEAF_COLUMNS),
         (tables.activity, ACTIVITY_LEAF_COLUMNS),
@@ -586,7 +776,7 @@ def _rows(
                 literal_column("tableoid", BigInteger).label("tableoid"),
                 *(table.c[name] for name in columns),
             )
-            .where(xid >= lower, xid < upper)
+            .where(xid >= lower, xid < upper, *(windows or {}).get(table.name, []))
             .order_by(xid, table.c.id)
         )
         result = connection.execute(

@@ -341,9 +341,11 @@ def fork_body(
 
 
 def horizon_of(body: Mapping[str, Any]) -> int:
-    """The ``xid`` a parsed genesis or seal body seals up to, exclusive."""
+    """The ``xid`` a parsed genesis, seal or fork body seals up to, exclusive."""
     if body["kind"] == "genesis":
         return int(body["enforce_from"])
+    if body["kind"] == "fork":
+        return int(body["xid_at_fork"])
     return int(body["xid_to"])
 
 
