@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import example, given
+from hypothesis import strategies as st
 
 from audit_trail.integrity._canonical import (
     MAX_INT_DIGITS,
@@ -129,6 +131,40 @@ def test_readers_types_give_the_same_text() -> None:
 
 def test_a_number_never_equals_a_string() -> None:
     assert canonical(2**60) != canonical(str(2**60))
+
+
+def _reference(value: object) -> str:
+    # The encoder's string and object rules as first written: json.dumps per
+    # string, keys sorted by their UTF-16 encoding.
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, dict):
+        keys = sorted(value, key=lambda key: key.encode("utf-16-be"))
+        return (
+            "{"
+            + ",".join(f"{_reference(k)}:{_reference(value[k])}" for k in keys)
+            + "}"
+        )
+    if isinstance(value, list):
+        return "[" + ",".join(_reference(item) for item in value) + "]"
+    return json.dumps(value)
+
+
+_TEXT = st.text(st.characters(exclude_categories=["Cs"], exclude_characters="\x00"))
+_TREES = st.recursive(
+    st.none() | st.booleans() | st.integers() | _TEXT,
+    lambda inner: (
+        st.lists(inner, max_size=4) | st.dictionaries(_TEXT, inner, max_size=6)
+    ),
+    max_leaves=20,
+)
+
+
+@given(value=_TREES)
+@example(value={"\ue000": 1, "\U0001f600": 2, "z": 3, "\x7f": 4, "\x1f\u2028": "\x08"})
+@example(value={"b": {"a": 1}, "a": ['\\"', "\u00e9"]})
+def test_canonical_matches_the_reference_encoding(value: object) -> None:
+    assert canonical(value) == _reference(value).encode()
 
 
 @pytest.mark.parametrize(
