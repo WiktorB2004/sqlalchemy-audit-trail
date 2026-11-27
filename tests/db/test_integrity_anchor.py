@@ -14,12 +14,11 @@ from sqlalchemy import Engine, delete, select, text
 from sqlalchemy import event as sa_event
 
 from audit_trail import AuditEvent, Severity, event, migrations
-from audit_trail.integrity import _seal
+from audit_trail.integrity import _anchor, _seal
 from audit_trail.integrity._anchor import (
     ReplicationError,
     declare_fork,
     export_checkpoint,
-    replication_state,
 )
 from audit_trail.integrity._block import checkpoint_body, parse_body
 from audit_trail.integrity._checkpoint import Checkpoint
@@ -227,14 +226,20 @@ def test_require_replicated_without_a_standby(env: Env) -> None:
     assert run(env).status is Status.VALID
 
 
-def test_replication_state_follows_sync_and_quorum() -> None:
-    assert replication_state([]) == "none"
-    assert replication_state([("async", True), ("potential", True)]) == "none"
-    assert replication_state([("sync", True)]) == "confirmed"
-    assert replication_state([("sync", True), ("sync", False)]) == "waiting"
-    assert replication_state([("sync", True), ("sync", None)]) == "waiting"
-    assert replication_state([("quorum", False), ("quorum", True)]) == "confirmed"
-    assert replication_state([("quorum", False), ("async", True)]) == "waiting"
+def test_an_error_after_the_commit_is_a_replication_error(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        _anchor, "_STANDBYS", text("SELECT no_such_column FROM pg_stat_replication")
+    )
+    before = len(blocks(env))
+    with env.engine.connect() as conn, pytest.raises(ReplicationError) as info:
+        export_checkpoint(conn, env.trail.tables, require_replicated=True)
+    assert info.value.reason == "CHECK_FAILED"
+    assert info.value.__cause__ is not None
+    after = blocks(env)
+    assert len(after) == before + 1
+    assert (info.value.seq, bool(info.value.lsn)) == (after[-1].seq, True)
 
 
 # -- forks without an id window (PITR) -------------------------------------------------
