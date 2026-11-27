@@ -285,6 +285,7 @@ def test_the_kinds_are_the_closed_sets() -> None:
         "UNSEALED_TAIL",
         "UNANCHORED_TAIL",
         "FORKED",
+        "FORKED_UNSIGNED",
         "ACKNOWLEDGED",
     ]
 

@@ -45,7 +45,9 @@ What it checks:
   with ``require_signatures`` so is an unsigned one.
 - Trusted checkpoints (``_checkpoint``): ``TRUNCATED`` when the chain ends
   below one, ``CHAIN_MISMATCH`` when its block has another hash, a
-  ``FORKED`` note instead when a signed fork block explains it. A match
+  ``FORKED`` note instead when a signed fork block explains it. With a
+  signature verifier, a fork block not signed by a key it knows is also a
+  ``FORKED_UNSIGNED`` note: it explains no checkpoint. A match
   makes the report ``ANCHORED``; the blocks after the newest match are an
   ``UNANCHORED_TAIL`` note.
 
@@ -159,6 +161,7 @@ class NoteKind(StrEnum):
     UNSEALED_TAIL = "UNSEALED_TAIL"
     UNANCHORED_TAIL = "UNANCHORED_TAIL"
     FORKED = "FORKED"
+    FORKED_UNSIGNED = "FORKED_UNSIGNED"
     ACKNOWLEDGED = "ACKNOWLEDGED"
 
 
@@ -1080,6 +1083,14 @@ class Verifier:
             f"incarnation {number} starts here: {reason}",
             seq=block.seq,
         )
+        if self._signatures is not None and block.seq not in self.signed:
+            # Anyone who can write the block table can add such a fork.
+            self._note(
+                NoteKind.FORKED_UNSIGNED,
+                "the fork block is not signed by a known key; it explains no "
+                "checkpoint",
+                seq=block.seq,
+            )
 
     def _read_retire(self, block: StoredBlock, body: Mapping[str, Any]) -> None:
         """Accept a retire block only as a match for the chain before it.

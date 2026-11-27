@@ -380,6 +380,27 @@ def test_an_unsigned_fork_explains_nothing(
     assert failures(plain) == {FailureKind.CHAIN_MISMATCH}
 
 
+def test_an_unsigned_fork_is_noted_when_signatures_are_checked(
+    pitr: tuple[Chain, Checkpoint, Checkpoint, list[dict[str, Any]]],
+) -> None:
+    chain, _good, _lost, rows = pitr
+    assert notes(check(chain, rows, [], signatures=BOTH)) == {NoteKind.FORKED}
+    fork = chain.blocks[4]
+    chain.blocks[4] = dataclasses.replace(fork, signature=None, key_id=None, alg=None)
+    report = check(chain, rows, [], signatures=BOTH)
+    assert report.failures == []
+    assert notes(report) == {NoteKind.FORKED, NoteKind.FORKED_UNSIGNED}
+    (unsigned,) = [n for n in report.notes if n.kind is NoteKind.FORKED_UNSIGNED]
+    assert unsigned.seq == fork.seq
+    # By a key the verifier does not know: UNKNOWN_KEY, and noted too.
+    sign(chain, NEW, fork.seq)
+    report = check(chain, rows, [], signatures=Ed25519Verifier([OLD.vkey]))
+    assert failures(report) == {FailureKind.UNKNOWN_KEY}
+    assert NoteKind.FORKED_UNSIGNED in notes(report)
+    # Without a verifier signatures are not checked, so nothing is noted.
+    assert notes(check(chain, rows, [])) == {NoteKind.FORKED}
+
+
 def test_an_undeclared_restore_fails(
     pitr: tuple[Chain, Checkpoint, Checkpoint, list[dict[str, Any]]],
 ) -> None:
