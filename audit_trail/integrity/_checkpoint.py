@@ -1,6 +1,6 @@
 """Checkpoints: the head of the chain, signed, for keeping off the database.
 
-Private for now. A checkpoint states which block was the head of the chain
+A checkpoint states which block was the head of the chain
 at a moment. Kept where whoever can rewrite the database cannot reach it, it
 lets ``verify`` catch a chain rewritten or cut short since (``CHAIN_MISMATCH``
 and ``TRUNCATED``).
@@ -56,7 +56,7 @@ _FIELDS = ("block_hash", "chain", "incarnation", "sealed_at", "seq", "v", "xid_t
 
 @dataclass(frozen=True)
 class Checkpoint:
-    """A checkpoint of the chain. Private for now.
+    """A checkpoint of the chain.
 
     Attributes:
         chain: The chain id.

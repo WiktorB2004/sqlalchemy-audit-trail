@@ -1,6 +1,6 @@
 """The verifier core: checks blocks and rows, and reports what it finds.
 
-Private for now. Nothing here touches the database: ``Verifier`` is fed the
+Nothing here touches the database: ``Verifier`` is fed the
 blocks of the chain and then the rows of each partition, and returns a
 ``VerificationReport``. The leaves are rebuilt with the functions the sealer
 uses (``_block``, ``_commit``), so the two cannot drift.
@@ -755,7 +755,7 @@ class _Record:
 class Verifier:
     """Checks a chain and the rows it seals.
 
-    Private for now. Use: build it with the blocks in ``seq`` order, give
+    Use: build it with the blocks in ``seq`` order, give
     the horizon (here or with ``set_horizon``, read after the blocks), call
     ``check_partition`` for every partition that holds rows (its rows in
     ``(xid, id)`` order), ``schema`` once with the detached partitions, and

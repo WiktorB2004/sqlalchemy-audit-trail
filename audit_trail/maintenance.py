@@ -92,8 +92,10 @@ from audit_trail.tables import MAX_IDENTIFIER_LENGTH, AuditTables
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from audit_trail.integrity._checkpoint import Checkpoint
     from audit_trail.integrity._retire import Retirer
-    from audit_trail.integrity._sign import Signer
+    from audit_trail.integrity._sign import SignatureVerifier, Signer
+    from audit_trail.integrity._verify import FailureKind, VerificationReport
 
 LOCK_NOT_AVAILABLE = _pg.LOCK_NOT_AVAILABLE
 """SQLSTATE raised when ``lock_timeout`` expires."""
@@ -105,6 +107,9 @@ logger = logging.getLogger(__name__)
 
 # Lets a mapping keyed by a severity IntEnum pass where ints are expected.
 _Severity = TypeVar("_Severity", bound=int)
+
+# integrity.verify's default; its module imports this one, so it is repeated.
+_DEFAULT_CHUNK_ROWS = 2_000
 
 _RANGE_BOUND = r"^FOR VALUES FROM \((.*)\) TO \((.*)\)$"
 _LIST_BOUND = re.compile(r"^FOR VALUES IN \((.*)\)$")
@@ -166,7 +171,7 @@ SkipReason = Literal[
 class SkippedPartition:
     """An expired partition that ``drop_expired`` kept, with integrity.
 
-    Private for now. The next call tries it again.
+    The next call tries it again.
 
     Attributes:
         partition: Schema-qualified name, as ``drop_expired`` returns names.
@@ -192,8 +197,7 @@ class DroppedPartitions(list[str]):
     """What ``drop_expired`` returns: the names dropped, in order.
 
     A ``list`` of names, as before. ``skipped`` lists the expired partitions
-    kept instead of dropped, which happens only with integrity on; it is
-    private for now.
+    kept instead of dropped, which happens only with integrity on.
     """
 
     def __init__(
@@ -371,7 +375,6 @@ class HealthReport:
             behind; nothing drops them automatically. Check the name, then
             ``DROP TABLE`` it by hand.
         seal: Sealing lag of tables built with integrity, else ``None``.
-            Private for now.
     """
 
     min_months_ahead: int
@@ -430,7 +433,7 @@ def drop_expired(
     ``PartitionError`` when it changed. ``ensure_partitions`` runs in one
     transaction and works behind such a pooler.
 
-    With integrity on (private for now), the call first seals the finished
+    With integrity on, the call first seals the finished
     transactions and, with ``verify_before_drop``, verifies the expired
     partitions, on a second connection from ``connection.engine``. Before
     each detach it appends a ``retire`` block for the partition to the hash
@@ -475,8 +478,8 @@ def drop_expired(
             The verify runs once, before the drops: a sealed row changed in
             place after it, and before its partition is dropped, is not
             seen, and is dropped with the partition. Ignored without
-            integrity. Private for now.
-        signer: With integrity, signs the retire blocks. Private for now.
+            integrity.
+        signer: With integrity, signs the retire blocks.
 
     Returns:
         Schema-qualified names of the partitions dropped, in order: a
@@ -557,7 +560,7 @@ def health(
         max_seal_lag: With integrity, unsealed rows and prepared
             transactions older than this are flagged. A row's age counts
             from its event time, so a transaction that ran longer than this
-            is flagged until the next seal after its commit. Private for now.
+            is flagged until the next seal after its commit.
 
     Returns:
         The report.
@@ -639,6 +642,9 @@ class PartitionManager:
             configured for ``AUTOCOMMIT``.
         tables: The audit tables, from ``audit_trail.tables.build_tables``.
         severities: A severity ``IntEnum`` class, or any iterable of ints.
+        system_severity: Severity of the ``audit.scrubbed`` records, which
+            ``verify`` and ``acknowledge`` need; ``AuditTrail`` passes its
+            ``system_severity``.
     """
 
     def __init__(
@@ -646,10 +652,13 @@ class PartitionManager:
         engine: Engine | AsyncEngine,
         tables: AuditTables,
         severities: Iterable[int],
+        *,
+        system_severity: int | None = None,
     ) -> None:
         self.engine = engine
         self.tables = tables
         self.severities = severity_values(severities)
+        self.system_severity = None if system_severity is None else int(system_severity)
 
     def ensure_partitions(
         self, months_ahead: int = 3, *, lock_timeout: str | None = "5s"
@@ -723,8 +732,8 @@ class PartitionManager:
             transaction_retention: Retention of the transaction table.
             lock_timeout: PostgreSQL ``lock_timeout`` for each statement.
             verify_before_drop: With integrity, verify before the first
-                detach. Private for now.
-            signer: With integrity, signs the retire blocks. Private for now.
+                detach.
+            signer: With integrity, signs the retire blocks.
 
         Returns:
             Schema-qualified names of the partitions dropped, with the
@@ -763,8 +772,8 @@ class PartitionManager:
             transaction_retention: Retention of the transaction table.
             lock_timeout: PostgreSQL ``lock_timeout`` for each statement.
             verify_before_drop: With integrity, verify before the first
-                detach. Private for now.
-            signer: With integrity, signs the retire blocks. Private for now.
+                detach.
+            signer: With integrity, signs the retire blocks.
 
         Returns:
             Schema-qualified names of the partitions dropped, with the
@@ -800,7 +809,7 @@ class PartitionManager:
 
         Args:
             min_months_ahead: Coverage threshold in months after the current one.
-            max_seal_lag: Sealing lag threshold, with integrity. Private for now.
+            max_seal_lag: Sealing lag threshold, with integrity.
 
         Returns:
             The report.
@@ -828,7 +837,7 @@ class PartitionManager:
         transaction. On a standby, on a logical-replication subscriber of the
         block table, or while another sealer runs, it returns without
         sealing. Run it on a schedule, every minute for example; a missed run
-        only leaves rows unsealed for longer. Private for now.
+        only leaves rows unsealed for longer.
 
         Args:
             max_rows: Soft cap on the rows of the block; one transaction is
@@ -886,7 +895,7 @@ class PartitionManager:
 
         Args:
             min_months_ahead: Coverage threshold in months after the current one.
-            max_seal_lag: Sealing lag threshold, with integrity. Private for now.
+            max_seal_lag: Sealing lag threshold, with integrity.
 
         Returns:
             The report.
@@ -906,6 +915,207 @@ class PartitionManager:
                     max_seal_lag=max_seal_lag,
                 )
             )
+
+    def verify(
+        self,
+        *,
+        retention: Mapping[_Severity, timedelta | None] | None = None,
+        transaction_retention: timedelta | None = None,
+        checkpoints: Iterable[Checkpoint | str] = (),
+        verifier: SignatureVerifier | None = None,
+        require_signatures: bool = False,
+        chunk_rows: int = _DEFAULT_CHUNK_ROWS,
+    ) -> VerificationReport:
+        """Check the hash chain and every row it seals; see ``integrity.verify``.
+
+        Passes this manager's ``system_severity``. Read-only: the role of
+        ``engine`` needs ``SELECT`` on the audit tables, on each of their
+        partitions and on the block table.
+
+        Args:
+            retention: Retention by severity, as ``drop_expired`` takes it;
+                given, a partition retired too early is ``RETIRED_EARLY``.
+            transaction_retention: Retention of the transaction table.
+            checkpoints: Trusted checkpoints kept off the database host, as
+                ``Checkpoint`` objects or their note texts.
+            verifier: Checks the signatures of signed blocks and checkpoints.
+            require_signatures: Every block must be signed by a key
+                ``verifier`` knows.
+            chunk_rows: Rows read per ``READ ONLY`` transaction.
+
+        Returns:
+            The report.
+
+        Raises:
+            TypeError: If the manager was built with an ``AsyncEngine``.
+            ValueError: As ``integrity.verify``.
+        """
+        from audit_trail.integrity._verify_db import verify
+
+        if not isinstance(self.engine, Engine):
+            raise TypeError("the engine is async; use averify")
+        return verify(
+            self.engine,
+            self.tables,
+            retention=_int_keys(retention),
+            transaction_retention=transaction_retention,
+            system_severity=self.system_severity,
+            chunk_rows=chunk_rows,
+            checkpoints=checkpoints,
+            verifier=verifier,
+            require_signatures=require_signatures,
+        )
+
+    async def averify(
+        self,
+        *,
+        retention: Mapping[_Severity, timedelta | None] | None = None,
+        transaction_retention: timedelta | None = None,
+        checkpoints: Iterable[Checkpoint | str] = (),
+        verifier: SignatureVerifier | None = None,
+        require_signatures: bool = False,
+        chunk_rows: int = _DEFAULT_CHUNK_ROWS,
+    ) -> VerificationReport:
+        """Async ``verify``, for a manager built with an ``AsyncEngine``.
+
+        Args:
+            retention: Retention by severity, as ``drop_expired`` takes it.
+            transaction_retention: Retention of the transaction table.
+            checkpoints: Trusted checkpoints kept off the database host.
+            verifier: Checks the signatures of signed blocks and checkpoints.
+            require_signatures: Every block must be signed by a known key.
+            chunk_rows: Rows read per ``READ ONLY`` transaction.
+
+        Returns:
+            The report.
+
+        Raises:
+            TypeError: If the manager was built with a sync ``Engine``.
+            ValueError: As ``integrity.verify``.
+        """
+        from audit_trail.integrity._verify_db import averify
+
+        if isinstance(self.engine, Engine):
+            raise TypeError("the engine is sync; use verify")
+        return await averify(
+            self.engine,
+            self.tables,
+            retention=_int_keys(retention),
+            transaction_retention=transaction_retention,
+            system_severity=self.system_severity,
+            chunk_rows=chunk_rows,
+            checkpoints=checkpoints,
+            verifier=verifier,
+            require_signatures=require_signatures,
+        )
+
+    def acknowledge(
+        self,
+        kind: FailureKind | str,
+        scope: Mapping[str, object],
+        reason: str,
+        *,
+        retention: Mapping[_Severity, timedelta | None] | None = None,
+        transaction_retention: timedelta | None = None,
+        signer: Signer | None = None,
+        chunk_rows: int = _DEFAULT_CHUNK_ROWS,
+    ) -> int:
+        """Waive a known incident with an ``ack`` block; see ``integrity.acknowledge``.
+
+        Runs on a connection of its own and passes this manager's
+        ``system_severity``. The role of ``engine`` needs ``INSERT`` on the
+        block table, and what ``verify`` needs.
+
+        Args:
+            kind: The failure kind to waive.
+            scope: What the ack covers, such as
+                ``{"xid_from": a, "xid_to": b}``.
+            reason: Why, stored in clear in the chain.
+            retention: As ``verify`` takes it.
+            transaction_retention: As ``verify`` takes it.
+            signer: Signs the ack block; ``None`` leaves it unsigned.
+            chunk_rows: As ``verify`` takes it.
+
+        Returns:
+            The ``seq`` of the ack block.
+
+        Raises:
+            TypeError: If the manager was built with an ``AsyncEngine``.
+            ValueError: As ``integrity.acknowledge``.
+        """
+        from audit_trail.integrity._verify_db import acknowledge
+
+        if not isinstance(self.engine, Engine):
+            raise TypeError("the engine is async; use aacknowledge")
+        with self.engine.connect() as conn:
+            return acknowledge(
+                conn,
+                self.tables,
+                kind,
+                scope,
+                reason,
+                retention=_int_keys(retention),
+                transaction_retention=transaction_retention,
+                system_severity=self.system_severity,
+                chunk_rows=chunk_rows,
+                signer=signer,
+            )
+
+    async def aacknowledge(
+        self,
+        kind: FailureKind | str,
+        scope: Mapping[str, object],
+        reason: str,
+        *,
+        retention: Mapping[_Severity, timedelta | None] | None = None,
+        transaction_retention: timedelta | None = None,
+        signer: Signer | None = None,
+        chunk_rows: int = _DEFAULT_CHUNK_ROWS,
+    ) -> int:
+        """Async ``acknowledge``, for a manager built with an ``AsyncEngine``.
+
+        Args:
+            kind: The failure kind to waive.
+            scope: What the ack covers.
+            reason: Why, stored in clear in the chain.
+            retention: As ``verify`` takes it.
+            transaction_retention: As ``verify`` takes it.
+            signer: Signs the ack block; ``None`` leaves it unsigned.
+            chunk_rows: As ``verify`` takes it.
+
+        Returns:
+            The ``seq`` of the ack block.
+
+        Raises:
+            TypeError: If the manager was built with a sync ``Engine``.
+            ValueError: As ``integrity.acknowledge``.
+        """
+        from audit_trail.integrity._verify_db import aacknowledge
+
+        if isinstance(self.engine, Engine):
+            raise TypeError("the engine is sync; use acknowledge")
+        async with self.engine.connect() as conn:
+            return await aacknowledge(
+                conn,
+                self.tables,
+                kind,
+                scope,
+                reason,
+                retention=_int_keys(retention),
+                transaction_retention=transaction_retention,
+                system_severity=self.system_severity,
+                chunk_rows=chunk_rows,
+                signer=signer,
+            )
+
+
+def _int_keys(
+    retention: Mapping[_Severity, timedelta | None] | None,
+) -> dict[int, timedelta | None] | None:
+    """A retention mapping keyed by plain ints, as ``verify`` takes it."""
+    if retention is None:
+        return None
+    return {int(severity): value for severity, value in retention.items()}
 
 
 def _ensure(

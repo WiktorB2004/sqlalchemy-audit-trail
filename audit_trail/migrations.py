@@ -507,7 +507,7 @@ def write_genesis(
     commitments. Calling it again returns the existing genesis block, also
     when another call committed it after this transaction's snapshot was
     taken. It takes the sealer's advisory lock and runs in the connection's
-    current transaction; the caller commits. Private for now.
+    current transaction; the caller commits.
 
     Args:
         connection: Connection that may insert into the block table, not in

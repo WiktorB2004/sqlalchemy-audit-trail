@@ -1,6 +1,6 @@
 """The reference signer and verifier: Ed25519, with ``cryptography``.
 
-Private for now. Needs the ``sqlalchemy-audit-trail[integrity]`` extra; the
+Needs the ``sqlalchemy-audit-trail[integrity]`` extra; the
 rest of the library never imports this module or ``cryptography``.
 
 Keys are named as C2SP signed notes name them (c2sp.org/signed-note):
@@ -50,7 +50,7 @@ _SKEY_PREFIX = "PRIVATE+KEY+"
 
 
 class Ed25519Signer:
-    """Signs with an Ed25519 private key. Private for now.
+    """Signs with an Ed25519 private key.
 
     Args:
         name: The key name, such as ``"audit.example.com/sealer-2026"``: no
@@ -117,7 +117,7 @@ class Ed25519Signer:
 
 
 class Ed25519Verifier:
-    """Checks Ed25519 signatures of known keys. Private for now.
+    """Checks Ed25519 signatures of known keys.
 
     Args:
         vkeys: The verifier keys, as ``Ed25519Signer.vkey`` gives them. Give

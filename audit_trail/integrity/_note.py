@@ -1,6 +1,6 @@
 """C2SP signed notes: the frame a checkpoint travels in.
 
-Private for now. Follows https://c2sp.org/signed-note (the editor's copy
+Follows https://c2sp.org/signed-note (the editor's copy
 read on 2026-11-27):
 
     A signed note consists of a text ending in newline (U+000A), followed by
