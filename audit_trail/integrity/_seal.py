@@ -19,7 +19,7 @@ sealer never updates an audit row.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal
@@ -51,6 +51,7 @@ from audit_trail.integrity._block import (
     activity_stream,
     block_hash,
     genesis_body,
+    horizon_of,
     parse_body,
     seal_body,
     transaction_leaf_row,
@@ -400,7 +401,7 @@ def seal_health(
             "migrations.write_genesis() once every writer runs with integrity"
         )
         return SealHealth(False, None, None, 0, None, max_seal_lag, prepared, problem)
-    sealed_to = _xid_to(parse_body(horizon.body))
+    sealed_to = horizon_of(parse_body(horizon.body))
     # Bounded, so each walks the (xid, id) indexes from sealed_to only.
     columns = []
     for table, stamp in (
@@ -466,13 +467,7 @@ def _sealed_to(connection: Connection, block: Table) -> tuple[str, int] | None:
     if body is None:
         return None
     parsed = parse_body(body)
-    return str(parsed["chain"]), _xid_to(parsed)
-
-
-def _xid_to(body: Mapping[str, Any]) -> int:
-    if body["kind"] == "genesis":
-        return int(body["enforce_from"])
-    return int(body["xid_to"])
+    return str(parsed["chain"]), horizon_of(parsed)
 
 
 def _xids(

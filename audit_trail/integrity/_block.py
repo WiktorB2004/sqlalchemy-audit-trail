@@ -290,6 +290,13 @@ def fork_body(
     )
 
 
+def horizon_of(body: Mapping[str, Any]) -> int:
+    """The ``xid`` a parsed genesis or seal body seals up to, exclusive."""
+    if body["kind"] == "genesis":
+        return int(body["enforce_from"])
+    return int(body["xid_to"])
+
+
 def block_hash(prev_hash: bytes, body: bytes) -> bytes:
     """The hash chaining a block to the one before it."""
     if len(prev_hash) != 32:
