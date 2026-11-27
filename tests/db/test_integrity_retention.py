@@ -8,7 +8,7 @@ PostgreSQL; lock conflicts come from real open transactions and a short
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 from typing import Any
@@ -565,6 +565,44 @@ def test_blocks_without_a_genesis_drop_nothing(engine: Engine, schema: str) -> N
     with pytest.raises(_seal.SealRefusedError, match="NO_GENESIS"):
         drop(engine, tables)
     assert len(attached(engine, schema)) == 4 * 3
+
+
+# -- reading the chain ---------------------------------------------------------------
+
+
+def test_each_block_is_read_once_per_call(
+    engine: Engine,
+    tables: AuditTables,
+    schema: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write(engine, tables)
+    write(engine, tables, JUNE + 20 * DAY)
+    with engine.connect() as reader:
+        # The transaction partitions are retired but kept: the next call
+        # checks each against the blocks after its retire block.
+        reader.execute(
+            text(f'SELECT count(*) FROM "{schema}"."audit_transaction_p2026_06"')
+        )
+        drop(engine, tables, lock_timeout="500ms")
+        reader.rollback()
+    read: list[int] = []
+    seal_blocks = _retire.Retirer._seal_blocks
+
+    def counting(self: _retire.Retirer, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        for item in seal_blocks(self, *args, **kwargs):
+            read.append(item[0])
+            yield item
+
+    monkeypatch.setattr(_retire.Retirer, "_seal_blocks", counting)
+    assert short(drop(engine, tables)) == [
+        "audit_transaction_p2026_06",
+        "audit_transaction_p2026_07",
+    ]
+    # Every block, retire blocks included, is read at most once, however many
+    # partitions are checked against it.
+    assert len(read) == len(set(read))
+    assert len(read) == block_count(engine, tables)
 
 
 # -- the second connection ----------------------------------------------------------

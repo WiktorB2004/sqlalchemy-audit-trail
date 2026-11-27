@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from dataclasses import dataclass
 from types import TracebackType
 
 from sqlalchemy import (
@@ -168,9 +169,12 @@ class Retirer:
         self._conn: Connection | None = None
         self._blocked: dict[str, SkippedPartition] = {}
         self.skipped: list[SkippedPartition] = []
-        # Segments of the expired partitions in the blocks read so far.
+        # What the blocks read so far say about the expired partitions: their
+        # sealed segments, and their retire blocks. Each block is read once
+        # per call (``_scan``).
         self._wanted: set[str] = set()
         self._sealed: dict[str, dict[tuple[int, str], SealedSegment]] = {}
+        self._retired: dict[str, _RetireBlock] = {}
         self._scanned = 0
 
     def __enter__(self) -> Retirer:
@@ -345,16 +349,14 @@ class Retirer:
     def check_detached(self, child: _Child) -> bool:
         """Whether the detached ``child`` is wholly covered by its retire block."""
         conn = self.conn
-        block = self._block
         with _read_only(conn):
-            retired = conn.execute(
-                select(block.c.seq).where(block.c.retired_partition == child.name)
-            ).scalar_one_or_none()
-            sealed = _sealed_to(conn, block)
-            later = retired is not None and child.name in self._partitions_after(
-                conn, int(retired), names={child.name}
-            )
+            self._scan(conn)
+            sealed = _sealed_to(conn, self._block)
             unsealed = sealed is not None and self._unsealed(conn, child, sealed[1])
+        retired = self._retired.get(child.name)
+        later = retired is not None and any(
+            seq > retired.seq for seq, _stream in self._sealed.get(child.name, {})
+        )
         if retired is None or later or unsealed:
             return self._skip(
                 SkippedPartition(
@@ -395,47 +397,37 @@ class Retirer:
         return found is not None
 
     def _scan(self, conn: Connection | None = None) -> None:
-        """Read the segments of the expired partitions from new seal blocks.
+        """Read the blocks written since the last scan.
 
+        Keeps the segments and the retire blocks of the expired partitions.
         Without ``conn``, in short transactions of its own; with one, in its
         transaction.
         """
-        for seq, segments in self._seal_blocks(conn, self._scanned):
+        for seq, retired, segments in self._seal_blocks(conn, self._scanned):
             self._scanned = seq
+            if retired is not None and retired.partition in self._wanted:
+                self._retired.setdefault(retired.partition, retired)
             for segment in segments:
                 if segment.partition in self._wanted:
-                    sealed = SealedSegment(
-                        seq,
-                        Segment(
-                            segment.stream,
-                            segment.partition,
-                            segment.rows,
-                            segment.root,
-                        ),
-                    )
                     self._sealed.setdefault(segment.partition, {})[
                         (seq, segment.stream)
-                    ] = sealed
-
-    def _partitions_after(
-        self, conn: Connection, after: int, *, names: set[str]
-    ) -> set[str]:
-        found: set[str] = set()
-        for _seq, segments in self._seal_blocks(conn, after):
-            found |= {s.partition for s in segments if s.partition in names}
-        return found
+                    ] = SealedSegment(seq, segment)
 
     def _seal_blocks(
         self, conn: Connection | None, after: int
-    ) -> Iterable[tuple[int, list[Segment]]]:
-        """``(seq, segments)`` of every seal block after ``after``, in order.
+    ) -> Iterable[tuple[int, _RetireBlock | None, list[Segment]]]:
+        """``(seq, retire block, segments)`` of every block after ``after``.
 
-        Malformed bodies are left out; ``verify`` reports them.
+        In order. A block that is not a retire block has ``None``; one that
+        is not a seal block has no segments. Malformed seal bodies have no
+        segments either; ``verify`` reports them.
         """
         block = self._block
         while True:
             statement = (
-                select(block.c.seq, block.c.kind, block.c.body)
+                select(
+                    block.c.seq, block.c.kind, block.c.body, block.c.retired_partition
+                )
                 .where(block.c.seq > after)
                 .order_by(block.c.seq)
                 .limit(_SCAN_CHUNK)
@@ -448,18 +440,35 @@ class Retirer:
             for row in rows:
                 seq = int(row.seq)
                 after = seq
+                if row.kind == "retire" and row.retired_partition is not None:
+                    yield (
+                        seq,
+                        _RetireBlock(seq, str(row.retired_partition), bytes(row.body)),
+                        [],
+                    )
+                    continue
                 if row.kind != "seal":
-                    yield seq, []
+                    yield seq, None, []
                     continue
                 try:
                     body = parse_body(bytes(row.body))
                 except (UnicodeDecodeError, ValueError):
-                    yield seq, []
+                    yield seq, None, []
                     continue
                 parsed = parse_segments(seq, body.get("segments")) or []
                 yield (
                     seq,
+                    None,
                     [Segment(s.stream, s.partition, s.rows, s.root) for s in parsed],
                 )
             if len(rows) < _SCAN_CHUNK:
                 return
+
+
+@dataclass(frozen=True)
+class _RetireBlock:
+    """A retire block as stored: its number, partition and body."""
+
+    seq: int
+    partition: str
+    body: bytes
