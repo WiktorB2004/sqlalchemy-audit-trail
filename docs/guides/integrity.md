@@ -142,9 +142,7 @@ Use an `AuditTrail` with the same `schema`, severities and `system_severity` as 
 The report has a `status` (`VALID`, `VALID_WITH_NOTES` or `FAILED`), an `anchor` (`ANCHORED` when a checkpoint matched), `failures` and `notes`, each a `Finding` with a `kind`, a `detail` sentence and the block, partition or row it concerns. A finding never contains a stored value or a salt.
 
 - **Failures** (`FailureKind`) include `ROOT_MISMATCH` and `ROW_COUNT_MISMATCH` (sealed rows changed, added or deleted), `COMMITMENT_MISMATCH` (an erasable value changed), `COMMITMENT_MISSING` (a row written without `Integrity`), `ERASURE_UNEXPLAINED` and `SCRUB_COUNT_MISMATCH` (an erasure without a matching scrub), `SEGMENT_MISSING` (a partition gone without a retire block), `RETIRED_EARLY` (with `retention`: a partition retired inside its retention), `DETACHED_PARTITION`, `PREV_MISMATCH` and `HASH_MISMATCH` (the chain itself), `TRUNCATED` and `CHAIN_MISMATCH` (against a checkpoint), `BAD_SIGNATURE`, `UNKNOWN_KEY`, `MALFORMED_BLOCK` and `XID_REWIND`.
-- **Notes** (`NoteKind`) do not fail the report: `ERASED`, `ERASED_RECEIPT_RETIRED`, `RETIRED`, `PRE_GENESIS`, `UNSEALED_TAIL`, `UNANCHORED_TAIL`, `FORKED` and `ACKNOWLEDGED`.
-
-<!-- Pending in the checkpoints work: a note kind for a fork that no known key signed. List it here once it is merged. -->
+- **Notes** (`NoteKind`) do not fail the report: `ERASED`, `ERASED_RECEIPT_RETIRED`, `RETIRED`, `PRE_GENESIS`, `UNSEALED_TAIL`, `UNANCHORED_TAIL`, `FORKED`, `FORKED_UNSIGNED` and `ACKNOWLEDGED`. With a `verifier`, a fork block that no key it knows signed gets a `FORKED_UNSIGNED` note next to its `FORKED` one: anyone who can write the block table can add such a block, so it explains no checkpoint (see [restores and forks](#restores-and-forks)).
 
 ### Acknowledging a known incident
 
@@ -191,7 +189,7 @@ with sealer_engine.connect() as conn:
 store_off_the_box(checkpoint.to_note())
 ```
 
-The text is a [C2SP signed note](https://c2sp.org/signed-note): a two-line statement of the chain id, block number, block hash, sealed horizon and time, followed by one signature line per key, so existing note tooling can check the signatures. It is not a C2SP [tlog-checkpoint](https://github.com/C2SP/C2SP/blob/main/tlog-checkpoint.md): the head of the chain is a hash chain, not a Merkle tree over the blocks, so there is no tree size and no consistency proof. `Checkpoint.from_note(text)` reads one back, and `verify(checkpoints=[...])` takes the texts as they are.
+The text is a [C2SP signed note](https://c2sp.org/signed-note): a two-line statement of the chain id, block number, block hash, sealed horizon, time and incarnation (1 until the first fork, then the number of the newest fork's), followed by one signature line per key, so existing note tooling can check the signatures. It is not a C2SP [tlog-checkpoint](https://github.com/C2SP/C2SP/blob/main/tlog-checkpoint.md): the head of the chain is a hash chain, not a Merkle tree over the blocks, so there is no tree size and no consistency proof. `Checkpoint.from_note(text)` reads one back, and `verify(checkpoints=[...])` takes the texts as they are. A note with two signatures of one key, or a key name with a control character, is refused as malformed, and `checkpoint.signed([...])` refuses a key that signed it already.
 
 Storing it is up to you; the database must not be able to change it afterwards:
 
@@ -202,9 +200,15 @@ Storing it is up to you; the database must not be able to change it afterwards:
 
 Exporting appends a `checkpoint` block, so the chain itself records that an anchor was taken.
 
-**Replication.** After an asynchronous failover that lost the newest blocks, a checkpoint naming one of them would look exactly like an attack (`TRUNCATED`). `export_checkpoint(require_replicated=True)` returns the checkpoint only once a synchronous standby has flushed its block, and otherwise raises `ReplicationError` (`NO_SYNC_STANDBY` or `NOT_REPLICATED`, with the block's `seq` and WAL position). It reads `pg_stat_replication`, whose WAL positions only roles with the privileges of `pg_read_all_stats` (included in `pg_monitor`) can see.
+**Replication.** After an asynchronous failover that lost the newest blocks, a checkpoint naming one of them would look exactly like an attack (`TRUNCATED`). `export_checkpoint(require_replicated=True)` returns the checkpoint only once as many synchronous standbys as `synchronous_standby_names` asks for have flushed its block: `n` with `sync_state` `sync` for `FIRST n` (or a plain list of names, which means `FIRST 1`), `n` with `quorum` for `ANY n`. It waits up to `replication_timeout` (30 seconds by default). It reads `pg_stat_replication`, whose WAL positions only roles with the privileges of `pg_read_all_stats` (included in `pg_monitor`) can see.
 
-<!-- Pending in the checkpoints work: a short retry window for NO_SYNC_STANDBY. Describe it here once it is merged. -->
+The check runs after the commit, so the `checkpoint` block is in the chain whatever happens; only the checkpoint is withheld. Any error from then on is a `ReplicationError` with the block's `seq` and the WAL position it waited for (`lsn`, empty if reading it failed), and a `reason`:
+
+- `NO_SYNC_STANDBY`: `synchronous_standby_names` is empty, which fails at once, or fewer standbys of the kind it asks for are listed. A standby that is reconnecting is listed again within moments, so this waits about two seconds (capped by `replication_timeout`) before it gives up. A role without `pg_monitor` sees no standby and fails this way too;
+- `NOT_REPLICATED`: enough standbys are listed, but not enough flushed the block within `replication_timeout`;
+- `CHECK_FAILED`: reading the WAL position or `pg_stat_replication` failed; the error is chained as the cause.
+
+In every case, export again once the standbys are back: the next call appends a new `checkpoint` block.
 
 **Keys.** `Ed25519Signer.generate("audit.example.com/sealer-2027")` makes a key; keep its `skey` secret and give its `vkey` to the verifiers. Use a new name for each new key, and keep old verifier keys in `Ed25519Verifier` for as long as blocks and checkpoints signed by them are checked. For tier 3, implement the `Signer` protocol (`key_id`, `algorithm`, `sign(message)`) against your KMS or HSM.
 
@@ -235,7 +239,15 @@ with sealer_engine.connect() as conn:
     )
 ```
 
-It first seals what the old incarnation left unsealed, then appends a `fork` block. `verify()` reports it as a `FORKED` note. Given a checkpoint taken after the fork's own, it explains the divergence only when the fork block is signed by a key the verifier knows; otherwise the checkpoint fails as `TRUNCATED` or `CHAIN_MISMATCH`.
+It first seals what the old incarnation left unsealed, then appends a `fork` block. `verify()` reports it as a `FORKED` note.
+
+A checkpoint stored before the restore may name a block that the restored chain lost or holds with another hash. Such a checkpoint is a `FORKED` note instead of a failure only when all of these hold:
+
+- the fork block is signed by a key the verifier knows; an unsigned fork gets a `FORKED_UNSIGNED` note and explains nothing;
+- the checkpoint is of an earlier incarnation than the one the fork starts (each checkpoint records its incarnation);
+- the checkpoint names a block after the last good checkpoint the fork was declared from.
+
+Otherwise it fails as `TRUNCATED` or `CHAIN_MISMATCH`. A checkpoint taken after the fork is never explained by it: the chain it saw already held the fork block, so a divergence since is a rewrite.
 
 **Point-in-time recovery**, or a base backup started as a primary: transaction ids carry on from the restore point and repeat some ids of the lost blocks, which is harmless because those blocks are gone too. Declare the fork.
 
@@ -247,6 +259,6 @@ pg_resetwal --epoch=<(highest stored xid >> 32) + 1> "$PGDATA"
 
 Find the highest stored xid with `SELECT max(xid::text::numeric) FROM audit.audit_activity` (and the same for `audit_transaction`). Start the server and declare the fork. `pg_resetwal` discards the write-ahead log, so rebuild the replicas afterwards, and read [its documentation](https://www.postgresql.org/docs/current/app-pgresetwal.html) first.
 
-**`pg_dump` / `pg_restore` on a managed service**, where `pg_resetwal` is not available: `declare_fork()` sees the rewound ids and records an **id window**, the highest `id` of each stream at the fork. From then on the old blocks hold the rows at or below it and the new incarnation the rows above it. This needs the identity sequences restored with the data (a full `pg_restore`, or a data-only restore that keeps the `SEQUENCE SET` entries): `declare_fork()` refuses when a sequence is behind the window, and every later seal refuses with `ID_FLOOR_VIOLATION` if new rows get ids at or below it (`ALTER ... RESTART`, for example). `id_window=` forces the choice either way.
+**`pg_dump` / `pg_restore` on a managed service**, where `pg_resetwal` is not available: `declare_fork()` sees the rewound ids and records an **id window**, the highest `id` of each stream at the fork. From then on the old blocks hold the rows at or below it and the new incarnation the rows above it. This needs the identity sequences restored with the data (a full `pg_restore`, or a data-only restore that keeps the `SEQUENCE SET` entries): `declare_fork()` refuses when a sequence is behind the window, and every later seal refuses with `ID_FLOOR_VIOLATION` if new rows get ids at or below it (`ALTER ... RESTART`, for example): when a table's identity sequence is below the window, and, while the sequence is still within the fork's row count of the window, when a stream has more rows at or below the window than the fork counted. The second check weakens as retention drops those rows (see [Limitations](../limitations.md#tamper-evidence)). `id_window=` forces the choice either way.
 
 A block table from another incarnation is never reused without `declare_fork()`. Point-in-time recovery is detected only against a checkpoint: without tier 2, a restore to an earlier state looks like a consistent, shorter chain.
