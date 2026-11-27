@@ -76,8 +76,8 @@ from audit_trail.integrity._block import (
 )
 from audit_trail.integrity._codec import rfc3339
 from audit_trail.integrity._seal import (
-    _window,
     block_table,
+    current_window,
     last_block,
     seal,
     sealed_horizon,
@@ -431,7 +431,7 @@ class Retirer:
             columns.append(Column("severity", SmallInteger))
         table = Table(child.name, MetaData(), *columns, schema=child.schema)
         xid = table.c[_schema.XID]
-        floors = _window(conn, self._block).id_floor
+        floors = current_window(conn, self._block).id_floor
         window = window_clause(table, floors, above=True)
         found = conn.execute(
             select(literal_column("1", Integer))

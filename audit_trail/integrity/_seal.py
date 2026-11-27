@@ -197,7 +197,7 @@ def write_genesis(
 ) -> Genesis:
     """Start the chain, once; see ``migrations.write_genesis``."""
     block = block_table(tables)
-    _check_transactional(connection, "write_genesis")
+    _pg.check_transactional(connection, "write_genesis")
     start = connection.execute(
         text(
             f"SELECT {_pg.XACT_LOCK} AS locked, "
@@ -300,7 +300,7 @@ def seal(
     if max_rows < 1:
         raise ValueError("max_rows must be at least 1")
     block = block_table(tables)
-    _check_transactional(connection, "seal")
+    _pg.check_transactional(connection, "seal")
     if connection.in_transaction():
         raise ValueError(
             "seal runs its own REPEATABLE READ transaction; pass a connection "
@@ -363,16 +363,16 @@ def _seal(
                 "replica), so new rows would repeat sealed ranges. Never seal "
                 "on a logical replica; after a restore, declare a fork",
             )
-        window = _window(connection, block)
+        window = current_window(connection, block)
         check_floor(connection, tables, window)
-        windows = _windows(tables, window.id_floor)
+        windows = window_clauses(tables, window.id_floor)
         if up_to is not None:
             horizon = max(min(horizon, up_to), xid_from)
         xid_to, capped = _cut(connection, tables, xid_from, horizon, max_rows, windows)
         if xid_to is None:
             return SealResult(0, 0, xid_from)
         builder = SegmentBuilder()
-        for stream, partition, row in _rows(
+        for stream, partition, row in leaf_rows(
             connection, tables, xid_from, xid_to, windows
         ):
             builder.add(stream, partition, row)
@@ -447,7 +447,7 @@ def seal_health(
         return SealHealth(False, None, None, 0, None, max_seal_lag, prepared, problem)
     sealed_to = horizon_of(parse_body(horizon.body))
     # Rows of an earlier incarnation are sealed, whatever their xid.
-    windows = _windows(tables, _window(connection, block).id_floor)
+    windows = window_clauses(tables, current_window(connection, block).id_floor)
     # Bounded, so each walks the (xid, id) indexes from sealed_to only.
     columns = []
     for table, stamp in (
@@ -478,12 +478,6 @@ def missing_block_table(block: Table) -> str:
         f"the block table {block.fullname} does not exist; run "
         "migrations.add_integrity() first"
     )
-
-
-def _check_transactional(connection: Connection, name: str) -> None:
-    dbapi = connection.connection.dbapi_connection
-    if getattr(dbapi, "autocommit", False):
-        raise ValueError(f"{name} needs a transaction, not AUTOCOMMIT")
 
 
 def snapshot_horizon(connection: Connection) -> int:
@@ -536,7 +530,7 @@ class Window:
     id_count: dict[str, int] | None = None
 
 
-def _window(connection: Connection, block: Table) -> Window:
+def current_window(connection: Connection, block: Table) -> Window:
     """The id window of the current incarnation: of the newest fork with one.
 
     A fork without an id window keeps the one before it.
@@ -596,7 +590,7 @@ def window_clause(
     return or_(*named, severity.not_in(list(severities)))
 
 
-def _windows(
+def window_clauses(
     tables: AuditTables,
     lower: Mapping[str, int] | None,
     upper: Mapping[str, int] | None = None,
@@ -795,7 +789,7 @@ def _cut(
     return following, True
 
 
-def _rows(
+def leaf_rows(
     connection: Connection,
     tables: AuditTables,
     lower: int,

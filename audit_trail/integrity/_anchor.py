@@ -55,15 +55,14 @@ from audit_trail.integrity._block import (
 from audit_trail.integrity._checkpoint import Checkpoint
 from audit_trail.integrity._seal import (
     SealRefusedError,
-    _check_transactional,
-    _rows,
-    _window,
-    _windows,
     block_table,
+    current_window,
     insert_block,
     last_block,
+    leaf_rows,
     sealed_horizon,
     sequence_value,
+    window_clauses,
 )
 from audit_trail.integrity._sign import Signer
 from audit_trail.tables import AuditTables
@@ -164,7 +163,7 @@ def export_checkpoint(
             any error after the commit is one, with ``seq`` and ``lsn``.
     """
     block = block_table(tables)
-    _check_transactional(connection, "export_checkpoint")
+    _pg.check_transactional(connection, "export_checkpoint")
     _check_idle(connection, "export_checkpoint")
     with connection.begin():
         _lock(connection, block)
@@ -173,7 +172,7 @@ def export_checkpoint(
         if head is None or last is None:
             raise _no_genesis(block)
         chain, xid_to = head
-        incarnation = _window(connection, block).incarnation
+        incarnation = current_window(connection, block).incarnation
         seq = int(last.seq) + 1
         body = checkpoint_body(chain, seq, xid_to)
         digest = insert_block(
@@ -432,7 +431,7 @@ def declare_fork(
         if isinstance(last_good_checkpoint, str)
         else last_good_checkpoint
     )
-    _check_transactional(connection, "declare_fork")
+    _pg.check_transactional(connection, "declare_fork")
     _check_idle(connection, "declare_fork")
     with connection.begin():
         horizon = _lock(connection, block)
@@ -442,7 +441,7 @@ def declare_fork(
             raise _no_genesis(block)
         chain, sealed_to = head
         _check_checkpoint(connection, block, chain, checkpoint)
-        window = _window(connection, block)
+        window = current_window(connection, block)
         rewound = horizon < sealed_to
         with_window = rewound if id_window is None else id_window
         if rewound and not with_window:
@@ -466,8 +465,8 @@ def declare_fork(
         closing_seq: int | None = None
         if closing_to is not None and closing_to > sealed_to:
             builder = SegmentBuilder()
-            windows = _windows(tables, lower, upper)
-            for stream, partition, row in _rows(
+            windows = window_clauses(tables, lower, upper)
+            for stream, partition, row in leaf_rows(
                 connection, tables, sealed_to, closing_to, windows
             ):
                 builder.add(stream, partition, row)
@@ -521,10 +520,7 @@ def _lock(connection: Connection, block: Table) -> int:
             f"the block table {block.fullname} does not exist; run "
             "migrations.add_integrity() first"
         )
-    connection.execute(
-        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-        {"key": _pg.lock_key(block)},
-    )
+    _pg.xact_lock(connection, _pg.lock_key(block))
     return int(
         connection.execute(
             text("SELECT pg_snapshot_xmin(pg_current_snapshot())::text")
@@ -609,7 +605,7 @@ def _highest_xid(
     upper: Mapping[str, int] | None,
 ) -> int | None:
     """The highest ``xid`` of a row in the window, over both tables."""
-    windows = _windows(tables, lower, upper)
+    windows = window_clauses(tables, lower, upper)
     found: list[int] = []
     for table in (tables.transaction, tables.activity):
         xid = table.c[_schema.XID]
