@@ -93,6 +93,18 @@ _DDL_SKIPS: dict[str, SkipReason] = {
 }
 
 
+def chain_started(connection: Connection, tables: AuditTables) -> bool:
+    """Whether the block table of ``tables`` holds any block.
+
+    With none, the chain has not been started (``write_genesis``), nothing
+    was sealed, and ``drop_expired`` drops as without integrity. A block
+    table that holds blocks but no genesis is refused by ``seal``.
+    """
+    block = block_table(tables)
+    found = connection.execute(select(block.c.seq).limit(1)).first()
+    return found is not None
+
+
 class Retirer:
     """Seals, verifies and retires expired partitions for ``drop_expired``.
 

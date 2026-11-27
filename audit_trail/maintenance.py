@@ -435,7 +435,9 @@ def drop_expired(
     pending), is kept and reported in ``skipped`` instead of failing the
     call; no partition is dropped without a retire block. The backend is
     also checked before each retire block, so behind a transaction-mode
-    pooler none is written.
+    pooler none is written. Before the chain is started (the block table is
+    empty: ``write_genesis`` has not run), nothing has been sealed, and the
+    call drops as without integrity.
 
     Args:
         connection: ``AUTOCOMMIT`` connection with DDL privileges, direct or
@@ -473,8 +475,9 @@ def drop_expired(
         PartitionLockTimeoutError: If a lock was not granted within
             ``lock_timeout``. Partitions dropped before that stay dropped.
             With integrity, a detach or drop skips the partition instead.
-        SealRefusedError: With integrity, the chain has no genesis block or
-            the transaction ids were rewound; nothing was dropped.
+        SealRefusedError: With integrity, the block table holds blocks but
+            no genesis block, or the transaction ids were rewound; nothing
+            was dropped.
     """
     if not getattr(connection.connection.dbapi_connection, "autocommit", False):
         raise ValueError(
@@ -1045,14 +1048,18 @@ def _drop(
                 value,
             )
 
-        if not has_integrity(transaction):
+        if has_integrity(transaction):
+            # Imported here: the integrity modules import this one.
+            from audit_trail.integrity._retire import Retirer, chain_started
+
+            retiring = chain_started(conn, tables)
+        else:
+            retiring = False
+        if not retiring:
             dropped = DroppedPartitions()
             for target in targets:
                 dropped += _drop_months(session, target, now)
         else:
-            # Imported here: the integrity modules import this one.
-            from audit_trail.integrity._retire import Retirer
-
             session.check()
             with Retirer(
                 conn, tables, verify_before_drop=verify_before_drop

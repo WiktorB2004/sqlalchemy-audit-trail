@@ -515,13 +515,42 @@ def test_rows_after_the_retire_block_keep_the_detached_table(
 # -- the chain must be started --------------------------------------------------------
 
 
-def test_no_genesis_drops_nothing(engine: Engine, schema: str) -> None:
+def test_an_empty_chain_drops_as_without_integrity(engine: Engine, schema: str) -> None:
     tables = build_tables(schema=schema, integrity=True)
     with engine.begin() as conn:
         create_audit_tables(conn, tables, Sev)
         ensure_partitions(
             conn, tables, Sev, months_ahead=3, now=datetime(2026, 6, 5, tzinfo=UTC)
         )
+    checkouts: list[object] = []
+
+    def count(*_args: object) -> None:
+        checkouts.append(_args)
+
+    event.listen(engine, "checkout", count)
+    try:
+        dropped = drop(engine, tables)
+    finally:
+        event.remove(engine, "checkout", count)
+    # No block yet: nothing was sealed, so nothing is retired or skipped,
+    # and no second connection is taken.
+    assert dropped == expired(schema)
+    assert dropped.skipped == []
+    assert len(checkouts) == 1
+    assert block_count(engine, tables) == 0
+
+
+def test_blocks_without_a_genesis_drop_nothing(engine: Engine, schema: str) -> None:
+    tables = build_tables(schema=schema, integrity=True)
+    with engine.begin() as conn:
+        create_audit_tables(conn, tables, Sev)
+        ensure_partitions(
+            conn, tables, Sev, months_ahead=3, now=datetime(2026, 6, 5, tzinfo=UTC)
+        )
+        # A chain whose only block is not a genesis block.
+        block = _seal.block_table(tables)
+        body = b'{"kind":"ack"}'
+        _seal.insert_block(conn, block, 1, "ack", bytes(32), body)
     with pytest.raises(_seal.SealRefusedError, match="NO_GENESIS"):
         drop(engine, tables)
     assert len(attached(engine, schema)) == 4 * 3
