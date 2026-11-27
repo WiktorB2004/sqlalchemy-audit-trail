@@ -24,6 +24,11 @@ stores it exactly as hashed::
 
 The first block is a ``genesis`` block with ``prev_hash`` of 32 zero bytes.
 Hashes inside a body are base64, as in ``seal_commitments``.
+
+A ``retire`` block is written before a partition is dropped. It names the
+partition, its table and streams, and covers every segment of it in the
+seal blocks before it: their seal range, count, rows and a digest of them
+(``retire_coverage``).
 """
 
 from __future__ import annotations
@@ -375,30 +380,90 @@ def ack_body(
     )
 
 
+RETIRE_CONTEXT = context("retire")
+"""Domain separation string of a retire block's ``segments_digest``."""
+
+
+@dataclass(frozen=True)
+class SealedSegment:
+    """A segment as the chain holds it: the seal block it is in, and itself.
+
+    Attributes:
+        seq: The seal block.
+        segment: The segment.
+    """
+
+    seq: int
+    segment: Segment
+
+
+def retire_coverage(segments: Iterable[SealedSegment]) -> dict[str, object]:
+    """What a retire block says about the sealed segments of its partition.
+
+    Args:
+        segments: Every segment of the partition in the seal blocks before
+            the retire block.
+
+    Returns:
+        ``seals``: ``{"first": seq, "last": seq}`` of the first and last
+        seal block with a segment of the partition, ``None`` when there is
+        none; ``segments``: how many; ``rows``: their rows together;
+        ``segments_digest``: base64 of
+        ``SHA-256("sqlalchemy-audit-trail/retire/v1" || 0x00 || c1 || c2 ...)``
+        where ``ci`` is the canonical ``{seq, stream, rows, root}`` of each
+        segment, in ``(seq, stream)`` order.
+    """
+    ordered = sorted(segments, key=lambda s: (s.seq, s.segment.stream))
+    digest = hashlib.sha256(RETIRE_CONTEXT + b"\x00")
+    for item in ordered:
+        digest.update(
+            canonical(
+                {
+                    "seq": item.seq,
+                    "stream": item.segment.stream,
+                    "rows": item.segment.rows,
+                    "root": b64(item.segment.root),
+                }
+            )
+        )
+    seals = {"first": ordered[0].seq, "last": ordered[-1].seq} if ordered else None
+    return {
+        "seals": seals,
+        "segments": len(ordered),
+        "rows": sum(item.segment.rows for item in ordered),
+        "segments_digest": b64(digest.digest()),
+    }
+
+
 def retire_body(
     chain: str,
     seq: int,
     *,
-    stream: str,
+    table: str,
     partition: str,
+    streams: Iterable[str],
     upper_bound: datetime,
     retention: int | None,
-    rows: int,
-    segments_digest: bytes,
+    segments: Iterable[SealedSegment],
 ) -> bytes:
     """Body of a retire block, written before a partition is dropped.
+
+    It binds the drop to the chain: the partition, the streams it holds,
+    and every segment of it sealed before the block (``retire_coverage``).
+    A segment of the partition sealed after the block is not covered.
 
     Args:
         chain: The chain id.
         seq: The block's number.
-        stream: The partition's stream.
+        table: ``transaction`` or ``activity``.
         partition: Name of the partition, without schema.
+        streams: The streams its rows belong to: ``transaction``, or
+            ``activity.<severity>`` for each severity its parent holds.
         upper_bound: The partition's exclusive upper bound.
         retention: The retention it was dropped under, in whole seconds;
             ``None`` when it had none.
-        rows: Rows the partition held.
-        segments_digest: SHA-256 over the roots of its segments, in chain
-            order.
+        segments: Every segment of the partition in the seal blocks before
+            this one.
     """
     return _body(
         {
@@ -406,12 +471,12 @@ def retire_body(
             "kind": "retire",
             "chain": chain,
             "seq": seq,
-            "stream": stream,
+            "table": table,
             "partition": partition,
+            "streams": sorted(streams),
             "upper_bound": rfc3339(upper_bound),
             "retention": retention,
-            "rows": rows,
-            "segments_digest": b64(segments_digest),
+            **retire_coverage(segments),
         }
     )
 

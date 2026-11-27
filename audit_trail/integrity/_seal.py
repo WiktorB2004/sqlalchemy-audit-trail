@@ -200,7 +200,7 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
         return existing
     if connection.execute(select(func.count()).select_from(block)).scalar_one():
         raise ValueError(f"{block.fullname} has blocks but no genesis block")
-    horizon = _horizon(connection)
+    horizon = snapshot_horizon(connection)
     chain = str(uuid.uuid4())
     try:
         # A savepoint, so a conflict leaves the caller's transaction usable.
@@ -234,7 +234,11 @@ def _genesis(connection: Connection, block: Table) -> Genesis | None:
 
 
 def seal(
-    connection: Connection, tables: AuditTables, *, max_rows: int = DEFAULT_MAX_ROWS
+    connection: Connection,
+    tables: AuditTables,
+    *,
+    max_rows: int = DEFAULT_MAX_ROWS,
+    up_to: int | None = None,
 ) -> SealResult:
     """Seal the finished transactions since the last block into a new block.
 
@@ -263,6 +267,9 @@ def seal(
             ``AUTOCOMMIT`` mode; never the DDL connection of ``drop_expired``.
         tables: Audit tables built with integrity.
         max_rows: Soft cap on the rows of the block, at least 1.
+        up_to: Seal no transaction at or above this ``xid``: ``H`` is
+            lowered to it. A catch-up loop that passes the horizon it read
+            first ends even while writers outpace the sealer.
 
     Returns:
         What was sealed. On a standby, on a logical-replication subscriber of
@@ -286,7 +293,7 @@ def seal(
             "that is not in a transaction"
         )
     try:
-        return _seal(connection, tables, block, max_rows)
+        return _seal(connection, tables, block, max_rows, up_to)
     except _StaleSnapshotError:
         # The transaction was rolled back on the way out.
         return SealResult(0, 0, None, skipped="busy")
@@ -297,7 +304,11 @@ class _StaleSnapshotError(Exception):
 
 
 def _seal(
-    connection: Connection, tables: AuditTables, block: Table, max_rows: int
+    connection: Connection,
+    tables: AuditTables,
+    block: Table,
+    max_rows: int,
+    up_to: int | None,
 ) -> SealResult:
     with connection.begin():
         # Before any query, so the snapshot is taken at REPEATABLE READ.
@@ -321,7 +332,7 @@ def _seal(
             return SealResult(0, 0, None, skipped="busy")
         horizon = int(start.horizon)
         last = last_block(connection, block)
-        sealed = _sealed_to(connection, block)
+        sealed = sealed_horizon(connection, block)
         if last is None or sealed is None:
             raise SealRefusedError(
                 "NO_GENESIS",
@@ -337,6 +348,8 @@ def _seal(
                 "replica), so new rows would repeat sealed ranges. Never seal "
                 "on a logical replica; after a restore, declare a fork",
             )
+        if up_to is not None:
+            horizon = max(min(horizon, up_to), xid_from)
         xid_to, capped = _cut(connection, tables, xid_from, horizon, max_rows)
         if xid_to is None:
             return SealResult(0, 0, xid_from)
@@ -450,7 +463,8 @@ def _check_transactional(connection: Connection, name: str) -> None:
         raise ValueError(f"{name} needs a transaction, not AUTOCOMMIT")
 
 
-def _horizon(connection: Connection) -> int:
+def snapshot_horizon(connection: Connection) -> int:
+    """The ``xmin`` of the current snapshot: every lower xid has ended."""
     return int(
         connection.execute(
             text("SELECT pg_snapshot_xmin(pg_current_snapshot())::text")
@@ -465,7 +479,7 @@ def last_block(connection: Connection, block: Table) -> Any:
     ).one_or_none()
 
 
-def _sealed_to(connection: Connection, block: Table) -> tuple[str, int] | None:
+def sealed_horizon(connection: Connection, block: Table) -> tuple[str, int] | None:
     """The chain id and the horizon of the newest genesis or seal block."""
     body = connection.execute(
         select(block.c.body)

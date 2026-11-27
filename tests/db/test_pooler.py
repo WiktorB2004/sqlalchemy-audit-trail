@@ -15,9 +15,11 @@ from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 
 import pytest
-from sqlalchemy import Engine, create_engine, make_url, text
+from sqlalchemy import Engine, create_engine, make_url, select, text
 from sqlalchemy.exc import OperationalError
 
+from audit_trail import migrations
+from audit_trail.integrity import _seal
 from audit_trail.maintenance import (
     PartitionError,
     drop_expired,
@@ -211,3 +213,37 @@ def test_drop_expired_works_with_session_pooling(
             assert auto.execute(text("SHOW lock_timeout")).scalar_one() == before
         assert len(dropped) == expected
     assert advisory_locks(engine) == 0
+
+
+@pytest.mark.filterwarnings("ignore:Did not recognize type 'xid8'")
+def test_drop_expired_with_integrity_refuses_before_any_retire_block(
+    engine: Engine, transaction_pooled: Engine, schema: str
+) -> None:
+    t = build_tables(schema=schema, integrity=True)
+    with engine.begin() as conn:
+        create_audit_tables(conn, t, Sev)
+        ensure_partitions(
+            conn, t, Sev, months_ahead=3, now=datetime(2026, 6, 5, tzinfo=UTC)
+        )
+        migrations.write_genesis(conn, t)
+    block = _seal.block_table(t)
+
+    def retire_blocks() -> int:
+        with engine.connect() as conn:
+            return len(
+                conn.execute(select(block.c.seq).where(block.c.kind == "retire")).all()
+            )
+
+    with transaction_pooled.connect() as conn:
+        auto = conn.execution_options(isolation_level="AUTOCOMMIT")
+        with pytest.raises(PartitionError, match="session-pooled connection"):
+            drop_expired(auto, t, RETENTION, now=NOW, lock_timeout="1s")
+
+    assert retire_blocks() == 0
+    assert advisory_locks(engine) == 0
+    # A direct connection retires and drops them afterwards.
+    with engine.connect() as conn:
+        auto = conn.execution_options(isolation_level="AUTOCOMMIT")
+        dropped = drop_expired(auto, t, RETENTION, now=NOW, lock_timeout="1s")
+    assert len(dropped) == 3 * 2
+    assert retire_blocks() == 3 * 2

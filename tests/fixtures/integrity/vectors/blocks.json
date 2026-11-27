@@ -127,6 +127,12 @@
       "prev_hash": "ef6ba7784c519a275884376c12a00bfba7bfd0df649241cb793ca56a4d185471",
       "body": "{\"chain\":\"3f2b8c1e-6a4d-4e2f-9c1b-7d5e3a2f1b0c\",\"id_count\":null,\"id_floor\":null,\"incarnation\":3,\"kind\":\"fork\",\"prior_checkpoint\":{\"block_hash\":\"72uneExRmidYhDdsEqAL+6e/0N9kkkHLeTylak0YVHE=\",\"seq\":4},\"reason\":\"PITR à 03:00\",\"seq\":5,\"v\":1,\"xid_at_fork\":1600}",
       "block_hash": "3cd504d90d36dd7c957d54a37ead011ce7fc0f00833cb1f66a08764e09336872"
+    },
+    {
+      "name": "retire of one segment",
+      "prev_hash": "3cd504d90d36dd7c957d54a37ead011ce7fc0f00833cb1f66a08764e09336872",
+      "body": "{\"chain\":\"3f2b8c1e-6a4d-4e2f-9c1b-7d5e3a2f1b0c\",\"kind\":\"retire\",\"partition\":\"audit_transaction_p2026_11\",\"retention\":7776000,\"rows\":1,\"seals\":{\"first\":2,\"last\":2},\"segments\":1,\"segments_digest\":\"lHUbppV1F9XmSQ+0ihj5NcigmXfHmUhvok8LsK/hEqM=\",\"seq\":6,\"streams\":[\"transaction\"],\"table\":\"transaction\",\"upper_bound\":\"2026-12-01T00:00:00.000000Z\",\"v\":1}",
+      "block_hash": "c5ddd4529aff29a7aff9b2a98635965f86e1a53d56aaee4c118046b4575bee63"
     }
   ]
 }

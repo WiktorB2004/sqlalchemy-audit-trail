@@ -7,6 +7,7 @@ one kind of failure.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -40,6 +41,8 @@ from audit_trail import (
 )
 from audit_trail.integrity import _seal, _verify_db
 from audit_trail.integrity._block import (
+    SealedSegment,
+    Segment,
     ack_body,
     activity_stream,
     block_hash,
@@ -188,7 +191,7 @@ def append_block(env: Env, kind: str, make_body: Any) -> int:
 def sealed_to(env: Env) -> int:
     block = _seal.block_table(env.trail.tables)
     with env.engine.connect() as conn:
-        found = _seal._sealed_to(conn, block)
+        found = _seal.sealed_horizon(conn, block)
     assert found is not None
     return found[1]
 
@@ -692,20 +695,44 @@ def test_a_row_from_the_future_is_xid_rewind(env: Env) -> None:
     assert (finding.table, finding.xid) == ("transaction", future)
 
 
+def sealed_segments(env: Env, partition: str) -> list[SealedSegment]:
+    """The segments of ``partition`` in the seal blocks, read with SQL of its own."""
+    block = _seal.block_table(env.trail.tables)
+    with env.engine.connect() as conn:
+        rows = conn.execute(
+            select(block.c.seq, block.c.body)
+            .where(block.c.kind == "seal")
+            .order_by(block.c.seq)
+        ).all()
+    return [
+        SealedSegment(
+            int(row.seq),
+            Segment(
+                item["stream"], partition, item["rows"], base64.b64decode(item["root"])
+            ),
+        )
+        for row in rows
+        for item in parse_body(bytes(row.body))["segments"]
+        if item["partition"] == partition
+    ]
+
+
 def retire(env: Env, upper_bound: datetime) -> int:
+    """A retire block of the transaction partition, as drop_expired writes it."""
     partition = transaction_partition(env)
+    segments = sealed_segments(env, partition)
     return append_block(
         env,
         "retire",
         lambda chain, seq: retire_body(
             chain,
             seq,
-            stream="transaction",
+            table="transaction",
             partition=partition,
+            streams=["transaction"],
             upper_bound=upper_bound,
             retention=None,
-            rows=2,
-            segments_digest=bytes(32),
+            segments=segments,
         ),
     )
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
@@ -24,6 +26,9 @@ UNDEFINED_TABLE = "42P01"
 
 LOCK_NOT_AVAILABLE = "55P03"
 """SQLSTATE raised when ``lock_timeout`` expires."""
+
+OBJECT_NOT_IN_PREREQUISITE_STATE = "55000"
+"""SQLSTATE of a ``DETACH`` while a detach from the same parent is pending."""
 
 
 XACT_LOCK = "pg_advisory_xact_lock(hashtext(:key))"
@@ -91,6 +96,18 @@ def execute_ddl(connection: Connection, statement: str) -> None:
 def lock_key(block: Table) -> str:
     """Key of the advisory lock that lets one writer of a seal chain run at a time."""
     return f"audit_trail.seal:{block.schema}.{block.name}"
+
+
+@contextmanager
+def read_only(conn: Connection) -> Iterator[Connection]:
+    """A short ``READ ONLY`` transaction on a connection."""
+    transaction = conn.begin()
+    try:
+        conn.execute(text("SET TRANSACTION READ ONLY"))
+        yield conn
+    finally:
+        # Nothing was written; ending it either way releases the snapshot.
+        transaction.rollback()
 
 
 def regclass(connection: Connection, table: Table) -> str:
