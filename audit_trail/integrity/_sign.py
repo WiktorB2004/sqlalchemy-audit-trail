@@ -27,13 +27,15 @@ import hashlib
 import unicodedata
 from typing import Protocol, runtime_checkable
 
+from audit_trail.integrity._codec import context
+
 ED25519 = "ed25519"
 """``algorithm`` of an Ed25519 key."""
 
 NOTE_SIGNATURE_TYPES: dict[str, int] = {ED25519: 0x01}
 """C2SP signature type bytes by algorithm (c2sp.org/signed-note)."""
 
-BLOCK_SIGNATURE_CONTEXT = b"sqlalchemy-audit-trail/block-signature/v1"
+BLOCK_SIGNATURE_CONTEXT = context("block-signature")
 """Domain separation string of a block signature."""
 
 

@@ -22,8 +22,6 @@ exported without a key is the text alone.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -32,7 +30,14 @@ from typing import Any
 
 from audit_trail.integrity._block import FORMAT_VERSION
 from audit_trail.integrity._canonical import canonical
-from audit_trail.integrity._codec import rfc3339
+from audit_trail.integrity._codec import (
+    b64,
+    context,
+    decode_strict,
+    is_int,
+    parse_rfc3339,
+    rfc3339,
+)
 from audit_trail.integrity._note import (
     Note,
     NoteError,
@@ -43,7 +48,7 @@ from audit_trail.integrity._note import (
 )
 from audit_trail.integrity._sign import SignatureVerifier, Signer
 
-HEADER = "sqlalchemy-audit-trail/checkpoint/v1"
+HEADER = context("checkpoint").decode()
 """First line of a checkpoint's text."""
 
 _FIELDS = ("block_hash", "chain", "incarnation", "sealed_at", "seq", "v", "xid_to")
@@ -80,7 +85,7 @@ class Checkpoint:
                 "v": FORMAT_VERSION,
                 "chain": self.chain,
                 "seq": self.seq,
-                "block_hash": base64.b64encode(self.block_hash).decode("ascii"),
+                "block_hash": b64(self.block_hash),
                 "xid_to": self.xid_to,
                 "sealed_at": rfc3339(self.sealed_at),
                 "incarnation": self.incarnation,
@@ -163,34 +168,11 @@ def _statement(text: str) -> Checkpoint:
     chain, seq, xid_to = fields["chain"], fields["seq"], fields["xid_to"]
     incarnation = fields["incarnation"]
     if not isinstance(chain, str) or not all(
-        _is_int(value) for value in (seq, xid_to, incarnation)
+        is_int(value) for value in (seq, xid_to, incarnation)
     ):
         raise malformed("chain, seq, xid_to or incarnation has the wrong type")
-    block_hash = _hash(fields["block_hash"])
-    sealed_at = _time(fields["sealed_at"])
+    block_hash = decode_strict(fields["block_hash"], 32)
+    sealed_at = parse_rfc3339(fields["sealed_at"])
     if block_hash is None or sealed_at is None or seq < 1 or incarnation < 1:
         raise malformed("block_hash, sealed_at, seq or incarnation is invalid")
     return Checkpoint(chain, seq, block_hash, xid_to, sealed_at, incarnation)
-
-
-def _hash(value: object) -> bytes | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        raw = base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    return raw if len(raw) == 32 else None
-
-
-def _time(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.endswith("Z"):
-        return None
-    try:
-        return datetime.fromisoformat(value[:-1] + "+00:00")
-    except ValueError:
-        return None
-
-
-def _is_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
