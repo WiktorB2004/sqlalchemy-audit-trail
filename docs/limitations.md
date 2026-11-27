@@ -92,7 +92,7 @@ The log stores diffs, not copies of rows. It cannot answer "which records had st
 
 ## Maintenance behind transaction pooling
 
-`drop_expired()` takes a session-level advisory lock and sets a session `lock_timeout`, in `AUTOCOMMIT`. Behind PgBouncer in transaction mode the unlock and the reset reach other server connections, so the lock leaks and later `drop_expired()` and `ensure_partitions()` calls time out. Run the maintenance job on a direct or session-pooled connection (see [PgBouncer](guides/integrity.md#pgbouncer)).
+`drop_expired()` holds a session-level advisory lock and a session `lock_timeout` across its statements, in `AUTOCOMMIT`. Behind PgBouncer in transaction mode its statements reach different server connections, so it refuses with a `PartitionError` before it takes the lock. Run it on a direct or session-pooled connection (see [connection poolers](guides/operations.md#connection-poolers)); `ensure_partitions()` works behind transaction pooling.
 
 ## Tamper evidence
 

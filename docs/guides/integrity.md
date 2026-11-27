@@ -313,10 +313,10 @@ Behind PgBouncer, choose the pool mode by job:
 
 | Job | Transaction pooling | Session pooling or a direct connection |
 |---|---|---|
-| Audit writes, `seal()`, `verify()` / `averify()`, `export_checkpoint()`, `acknowledge()` | yes | yes |
-| `ensure_partitions()`, `drop_expired()` | **no** | yes |
+| Audit writes, `seal()`, `verify()` / `averify()`, `export_checkpoint()`, `acknowledge()`, `ensure_partitions()` | yes | yes |
+| `drop_expired()` | **no** | yes |
 
-`drop_expired()` takes a session-level advisory lock and sets `lock_timeout` for the session, in `AUTOCOMMIT`. Behind transaction pooling the unlock and the reset reach other server connections: the lock stays held by an idle pooled backend, and later `drop_expired()` and `ensure_partitions()` calls fail with `PartitionLockTimeoutError`. Until that is fixed, give the maintenance job a direct connection or a session-pooled one. In session mode a pooled connection is held for as long as the client keeps it, so keep the client pool small, or use `NullPool`, when the bouncer's `default_pool_size` is small.
+`drop_expired()` holds a session-level advisory lock and `lock_timeout` across its statements, in `AUTOCOMMIT`, because `DETACH PARTITION ... CONCURRENTLY` cannot run in a transaction. Behind transaction pooling it refuses: it checks that its statements stay on one server connection before it sets anything, before each retire block and before each DDL statement, and otherwise raises `PartitionError` before writing a retire block or detaching anything. Give the retention job a direct connection or a session-pooled one; see [connection poolers](operations.md#connection-poolers). In session mode a pooled connection is held for as long as the client keeps it, so keep the client pool small, or use `NullPool`, when the bouncer's `default_pool_size` is small.
 
 Prepared statements: PgBouncer 1.21 and later, with `max_prepared_statements` above 0 (200 by default since 1.24), handle the drivers' prepared statements in transaction mode. With `max_prepared_statements = 0`, or an older PgBouncer, turn them off in the driver:
 

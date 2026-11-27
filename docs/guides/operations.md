@@ -77,7 +77,7 @@ With [tamper evidence](integrity.md) on, three more jobs run, each under its own
 - `export_checkpoint()` hourly or daily, stored off the database host;
 - `verify()` daily, under the verifier role, ideally from another machine.
 
-`drop_expired()` then seals, verifies and writes a retire block before each drop, on a second connection from the maintenance engine's pool.
+`drop_expired()` then seals, verifies and writes a retire block before each drop, on a second connection from the maintenance engine's pool. It still needs a direct or session-pooled connection (see [connection poolers](#connection-poolers)), and behind a transaction-mode pooler it refuses before writing any retire block.
 
 ## Logging
 
