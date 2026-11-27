@@ -45,6 +45,7 @@ nav:
       - Querying the log: guides/querying.md
       - Privacy and GDPR: guides/privacy.md
       - Partitions and retention: guides/partitions.md
+      - Tamper evidence: guides/integrity.md
       - Testing your application: guides/testing.md
       - Database roles and permissions: guides/permissions.md
       - Operations: guides/operations.md

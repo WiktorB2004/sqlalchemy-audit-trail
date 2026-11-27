@@ -91,3 +91,13 @@ A `str` is refused with `TypeError`, since it would be read as a set of letters.
 `scrub` erases only the entries in those scopes. `scrub_actor` removes the context keys only from the entries in those scopes. `audit_transaction` rows have no `scope_id`: a transaction row is cleared only when it has entries and every one of them, whoever its actor, is in those scopes. Its address, user agent and label are shared by all of its entries, so a request that also wrote entries of another tenant, or entries without a scope, keeps them, and so does a transaction row without entries. A restricted `scrub_actor` can therefore leave some of the actor's context in place. A complete erasure across tenants takes a run without `scope_ids`, by the operator.
 
 The `audit.scrubbed` entry records the restriction under `scope_ids` in its payload: the sorted list, or `null` for none.
+
+## Scrubbing with integrity
+
+With [tamper evidence](integrity.md) on, every erasable part of an entry (the label, the changes, the payload and the actor's context) also has a salted SHA-256 commitment, which is sealed into the hash chain, and a random 16-byte salt kept next to it in `seal_salts`. The query API never returns either column.
+
+`scrub()` and `scrub_actor()` erase the value as before, and also **delete the salt** of each part they erase, and record in `seal_erased` the transaction id of the scrub, which its `audit.scrubbed` entry carries too. The commitment stays, so the chain still verifies, and `verify()` checks that every erasure points to a recorded scrub. Without the value and the salt, the commitment can no longer be linked to the value, as far as SHA-256 holds: it hides the value computationally, not perfectly.
+
+The EDPB's guidelines on blockchains ([Guidelines 02/2025](https://www.edpb.europa.eu/our-work-tools/documents/public-consultations/2025/guidelines-022025-processing-personal-data_en), version 2.0, paragraph 52) describe the same measure for data on a blockchain: a salted hash remains personal data while the salt exists, and should no longer be linkable to the data once the salt is deleted, provided the salt was not leaked. The guidelines are written for blockchains and apply here only by analogy.
+
+**Backups, WAL and replicas.** A scrub deletes the salt from the live database only. Base backups, archived WAL, dumps and replicas taken before the scrub still hold the value **and** its salt, until they age out. The erasure is complete only once the oldest backup from before it has expired, so keep backup retention in step with what you promise data subjects. The same holds for logs of failed audit writes, which contain the values and their salts (see [limitations](../limitations.md#tamper-evidence)).
