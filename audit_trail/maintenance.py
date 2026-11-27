@@ -438,6 +438,10 @@ def drop_expired(
     pooler none is written. Before the chain is started (the block table is
     empty: ``write_genesis`` has not run), nothing has been sealed, and the
     call drops as without integrity.
+    Otherwise the call holds a second connection from the pool of
+    ``connection.engine`` while it runs; a pool with no free connection for
+    it raises ``PartitionError`` at once, instead of waiting for its
+    ``pool_timeout``.
 
     Args:
         connection: ``AUTOCOMMIT`` connection with DDL privileges, direct or
@@ -471,7 +475,9 @@ def drop_expired(
             retention is negative, or ``now`` is naive.
         PartitionError: If a parent table does not exist, or the statements
             reached more than one backend, as behind a transaction-mode
-            pooler. Partitions dropped before that stay dropped.
+            pooler (partitions dropped before that stay dropped), or, with
+            integrity, the pool of ``connection.engine`` has no free
+            connection for the second one (nothing was dropped).
         PartitionLockTimeoutError: If a lock was not granted within
             ``lock_timeout``. Partitions dropped before that stay dropped.
             With integrity, a detach or drop skips the partition instead.

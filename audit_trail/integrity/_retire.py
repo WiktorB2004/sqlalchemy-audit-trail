@@ -34,10 +34,15 @@ from collections.abc import Iterable
 from types import TracebackType
 
 from sqlalchemy import (
+    AssertionPool,
     Column,
     Connection,
+    Engine,
     Integer,
     MetaData,
+    QueuePool,
+    SingletonThreadPool,
+    StaticPool,
     Table,
     bindparam,
     literal_column,
@@ -46,6 +51,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from audit_trail import _pg
 from audit_trail.integrity import _schema
@@ -76,6 +82,7 @@ from audit_trail.integrity._verify_db import (
 from audit_trail.maintenance import (
     LOCK_NOT_AVAILABLE,
     OBJECT_NOT_IN_PREREQUISITE_STATE,
+    PartitionError,
     SkippedPartition,
     SkipReason,
     _Child,
@@ -91,6 +98,31 @@ _DDL_SKIPS: dict[str, SkipReason] = {
     LOCK_NOT_AVAILABLE: "lock_not_available",
     OBJECT_NOT_IN_PREREQUISITE_STATE: "detach_pending",
 }
+
+
+def _no_second_connection(engine: Engine) -> str:
+    return (
+        "drop_expired with integrity needs a second connection from the pool "
+        f"of {engine!r}, besides the one it was given, and the pool "
+        f"({engine.pool.status()}) has no free one; give the pool room for "
+        "one more connection"
+    )
+
+
+def _check_free_slot(engine: Engine) -> None:
+    """Raise ``PartitionError`` when the pool cannot give another connection.
+
+    Checked before ``connect`` so that a full pool fails at once, not after
+    its ``pool_timeout``. A pool that hands out one shared connection can
+    never give a second one.
+    """
+    pool = engine.pool
+    if isinstance(pool, StaticPool | SingletonThreadPool | AssertionPool):
+        raise PartitionError(_no_second_connection(engine))
+    if isinstance(pool, QueuePool):
+        limit = pool.size() + pool._max_overflow
+        if pool._max_overflow >= 0 and pool.checkedout() >= limit:
+            raise PartitionError(_no_second_connection(engine))
 
 
 def chain_started(connection: Connection, tables: AuditTables) -> bool:
@@ -109,7 +141,9 @@ class Retirer:
     """Seals, verifies and retires expired partitions for ``drop_expired``.
 
     Private for now. A context manager: it holds a second connection from
-    the engine of ``connection`` while it is open.
+    the engine of ``connection`` while it is open. A pool that cannot give
+    one at once raises ``PartitionError`` instead of waiting for its
+    ``pool_timeout``.
 
     Args:
         connection: The ``AUTOCOMMIT`` connection of ``drop_expired``.
@@ -140,7 +174,11 @@ class Retirer:
         self._scanned = 0
 
     def __enter__(self) -> Retirer:
-        conn = self._engine.connect()
+        _check_free_slot(self._engine)
+        try:
+            conn = self._engine.connect()
+        except PoolTimeoutError as exc:
+            raise PartitionError(_no_second_connection(self._engine)) from exc
         # Not AUTOCOMMIT, whatever the engine's default: the chain needs
         # transactions.
         self._conn = conn.execution_options(isolation_level="READ COMMITTED")

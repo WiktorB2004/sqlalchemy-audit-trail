@@ -7,13 +7,23 @@ PostgreSQL; lock conflicts come from real open transactions and a short
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 from typing import Any
 
 import pytest
-from sqlalchemy import Connection, Engine, event, insert, select, text, update
+from sqlalchemy import (
+    Connection,
+    Engine,
+    create_engine,
+    event,
+    insert,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from audit_trail import migrations
@@ -33,6 +43,7 @@ from audit_trail.integrity._verify import (
 from audit_trail.integrity._verify_db import verify
 from audit_trail.maintenance import (
     DroppedPartitions,
+    PartitionError,
     PartitionManager,
     drop_expired,
     ensure_partitions,
@@ -554,6 +565,23 @@ def test_blocks_without_a_genesis_drop_nothing(engine: Engine, schema: str) -> N
     with pytest.raises(_seal.SealRefusedError, match="NO_GENESIS"):
         drop(engine, tables)
     assert len(attached(engine, schema)) == 4 * 3
+
+
+# -- the second connection ----------------------------------------------------------
+
+
+def test_a_full_pool_raises_at_once(engine: Engine, tables: AuditTables) -> None:
+    # One connection in all: drop_expired has it, so the second cannot come.
+    # A long pool_timeout shows the call does not wait for it.
+    small = create_engine(engine.url, pool_size=1, max_overflow=0, pool_timeout=60)
+    try:
+        started = time.monotonic()
+        with pytest.raises(PartitionError, match="second connection"):
+            drop(small, tables)
+        assert time.monotonic() - started < 30
+    finally:
+        small.dispose()
+    assert retire_blocks(engine, tables) == {}
 
 
 # -- the manager ----------------------------------------------------------------------
