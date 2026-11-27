@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changed
+
+- **Breaking:** `examples/roles.sql` narrows the scrub-only role from `UPDATE` on the whole audit tables to `UPDATE` of the columns a scrub erases (`object_label` and `data` of `audit_activity`; `actor_label`, `remote_addr`, `user_agent` and `meta` of `audit_transaction`). A column grant does not narrow a table grant, so on an existing install run `REVOKE UPDATE ON audit.audit_transaction, audit.audit_activity FROM audit_scrubber` before the new column grants
+
+### Added
+
+- Tamper evidence, opt-in with `AuditTrail(integrity=Integrity())`: every audit row carries its transaction id and salted commitments to its erasable parts; `audit.maintenance.seal()` / `aseal()` hash the rows of finished transactions into a chain of blocks; `audit.maintenance.verify()` / `averify()` rebuild the chain from the rows and report every failure; `acknowledge()` waives a known incident in the chain. Writes take no extra lock or round trip. See the new tamper evidence guide; it is tamper evidence, not prevention
+- Checkpoints: `audit_trail.integrity.export_checkpoint()` returns the head of the chain as a C2SP signed note for storing off the database host, optionally only once a synchronous standby has flushed it (`require_replicated=True`); `verify(checkpoints=...)` catches a rewritten, cut-off or restored chain against them. A `Signer` / `SignatureVerifier` hook signs blocks and checkpoints, with an Ed25519 reference in `audit_trail.integrity.ed25519` behind the new `sqlalchemy-audit-trail[integrity]` extra
+- `declare_fork()` starts a new incarnation of the chain after a point-in-time recovery or a `pg_dump` / `pg_restore`, with an id window where transaction ids were rewound
+- Upgrading: `migrations.add_integrity()` adds the columns and the `audit_seal_block` table under a short `lock_timeout` with retries, `migrations.add_integrity_indexes()` builds the `(xid, id)` indexes online, and `migrations.write_genesis()` starts the chain once every writer runs with `Integrity()`. `build_tables(integrity=True)` declares everything for a new install
+- With integrity, `drop_expired()` seals, verifies (`verify_before_drop=True`) and writes a retire block before each drop, on a second pooled connection, and reports the partitions it kept in `skipped`; like without integrity, it refuses a transaction-mode pooler, before writing any retire block; `health()` reports the sealing lag and old prepared transactions in `seal`; scrubbing deletes the salt of each erased part and stamps it with the scrub's transaction id
+- `examples/roles.sql` gains the grants for integrity: the application role inserts every column except `id` and `xid` (after `REVOKE INSERT`), and new sealer and verifier roles
+
 ### Fixed
 
 - `drop_expired()` behind a pooler in transaction or statement mode (PgBouncer `pool_mode=transaction`) left its advisory lock and `lock_timeout` on a pooled server connection, so later runs failed with `PartitionLockTimeoutError` or hung. It now checks that its statements stay on one server connection and raises `PartitionError` before taking the lock if they do not; use a direct or session-pooled connection for it. `ensure_partitions()` already worked behind such poolers.
