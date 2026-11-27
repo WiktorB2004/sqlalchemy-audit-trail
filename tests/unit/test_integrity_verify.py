@@ -24,6 +24,7 @@ from audit_trail.integrity._block import (
     activity_leaf_row,
     activity_stream,
     block_hash,
+    checkpoint_body,
     fork_body,
     genesis_body,
     parse_body,
@@ -245,6 +246,9 @@ def test_the_core_imports_no_sqlalchemy() -> None:
         "audit_trail.integrity._canonical",
         "audit_trail.integrity._codec",
         "audit_trail.integrity._merkle",
+        "audit_trail.integrity._checkpoint",
+        "audit_trail.integrity._note",
+        "audit_trail.integrity._sign",
     }
 
 
@@ -281,6 +285,7 @@ def test_the_kinds_are_the_closed_sets() -> None:
         "UNSEALED_TAIL",
         "UNANCHORED_TAIL",
         "FORKED",
+        "FORKED_UNSIGNED",
         "ACKNOWLEDGED",
     ]
 
@@ -389,7 +394,9 @@ def test_a_seal_that_does_not_start_where_the_last_ended_is_malformed(
     assert failures(report) == {FailureKind.MALFORMED_BLOCK}
 
 
-def test_a_fork_block_is_not_supported_yet(sealed: Sealed) -> None:
+def test_a_fork_that_names_a_seal_block_as_its_checkpoint_is_malformed(
+    sealed: Sealed,
+) -> None:
     chain, transactions, activities = sealed
     body = fork_body(
         CHAIN,
@@ -410,10 +417,18 @@ def test_a_fork_block_is_not_supported_yet(sealed: Sealed) -> None:
 
 def test_checkpoint_blocks_are_accepted(sealed: Sealed) -> None:
     chain, transactions, activities = sealed
+    chain.add("checkpoint", checkpoint_body(CHAIN, chain.next, 300))
+    assert check(chain, transactions, activities).status is Status.VALID
+
+
+def test_a_checkpoint_block_without_xid_to_is_malformed(sealed: Sealed) -> None:
+    chain, transactions, activities = sealed
     body = parse_body(genesis_body(CHAIN, 1))
     body.update(kind="checkpoint", seq=chain.next)
     chain.add("checkpoint", canonical(body))
-    assert check(chain, transactions, activities).status is Status.VALID
+    assert failures(check(chain, transactions, activities)) == {
+        FailureKind.MALFORMED_BLOCK
+    }
 
 
 def test_no_genesis_block_raises() -> None:
@@ -445,7 +460,9 @@ def test_an_incarnation_judges_only_its_id_window() -> None:
     assert incarnation.holds("transaction", 101)
     assert incarnation.holds("transaction", 200)
     assert not incarnation.holds("transaction", 201)
-    assert incarnation.holds("activity.20", 1)
+    # A stream the closing fork did not name had no row then: none is held.
+    assert not incarnation.holds("activity.20", 1)
+    assert Incarnation(1, 10, id_floor={"transaction": 100}).holds("activity.20", 1)
     assert incarnation.is_pre_genesis(9)
     assert incarnation.seal_of(19) == Seal(5, 10, 20)
     assert incarnation.seal_of(20) == Seal(6, 20, 30)

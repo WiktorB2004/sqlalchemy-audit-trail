@@ -44,6 +44,17 @@ def decode_strict(text: object, length: int | None = None) -> bytes | None:
     return raw if length is None or len(raw) == length else None
 
 
+def decode_canonical(text: str) -> bytes | None:
+    """The bytes of canonical base64 text, or ``None``.
+
+    Strict, and also refuses text that ``b64`` would not give for its bytes:
+    an encoding with nonzero padding bits decodes too, and signed notes
+    must reject it.
+    """
+    raw = decode_strict(text)
+    return raw if raw is not None and b64(raw) == text else None
+
+
 def rfc3339(value: datetime) -> str:
     """A timestamp as RFC 3339 UTC text with six fraction digits and ``Z``.
 

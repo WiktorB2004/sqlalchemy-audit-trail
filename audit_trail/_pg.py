@@ -61,6 +61,17 @@ def is_sqlstate(exc: DBAPIError, code: str) -> bool:
     return sqlstate(exc) == code
 
 
+def check_transactional(connection: Connection, name: str) -> None:
+    """Refuse a connection in ``AUTOCOMMIT`` mode.
+
+    Raises:
+        ValueError: It is; the message names the caller, ``name``.
+    """
+    dbapi = connection.connection.dbapi_connection
+    if getattr(dbapi, "autocommit", False):
+        raise ValueError(f"{name} needs a transaction, not AUTOCOMMIT")
+
+
 def set_config(connection: Connection, name: str, value: str, *, local: bool) -> str:
     """Set a setting for the transaction or the session; return the old value.
 

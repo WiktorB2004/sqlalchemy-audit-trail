@@ -25,6 +25,7 @@ from audit_trail.integrity._block import (
     SegmentBuilder,
     activity_leaf_row,
     block_hash,
+    checkpoint_body,
     clear_data,
     fork_body,
     genesis_body,
@@ -165,6 +166,7 @@ def test_body_builders_give_the_vectors() -> None:
         segments=[retired],
     )
     assert retire == body_of("retire of one segment")
+    assert checkpoint_body(chain, 7, 4294968100) == body_of("checkpoint")
 
 
 def test_the_retire_digest_is_over_the_covered_segments() -> None:

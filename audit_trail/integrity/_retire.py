@@ -41,6 +41,7 @@ from types import TracebackType
 
 from sqlalchemy import (
     AssertionPool,
+    BigInteger,
     Column,
     Connection,
     Engine,
@@ -48,6 +49,7 @@ from sqlalchemy import (
     MetaData,
     QueuePool,
     SingletonThreadPool,
+    SmallInteger,
     StaticPool,
     Table,
     bindparam,
@@ -75,11 +77,15 @@ from audit_trail.integrity._block import (
 from audit_trail.integrity._codec import rfc3339
 from audit_trail.integrity._seal import (
     block_table,
+    current_window,
     last_block,
     seal,
     sealed_horizon,
+    signature_columns,
     snapshot_horizon,
+    window_clause,
 )
+from audit_trail.integrity._sign import Signer
 from audit_trail.integrity._types import Xid8
 from audit_trail.integrity._verify import ACTIVITY, TRANSACTION, FailureKind
 from audit_trail.integrity._verify_db import (
@@ -156,6 +162,8 @@ class Retirer:
             detach, and skip those it fails. Retention is not judged there
             (``RETIRED_EARLY`` is for a verifier given the retention from
             elsewhere): a retire block already written stays either way.
+        signer: Signs the seal and retire blocks; ``None`` leaves them
+            unsigned.
     """
 
     def __init__(
@@ -164,7 +172,9 @@ class Retirer:
         tables: AuditTables,
         *,
         verify_before_drop: bool,
+        signer: Signer | None = None,
     ) -> None:
+        self._signer = signer
         self._engine = connection.engine
         self._tables = tables
         self._block = block_table(tables)
@@ -179,6 +189,9 @@ class Retirer:
         self._sealed: dict[str, dict[tuple[int, str], SealedSegment]] = {}
         self._retired: dict[str, _RetireBlock] = {}
         self._scanned = 0
+        # ``transaction`` or ``activity``, of each partition seen by
+        # ``retire`` or ``check_orphan``.
+        self._tables_of: dict[str, str] = {}
 
     def __enter__(self) -> Retirer:
         _check_free_slot(self._engine)
@@ -230,7 +243,7 @@ class Retirer:
         # would keep a loop to the moving horizon capped forever.
         with self.conn.begin():
             up_to = snapshot_horizon(self.conn)
-        while seal(self.conn, self._tables, up_to=up_to).capped:
+        while seal(self.conn, self._tables, up_to=up_to, signer=self._signer).capped:
             pass
         self._scan()
         if not self._verify_before_drop or not children:
@@ -288,6 +301,7 @@ class Retirer:
                     "migrations.write_genesis() first"
                 )
             chain, sealed_to = sealed
+            self._tables_of[child.name] = _table_streams(target)[0]
             if self._unsealed(conn, child, sealed_to):
                 return self._skip(
                     SkippedPartition(
@@ -314,6 +328,7 @@ class Retirer:
                 segments=self._sealed.get(child.name, {}).values(),
             )
             prev = bytes(last.block_hash)
+            digest = block_hash(prev, body)
             inserted = conn.execute(
                 pg_insert(block)
                 .values(
@@ -321,8 +336,9 @@ class Retirer:
                     kind="retire",
                     body=body,
                     prev_hash=prev,
-                    block_hash=block_hash(prev, body),
+                    block_hash=digest,
                     retired_partition=child.name,
+                    **signature_columns(self._signer, digest),
                 )
                 .on_conflict_do_nothing(
                     index_elements=[block.c.retired_partition],
@@ -359,6 +375,7 @@ class Retirer:
         table and streams of ``target`` and the bound of ``child``, and
         covers exactly the segments of the partition sealed before it.
         """
+        self._tables_of[child.name] = _table_streams(target)[0]
         retired = self._retired.get(child.name)
         if retired is None or not _covers(retired, target, child, self._sealed):
             return self._skip(
@@ -406,17 +423,23 @@ class Retirer:
         return False
 
     def _unsealed(self, conn: Connection, child: _Child, sealed_to: int) -> bool:
-        table = Table(
-            child.name,
-            MetaData(),
-            Column(_schema.XID, Xid8()),
-            schema=child.schema,
-        )
+        """Whether the partition holds a row of the current incarnation that
+        is not sealed yet; rows of an earlier one (at or below the id floor
+        of a fork) are sealed, whatever their ``xid``."""
+        columns = [Column(_schema.XID, Xid8()), Column("id", BigInteger)]
+        if self._tables_of.get(child.name) == ACTIVITY:
+            columns.append(Column("severity", SmallInteger))
+        table = Table(child.name, MetaData(), *columns, schema=child.schema)
         xid = table.c[_schema.XID]
+        floors = current_window(conn, self._block).id_floor
+        window = window_clause(table, floors, above=True)
         found = conn.execute(
             select(literal_column("1", Integer))
             .select_from(table)
-            .where(xid >= bindparam("sealed_to", sealed_to, type_=Xid8()))
+            .where(
+                xid >= bindparam("sealed_to", sealed_to, type_=Xid8()),
+                *([] if window is None else [window]),
+            )
             .limit(1)
         ).first()
         return found is not None

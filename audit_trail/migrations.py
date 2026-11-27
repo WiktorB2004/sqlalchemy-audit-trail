@@ -56,6 +56,7 @@ from audit_trail import _pg
 from audit_trail.integrity import _schema as integrity_schema
 from audit_trail.integrity import _seal
 from audit_trail.integrity._seal import Genesis
+from audit_trail.integrity._sign import Signer
 from audit_trail.tables import AuditTables
 
 logger = logging.getLogger(__name__)
@@ -493,7 +494,9 @@ def add_integrity_indexes(
     return builder.built
 
 
-def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
+def write_genesis(
+    connection: Connection, tables: AuditTables, *, signer: Signer | None = None
+) -> Genesis:
     """Start the hash chain of the audit log with its genesis block.
 
     The last step of turning integrity on, after ``add_integrity`` and
@@ -510,6 +513,7 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
         connection: Connection that may insert into the block table, not in
             ``AUTOCOMMIT`` mode.
         tables: Audit tables built with integrity.
+        signer: Signs the block; ``None`` leaves it unsigned.
 
     Returns:
         The genesis block, and whether this call wrote it.
@@ -520,7 +524,7 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
             (run ``add_integrity`` first), or it holds blocks but no genesis
             block. The transaction stays usable.
     """
-    return _seal.write_genesis(connection, tables)
+    return _seal.write_genesis(connection, tables, signer=signer)
 
 
 _TABLE = text(

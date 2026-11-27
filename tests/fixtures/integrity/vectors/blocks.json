@@ -133,6 +133,12 @@
       "prev_hash": "3cd504d90d36dd7c957d54a37ead011ce7fc0f00833cb1f66a08764e09336872",
       "body": "{\"chain\":\"3f2b8c1e-6a4d-4e2f-9c1b-7d5e3a2f1b0c\",\"kind\":\"retire\",\"partition\":\"audit_transaction_p2026_11\",\"retention\":7776000,\"rows\":1,\"seals\":{\"first\":2,\"last\":2},\"segments\":1,\"segments_digest\":\"lHUbppV1F9XmSQ+0ihj5NcigmXfHmUhvok8LsK/hEqM=\",\"seq\":6,\"streams\":[\"transaction\"],\"table\":\"transaction\",\"upper_bound\":\"2026-12-01T00:00:00.000000Z\",\"v\":1}",
       "block_hash": "c5ddd4529aff29a7aff9b2a98635965f86e1a53d56aaee4c118046b4575bee63"
+    },
+    {
+      "name": "checkpoint",
+      "prev_hash": "c5ddd4529aff29a7aff9b2a98635965f86e1a53d56aaee4c118046b4575bee63",
+      "body": "{\"chain\":\"3f2b8c1e-6a4d-4e2f-9c1b-7d5e3a2f1b0c\",\"kind\":\"checkpoint\",\"seq\":7,\"v\":1,\"xid_to\":4294968100}",
+      "block_hash": "4f521357b81eb624ed8e05df3c8306b78ff30658317471d6e2d29a27f6e0be16"
     }
   ]
 }

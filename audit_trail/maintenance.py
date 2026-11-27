@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
     from audit_trail.integrity._retire import Retirer
+    from audit_trail.integrity._sign import Signer
 
 LOCK_NOT_AVAILABLE = _pg.LOCK_NOT_AVAILABLE
 """SQLSTATE raised when ``lock_timeout`` expires."""
@@ -401,6 +402,7 @@ def drop_expired(
     now: datetime | None = None,
     lock_timeout: str | None = "5s",
     verify_before_drop: bool = True,
+    signer: Signer | None = None,
 ) -> DroppedPartitions:
     """Detach and drop the monthly partitions past their retention.
 
@@ -474,6 +476,7 @@ def drop_expired(
             place after it, and before its partition is dropped, is not
             seen, and is dropped with the partition. Ignored without
             integrity. Private for now.
+        signer: With integrity, signs the retire blocks. Private for now.
 
     Returns:
         Schema-qualified names of the partitions dropped, in order: a
@@ -513,6 +516,7 @@ def drop_expired(
             now,
             lock_timeout,
             verify_before_drop,
+            signer,
         )
     except DBAPIError as exc:
         if _pg.is_sqlstate(exc, LOCK_NOT_AVAILABLE):
@@ -710,6 +714,7 @@ class PartitionManager:
         transaction_retention: timedelta | None = None,
         lock_timeout: str | None = "5s",
         verify_before_drop: bool = True,
+        signer: Signer | None = None,
     ) -> DroppedPartitions:
         """Drop expired partitions in ``AUTOCOMMIT`` mode; see ``drop_expired``.
 
@@ -719,6 +724,7 @@ class PartitionManager:
             lock_timeout: PostgreSQL ``lock_timeout`` for each statement.
             verify_before_drop: With integrity, verify before the first
                 detach. Private for now.
+            signer: With integrity, signs the retire blocks. Private for now.
 
         Returns:
             Schema-qualified names of the partitions dropped, with the
@@ -738,6 +744,7 @@ class PartitionManager:
                 transaction_retention=transaction_retention,
                 lock_timeout=lock_timeout,
                 verify_before_drop=verify_before_drop,
+                signer=signer,
             )
 
     async def adrop_expired(
@@ -747,6 +754,7 @@ class PartitionManager:
         transaction_retention: timedelta | None = None,
         lock_timeout: str | None = "5s",
         verify_before_drop: bool = True,
+        signer: Signer | None = None,
     ) -> DroppedPartitions:
         """Async ``drop_expired``, for a manager built with an ``AsyncEngine``.
 
@@ -756,6 +764,7 @@ class PartitionManager:
             lock_timeout: PostgreSQL ``lock_timeout`` for each statement.
             verify_before_drop: With integrity, verify before the first
                 detach. Private for now.
+            signer: With integrity, signs the retire blocks. Private for now.
 
         Returns:
             Schema-qualified names of the partitions dropped, with the
@@ -777,6 +786,7 @@ class PartitionManager:
                     transaction_retention=transaction_retention,
                     lock_timeout=lock_timeout,
                     verify_before_drop=verify_before_drop,
+                    signer=signer,
                 )
             )
 
@@ -809,7 +819,9 @@ class PartitionManager:
                 max_seal_lag=max_seal_lag,
             )
 
-    def seal(self, max_rows: int = DEFAULT_MAX_ROWS) -> SealResult:
+    def seal(
+        self, max_rows: int = DEFAULT_MAX_ROWS, *, signer: Signer | None = None
+    ) -> SealResult:
         """Seal finished transactions into the next block of the hash chain.
 
         Runs on a connection of its own, in one ``REPEATABLE READ``
@@ -821,6 +833,7 @@ class PartitionManager:
         Args:
             max_rows: Soft cap on the rows of the block; one transaction is
                 never split, so a larger one is sealed whole.
+            signer: Signs the block; ``None`` leaves it unsigned.
 
         Returns:
             What was sealed; when ``capped``, call again.
@@ -834,13 +847,16 @@ class PartitionManager:
         if not isinstance(self.engine, Engine):
             raise TypeError("the engine is async; use aseal")
         with self.engine.connect() as conn:
-            return seal(conn, self.tables, max_rows=max_rows)
+            return seal(conn, self.tables, max_rows=max_rows, signer=signer)
 
-    async def aseal(self, max_rows: int = DEFAULT_MAX_ROWS) -> SealResult:
+    async def aseal(
+        self, max_rows: int = DEFAULT_MAX_ROWS, *, signer: Signer | None = None
+    ) -> SealResult:
         """Async ``seal``, for a manager built with an ``AsyncEngine``.
 
         Args:
             max_rows: Soft cap on the rows of the block.
+            signer: Signs the block; ``None`` leaves it unsigned.
 
         Returns:
             What was sealed; when ``capped``, call again.
@@ -855,7 +871,9 @@ class PartitionManager:
             raise TypeError("the engine is sync; use seal")
         async with self.engine.connect() as conn:
             return await conn.run_sync(
-                lambda sync_conn: seal(sync_conn, self.tables, max_rows=max_rows)
+                lambda sync_conn: seal(
+                    sync_conn, self.tables, max_rows=max_rows, signer=signer
+                )
             )
 
     async def ahealth(
@@ -1008,6 +1026,7 @@ def _drop(
     now: datetime | None,
     lock_timeout: str | None,
     verify_before_drop: bool = True,
+    signer: Signer | None = None,
 ) -> DroppedPartitions:
     transaction, activity = tables.transaction, tables.activity
     transaction_oid = _oid(conn, _qualified(transaction))
@@ -1079,7 +1098,7 @@ def _drop(
         else:
             session.check()
             with Retirer(
-                conn, tables, verify_before_drop=verify_before_drop
+                conn, tables, verify_before_drop=verify_before_drop, signer=signer
             ) as retirer:
                 orphans = _expired_orphans(conn, tables, targets, severity_parents, now)
                 retirer.prepare(

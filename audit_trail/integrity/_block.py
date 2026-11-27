@@ -25,6 +25,10 @@ stores it exactly as hashed::
 The first block is a ``genesis`` block with ``prev_hash`` of 32 zero bytes.
 Hashes inside a body are base64, as in ``seal_commitments``.
 
+A ``checkpoint`` block records that a checkpoint naming it was exported
+(``_checkpoint``). A ``fork`` block starts a new incarnation of the chain
+after a restore (``_anchor.declare_fork``).
+
 A ``retire`` block is written before a partition is dropped. It names the
 partition, its table and streams, and covers every segment of it in the
 seal blocks before it: their seal range, count, rows and a digest of them
@@ -317,7 +321,8 @@ def fork_body(
         reason: Why the database was restored, as the operator wrote it.
         prior_seq: ``seq`` of the last good checkpoint.
         prior_hash: ``block_hash`` of that checkpoint.
-        xid_at_fork: ``pg_current_xact_id()`` when the fork was declared.
+        xid_at_fork: The horizon when the fork was declared; the new
+            incarnation's first seal block starts there.
         id_floor: Highest ``id`` of each stream before the fork, or ``None``
             when blocks select by ``xid`` alone.
         id_count: Rows of each stream with ``id <= id_floor``, or ``None``
@@ -340,10 +345,34 @@ def fork_body(
 
 
 def horizon_of(body: Mapping[str, Any]) -> int:
-    """The ``xid`` a parsed genesis or seal body seals up to, exclusive."""
+    """The ``xid`` a parsed genesis, seal or fork body seals up to, exclusive."""
     if body["kind"] == "genesis":
         return int(body["enforce_from"])
+    if body["kind"] == "fork":
+        return int(body["xid_at_fork"])
     return int(body["xid_to"])
+
+
+def checkpoint_body(chain: str, seq: int, xid_to: int) -> bytes:
+    """Body of a checkpoint block, which records that a checkpoint was taken.
+
+    The exported checkpoint names this block: its ``seq`` and ``block_hash``.
+
+    Args:
+        chain: The chain id.
+        seq: The block's number.
+        xid_to: The ``xid`` the current incarnation was sealed up to
+            (exclusive) when the checkpoint was taken.
+    """
+    return _body(
+        {
+            "v": FORMAT_VERSION,
+            "kind": "checkpoint",
+            "chain": chain,
+            "seq": seq,
+            "xid_to": xid_to,
+        }
+    )
 
 
 def ack_body(
