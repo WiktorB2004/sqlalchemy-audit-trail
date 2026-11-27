@@ -74,33 +74,31 @@ def canonical(value: object) -> bytes:
 
 
 def _encode(value: object, parts: list[str]) -> None:
-    # bool before int: True is an int.
-    if value is None:
-        parts.append("null")
-    elif value is True:
-        parts.append("true")
-    elif value is False:
-        parts.append("false")
-    elif isinstance(value, str):
-        parts.append(_string(value))
-    elif isinstance(value, int):
-        parts.append(_int(value))
-    elif isinstance(value, float):
-        if not math.isfinite(value):
-            raise CanonicalEncodingError("cannot encode a non-finite float")
-        parts.append(_decimal(Decimal(repr(value))))
-    elif isinstance(value, Decimal):
-        if not value.is_finite():
-            raise CanonicalEncodingError("cannot encode a non-finite Decimal")
-        parts.append(_decimal(value))
-    elif isinstance(value, Mapping):
-        _object(value, parts)
-    elif isinstance(value, list | tuple):
-        _array(value, parts)
-    else:
-        raise CanonicalEncodingError(
-            f"cannot encode a value of type {type(value).__qualname__}"
-        )
+    match value:
+        case None:
+            parts.append("null")
+        case bool():  # before int: True is an int
+            parts.append("true" if value else "false")
+        case str():
+            parts.append(_string(value))
+        case int():
+            parts.append(_int(value))
+        case float():
+            if not math.isfinite(value):
+                raise CanonicalEncodingError("cannot encode a non-finite float")
+            parts.append(_decimal(Decimal(repr(value))))
+        case Decimal():
+            if not value.is_finite():
+                raise CanonicalEncodingError("cannot encode a non-finite Decimal")
+            parts.append(_decimal(value))
+        case Mapping():
+            _object(value, parts)
+        case list() | tuple():
+            _array(value, parts)
+        case _:
+            raise CanonicalEncodingError(
+                f"cannot encode a value of type {type(value).__qualname__}"
+            )
 
 
 def _int(value: int) -> str:
