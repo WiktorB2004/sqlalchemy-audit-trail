@@ -470,7 +470,10 @@ def drop_expired(
         verify_before_drop: With integrity, verify the expired partitions
             and the chain before the first detach, and keep the partitions a
             failure names (all of them after a failure of the chain itself).
-            Ignored without integrity. Private for now.
+            The verify runs once, before the drops: a sealed row changed in
+            place after it, and before its partition is dropped, is not
+            seen, and is dropped with the partition. Ignored without
+            integrity. Private for now.
 
     Returns:
         Schema-qualified names of the partitions dropped, in order: a
