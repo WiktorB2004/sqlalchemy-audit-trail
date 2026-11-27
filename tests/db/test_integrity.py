@@ -594,7 +594,7 @@ _XID_INDEXES = text(
     LEFT JOIN pg_index px ON px.indexrelid = ii.inhparent
     LEFT JOIN pg_class pit ON pit.oid = px.indrelid
     WHERE n.nspname = :schema AND t.relkind IN ('r', 'p')
-      AND t.relname LIKE 'audit\_%'
+      AND t.relname LIKE 'audit\_%' AND t.relname <> 'audit_seal_block'
     ORDER BY t.relname
     """
 )

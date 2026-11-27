@@ -69,6 +69,15 @@ from sqlalchemy import Connection, Engine, Table, bindparam, text
 from sqlalchemy.exc import DBAPIError
 
 from audit_trail import _pg
+from audit_trail.integrity._schema import has_integrity
+from audit_trail.integrity._seal import (
+    DEFAULT_MAX_ROWS,
+    DEFAULT_MAX_SEAL_LAG,
+    SealHealth,
+    SealResult,
+    seal,
+    seal_health,
+)
 from audit_trail.migrations import (
     create_month_partition_sql,
     create_severity_partition_sql,
@@ -300,6 +309,8 @@ class HealthReport:
             between the detach and the drop in ``drop_expired`` leaves one
             behind; nothing drops them automatically. Check the name, then
             ``DROP TABLE`` it by hand.
+        seal: Sealing lag of tables built with integrity, else ``None``.
+            Private for now.
     """
 
     min_months_ahead: int
@@ -307,15 +318,17 @@ class HealthReport:
     activity: dict[int, PartitionHealth]
     pending_detach: list[str]
     orphaned: list[str]
+    seal: SealHealth | None = None
 
     @property
     def ok(self) -> bool:
-        """Whether nothing is below the threshold, pending or orphaned."""
+        """Whether nothing is below the threshold, pending, orphaned or lagging."""
         return not (
             self.transaction.below
             or any(h.below for h in self.activity.values())
             or self.pending_detach
             or self.orphaned
+            or (self.seal is not None and not self.seal.ok)
         )
 
 
@@ -419,10 +432,12 @@ def health(
     *,
     min_months_ahead: int = 2,
     now: datetime | None = None,
+    max_seal_lag: timedelta = DEFAULT_MAX_SEAL_LAG,
 ) -> HealthReport:
     """Report partition coverage, pending detaches and orphaned partitions.
 
-    Read-only; runs on any connection.
+    Read-only; runs on any connection. For tables built with integrity it
+    also reports the sealing lag in ``seal``.
 
     Args:
         connection: Connection that can read the catalog.
@@ -433,6 +448,10 @@ def health(
             ``ensure_partitions(months_ahead=3)``.
         now: Reference time, timezone-aware. ``None`` uses the database's
             ``now()``.
+        max_seal_lag: With integrity, unsealed rows and prepared
+            transactions older than this are flagged. A row's age counts
+            from its event time, so a transaction that ran longer than this
+            is flagged until the next seal after its commit. Private for now.
 
     Returns:
         The report.
@@ -495,6 +514,11 @@ def health(
             if child.pending
         ],
         orphaned=_orphans(connection, tables, severity_parents),
+        seal=(
+            seal_health(connection, tables, now=now, max_seal_lag=max_seal_lag)
+            if has_integrity(tables.transaction)
+            else None
+        ),
     )
 
 
@@ -644,11 +668,17 @@ class PartitionManager:
                 )
             )
 
-    def health(self, min_months_ahead: int = 2) -> HealthReport:
+    def health(
+        self,
+        min_months_ahead: int = 2,
+        *,
+        max_seal_lag: timedelta = DEFAULT_MAX_SEAL_LAG,
+    ) -> HealthReport:
         """Report partition health; see ``health``.
 
         Args:
             min_months_ahead: Coverage threshold in months after the current one.
+            max_seal_lag: Sealing lag threshold, with integrity. Private for now.
 
         Returns:
             The report.
@@ -660,14 +690,73 @@ class PartitionManager:
             raise TypeError("the engine is async; use ahealth")
         with self.engine.connect() as conn:
             return health(
-                conn, self.tables, self.severities, min_months_ahead=min_months_ahead
+                conn,
+                self.tables,
+                self.severities,
+                min_months_ahead=min_months_ahead,
+                max_seal_lag=max_seal_lag,
             )
 
-    async def ahealth(self, min_months_ahead: int = 2) -> HealthReport:
+    def seal(self, max_rows: int = DEFAULT_MAX_ROWS) -> SealResult:
+        """Seal finished transactions into the next block of the hash chain.
+
+        Runs on a connection of its own, in one ``REPEATABLE READ``
+        transaction. On a standby, on a logical-replication subscriber of the
+        block table, or while another sealer runs, it returns without
+        sealing. Run it on a schedule, every minute for example; a missed run
+        only leaves rows unsealed for longer. Private for now.
+
+        Args:
+            max_rows: Soft cap on the rows of the block; one transaction is
+                never split, so a larger one is sealed whole.
+
+        Returns:
+            What was sealed; when ``capped``, call again.
+
+        Raises:
+            TypeError: If the manager was built with an ``AsyncEngine``.
+            ValueError: If the tables were built without integrity.
+            SealRefusedError: The transaction ids were rewound, or the chain
+                has no genesis block; nothing was written.
+        """
+        if not isinstance(self.engine, Engine):
+            raise TypeError("the engine is async; use aseal")
+        with self.engine.connect() as conn:
+            return seal(conn, self.tables, max_rows=max_rows)
+
+    async def aseal(self, max_rows: int = DEFAULT_MAX_ROWS) -> SealResult:
+        """Async ``seal``, for a manager built with an ``AsyncEngine``.
+
+        Args:
+            max_rows: Soft cap on the rows of the block.
+
+        Returns:
+            What was sealed; when ``capped``, call again.
+
+        Raises:
+            TypeError: If the manager was built with a sync ``Engine``.
+            ValueError: If the tables were built without integrity.
+            SealRefusedError: The transaction ids were rewound, or the chain
+                has no genesis block; nothing was written.
+        """
+        if isinstance(self.engine, Engine):
+            raise TypeError("the engine is sync; use seal")
+        async with self.engine.connect() as conn:
+            return await conn.run_sync(
+                lambda sync_conn: seal(sync_conn, self.tables, max_rows=max_rows)
+            )
+
+    async def ahealth(
+        self,
+        min_months_ahead: int = 2,
+        *,
+        max_seal_lag: timedelta = DEFAULT_MAX_SEAL_LAG,
+    ) -> HealthReport:
         """Async ``health``, for a manager built with an ``AsyncEngine``.
 
         Args:
             min_months_ahead: Coverage threshold in months after the current one.
+            max_seal_lag: Sealing lag threshold, with integrity. Private for now.
 
         Returns:
             The report.
@@ -684,6 +773,7 @@ class PartitionManager:
                     self.tables,
                     self.severities,
                     min_months_ahead=min_months_ahead,
+                    max_seal_lag=max_seal_lag,
                 )
             )
 
@@ -703,10 +793,7 @@ def _ensure(
         previous_timeout = _pg.set_config(
             conn, "lock_timeout", lock_timeout, local=True
         )
-    conn.execute(
-        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-        {"key": _lock_key(tables)},
-    )
+    _pg.xact_lock(conn, _lock_key(tables))
     if now is None:
         now = conn.execute(text("SELECT now()")).scalar_one()
     months = _months(now, months_ahead)
@@ -818,16 +905,13 @@ def _drop(
     # statements between backends is caught before it can strand a lock.
     session = _Session(conn)
     session.check()
-    key = {"key": _lock_key(tables)}
+    key = _lock_key(tables)
     previous_timeout: str | None = None
     locked = False
     try:
         if lock_timeout is not None:
             previous_timeout = _set_session(session, "lock_timeout", lock_timeout)
-        pid = conn.execute(
-            text("SELECT pg_backend_pid() FROM pg_advisory_lock(hashtext(:key))"),
-            key,
-        ).scalar_one()
+        pid = _pg.session_lock(conn, key)
         locked = True
         session.check(pid)
         if now is None:
@@ -879,7 +963,7 @@ def _drop(
 
 def _release(
     session: _Session,
-    key: dict[str, str],
+    key: str,
     locked: bool,
     previous_timeout: str | None,
 ) -> bool:
@@ -887,10 +971,8 @@ def _release(
     conn = session.conn
     held = True
     if locked:
-        unlocked, pid = conn.execute(
-            text("SELECT pg_advisory_unlock(hashtext(:key)), pg_backend_pid()"), key
-        ).one()
-        held = bool(unlocked) and pid == session.pid
+        unlocked, pid = _pg.session_unlock(conn, key)
+        held = unlocked and pid == session.pid
     if previous_timeout is not None:
         pid = conn.execute(
             text("SELECT pg_backend_pid() FROM set_config(:name, :value, false)"),

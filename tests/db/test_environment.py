@@ -2,7 +2,8 @@
 
 ``AUDIT_TEST_EXPECT_PG`` (major version) and ``AUDIT_TEST_EXPECT_SA``
 (``major.minor``) are set per matrix cell. Without them only connectivity is
-checked.
+checked. With ``AUDIT_TEST_EXPECT_PG`` the server must also allow prepared
+transactions, so the tests that need them are not skipped in CI.
 """
 
 from __future__ import annotations
@@ -36,3 +37,11 @@ def test_sqlalchemy_version() -> None:
     expected = os.environ.get("AUDIT_TEST_EXPECT_SA")
     if expected:
         assert sqlalchemy.__version__.startswith(expected + ".")
+
+
+def test_prepared_transactions_are_enabled(engine: Engine) -> None:
+    if not os.environ.get("AUDIT_TEST_EXPECT_PG"):
+        return
+    with engine.connect() as conn:
+        allowed: str = conn.execute(text("SHOW max_prepared_transactions")).scalar_one()
+    assert int(allowed) > 0

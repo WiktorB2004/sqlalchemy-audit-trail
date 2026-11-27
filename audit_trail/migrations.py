@@ -47,13 +47,15 @@ import time
 from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, MetaData, text
 from sqlalchemy.dialects.postgresql.base import PGDialect
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.schema import CreateIndex, CreateTable
 
 from audit_trail import _pg
 from audit_trail.integrity import _schema as integrity_schema
+from audit_trail.integrity import _seal
+from audit_trail.integrity._seal import Genesis
 from audit_trail.tables import AuditTables
 
 logger = logging.getLogger(__name__)
@@ -192,7 +194,8 @@ def create_statements(tables: AuditTables, severities: Iterable[int]) -> list[st
     ``audit_trail.maintenance.ensure_partitions`` before the first write, or
     every insert fails with SQLSTATE ``23514``. Indexes are created on the
     partitioned parents, so PostgreSQL adds them to every partition, including
-    the ones created later.
+    the ones created later. Tables built with integrity also get the table of
+    sealed blocks.
 
     Args:
         tables: The audit tables, from ``build_tables``.
@@ -207,13 +210,15 @@ def create_statements(tables: AuditTables, severities: Iterable[int]) -> list[st
         statements.append(
             f"CREATE SCHEMA IF NOT EXISTS {_PREPARER.quote_schema(schema)}"
         )
-    for table in (tables.transaction, tables.activity):
+    block = tables.seal_block
+    created = [tables.transaction, tables.activity, *([] if block is None else [block])]
+    for table in created:
         statements.append(_compile(CreateTable(table)))
     statements.extend(
         create_severity_partition_sql(tables, value)
         for value in severity_values(severities)
     )
-    for table in (tables.transaction, tables.activity):
+    for table in created:
         statements.extend(
             _compile(CreateIndex(index))
             for index in sorted(table.indexes, key=lambda i: str(i.name))
@@ -232,9 +237,14 @@ def drop_statements(tables: AuditTables) -> list[str]:
     Returns:
         The statements, in order, without trailing semicolons.
     """
+    block = tables.seal_block
     return [
         f"DROP TABLE IF EXISTS {qualified_name(t.schema, t.name)}"
-        for t in (tables.activity, tables.transaction)
+        for t in (
+            *([] if block is None else [block]),
+            tables.activity,
+            tables.transaction,
+        )
     ]
 
 
@@ -300,8 +310,11 @@ def add_integrity_statements(tables: AuditTables) -> list[str]:
     ``pg_current_xact_id()`` is ``STABLE``, so ``ADD COLUMN ... DEFAULT
     pg_current_xact_id()`` would stamp every existing row with the
     migration's own ``xid``. Existing rows keep ``xid`` ``NULL``, and the
-    column stays nullable. Every statement is idempotent. The ``(xid, id)``
-    indexes are not here: ``add_integrity_indexes`` builds them online.
+    column stays nullable. Last, the table of sealed blocks (named by
+    ``build_tables(seal_block_table=...)``, also for tables built without
+    integrity) and its index, in the schema of the transaction table. Every
+    statement is idempotent. The ``(xid, id)`` indexes are not here:
+    ``add_integrity_indexes`` builds them online.
 
     Args:
         tables: The audit tables.
@@ -326,6 +339,16 @@ def add_integrity_statements(tables: AuditTables) -> list[str]:
             f"ALTER TABLE {name} ALTER COLUMN {integrity_schema.XID} "
             f"SET DEFAULT {integrity_schema.XID_DEFAULT}"
         )
+    block = tables.seal_block
+    if block is None:
+        block = integrity_schema.block_table(
+            MetaData(schema=tables.transaction.schema), tables.seal_block_table
+        )
+    statements.append(_compile(CreateTable(block, if_not_exists=True)))
+    statements.extend(
+        _compile(CreateIndex(index, if_not_exists=True))
+        for index in sorted(block.indexes, key=lambda i: str(i.name))
+    )
     return statements
 
 
@@ -468,6 +491,36 @@ def add_integrity_indexes(
         if not connection.invalidated:
             _pg.set_config(connection, "lock_timeout", previous, local=False)
     return builder.built
+
+
+def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
+    """Start the hash chain of the audit log with its genesis block.
+
+    The last step of turning integrity on, after ``add_integrity`` and
+    ``add_integrity_indexes``, and only once every writer runs with
+    ``Integrity``. The block records ``enforce_from``, the horizon
+    ``pg_snapshot_xmin(pg_current_snapshot())`` at this moment: rows with a
+    lower ``xid`` are out of scope, and every later row must carry
+    commitments. Calling it again returns the existing genesis block, also
+    when another call committed it after this transaction's snapshot was
+    taken. It takes the sealer's advisory lock and runs in the connection's
+    current transaction; the caller commits. Private for now.
+
+    Args:
+        connection: Connection that may insert into the block table, not in
+            ``AUTOCOMMIT`` mode.
+        tables: Audit tables built with integrity.
+
+    Returns:
+        The genesis block, and whether this call wrote it.
+
+    Raises:
+        ValueError: The tables were built without integrity, the connection
+            is in ``AUTOCOMMIT`` mode, the block table does not exist yet
+            (run ``add_integrity`` first), or it holds blocks but no genesis
+            block. The transaction stays usable.
+    """
+    return _seal.write_genesis(connection, tables)
 
 
 _TABLE = text(

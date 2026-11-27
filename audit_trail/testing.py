@@ -336,13 +336,20 @@ def drop_test_tables(audit: AuditTrail, connection: Connection) -> None:
 def clear_audit_entries(audit: AuditTrail, connection: Connection) -> None:
     """Delete every audit entry and transaction row with ``TRUNCATE``.
 
+    With integrity on, the sealed blocks are deleted too.
+
     Args:
         audit: The ``AuditTrail`` whose tables are emptied.
         connection: Connection to run on.
     """
+    block = audit.tables.seal_block
     names = ", ".join(
         qualified_name(table.schema, table.name)
-        for table in (audit.tables.activity, audit.tables.transaction)
+        for table in (
+            audit.tables.activity,
+            audit.tables.transaction,
+            *([] if block is None else [block]),
+        )
     )
     connection.exec_driver_sql(
         f"TRUNCATE {names}", execution_options={"no_parameters": True}

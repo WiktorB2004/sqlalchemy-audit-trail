@@ -6,14 +6,17 @@ import hashlib
 import json
 import sys
 from collections.abc import Iterator
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 from hypothesis import example, given
 from hypothesis import strategies as st
 
+from audit_trail.integrity._block import activity_leaf_row, transaction_leaf_row
 from audit_trail.integrity._canonical import (
     MAX_INT_DIGITS,
     CanonicalEncodingError,
@@ -204,9 +207,26 @@ def test_commitment_vectors(case: dict[str, str]) -> None:
 LEAVES = load("leaves.json")
 
 
+LEAF_ROWS = {"transaction": transaction_leaf_row, "activity": activity_leaf_row}
+
+
+def stored_row(row: dict[str, Any]) -> dict[str, Any]:
+    """A vector row as a driver reads it back: timestamps and UUIDs typed."""
+    typed = dict(row)
+    for name in ("issued_at", "created_at"):
+        if name in typed:
+            typed[name] = datetime.fromisoformat(typed[name])
+    for name in ("request_id", "correlation_id"):
+        if typed.get(name) is not None:
+            typed[name] = UUID(typed[name])
+    return typed
+
+
 @pytest.mark.parametrize("case", LEAVES, ids=[c["name"] for c in LEAVES])
 def test_leaf_vectors(case: dict[str, str]) -> None:
     row = json.loads(case["row"])
+    if "table" in case:
+        row = LEAF_ROWS[case["table"]](stored_row(row))
     assert canonical(row) == case["canonical"].encode()
     assert leaf_hash(row).hex() == case["leaf"]
     preimage = b"\x00sqlalchemy-audit-trail/leaf/v1" + case["canonical"].encode()

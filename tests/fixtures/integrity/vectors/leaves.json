@@ -10,5 +10,19 @@
     "row": "{\"id\": 7, \"xid\": 123456789, \"verb\": \"entity.updated\", \"seal_commitments\": {\"label\": \"AAAA\"}, \"created_at\": \"2026-01-10T12:00:00.000000Z\"}",
     "canonical": "{\"created_at\":\"2026-01-10T12:00:00.000000Z\",\"id\":7,\"seal_commitments\":{\"label\":\"AAAA\"},\"verb\":\"entity.updated\",\"xid\":123456789}",
     "leaf": "5347aa7e6afe77ae686e8116d1140c129279b5565853d0168f509b6829b116a0"
+  },
+  {
+    "name": "transaction row",
+    "table": "transaction",
+    "row": "{\"id\": 41, \"issued_at\": \"2026-11-26T13:05:09.123456+01:00\", \"actor_type\": \"user\", \"actor_id\": \"ann\", \"actor_label\": \"Ann\", \"remote_addr\": \"2001:db8::1\", \"user_agent\": \"Firefox\", \"method\": \"POST\", \"path\": \"/docs/1\", \"channel\": \"web\", \"auth_method\": \"session\", \"request_id\": \"6f1c1b2e-8d43-4f4c-9b7a-0d5f6c2a9e11\", \"correlation_id\": null, \"meta\": {\"tenant\": 7}, \"xid\": 4294968058, \"seal_commitments\": {\"actor\": \"q83vEjRWeJCrze8SNFZ4kA==\"}, \"seal_salts\": {\"actor\": \"AAECAwQFBgcICQoLDA0ODw==\"}, \"seal_erased\": null}",
+    "canonical": "{\"actor_id\":\"ann\",\"actor_type\":\"user\",\"auth_method\":\"session\",\"channel\":\"web\",\"correlation_id\":null,\"id\":41,\"issued_at\":\"2026-11-26T12:05:09.123456Z\",\"method\":\"POST\",\"path\":\"/docs/1\",\"request_id\":\"6f1c1b2e-8d43-4f4c-9b7a-0d5f6c2a9e11\",\"seal_commitments\":{\"actor\":\"q83vEjRWeJCrze8SNFZ4kA==\"},\"xid\":4294968058}",
+    "leaf": "77f026dcbe4e9ede8771f511ce124f5bcaf087ed45e8a86626775f2fc558d0ae"
+  },
+  {
+    "name": "activity row",
+    "table": "activity",
+    "row": "{\"id\": 1207, \"transaction_id\": 41, \"verb\": \"entity.updated\", \"severity\": 10, \"object_type\": \"Doc\", \"object_id\": \"1\", \"object_label\": \"Doc One\", \"target_type\": null, \"target_id\": null, \"actor_id\": \"ann\", \"scope_id\": \"tenant-7\", \"correlation_id\": \"0b8e2a44-1f0e-4c55-a3b0-6d2c1e7f9a30\", \"created_at\": \"2026-11-26T12:05:09.000001Z\", \"data\": {\"v\": 1, \"changes\": {\"title\": [\"Old\", \"Doc One\"]}, \"payload\": {\"email\": \"ann@example.com\"}, \"context\": {\"actor_type\": \"user\", \"actor_label\": \"Ann\", \"remote_addr\": \"2001:db8::1\", \"user_agent\": \"Firefox\", \"meta\": {\"tenant\": 7}, \"method\": \"POST\"}}, \"xid\": 4294968058, \"seal_commitments\": {\"label\": \"AAAA\", \"changes\": \"BBBB\", \"actor\": \"CCCC\"}, \"seal_salts\": {\"label\": \"DDDD\"}, \"seal_erased\": {\"payload\": \"4294968100\"}}",
+    "canonical": "{\"actor_id\":\"ann\",\"correlation_id\":\"0b8e2a44-1f0e-4c55-a3b0-6d2c1e7f9a30\",\"created_at\":\"2026-11-26T12:05:09.000001Z\",\"data\":{\"context\":{\"actor_type\":\"user\",\"method\":\"POST\"},\"v\":1},\"id\":1207,\"object_id\":\"1\",\"object_type\":\"Doc\",\"scope_id\":\"tenant-7\",\"seal_commitments\":{\"actor\":\"CCCC\",\"changes\":\"BBBB\",\"label\":\"AAAA\"},\"severity\":10,\"target_id\":null,\"target_type\":null,\"transaction_id\":41,\"verb\":\"entity.updated\",\"xid\":4294968058}",
+    "leaf": "0fa4b615f34aaec19db45d529cc92764a3770a6d669c38dfc96c8610fea3e4fd"
   }
 ]
