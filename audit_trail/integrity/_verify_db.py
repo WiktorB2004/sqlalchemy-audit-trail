@@ -37,11 +37,10 @@ from audit_trail import _pg
 from audit_trail.integrity import _schema
 from audit_trail.integrity._block import ack_body, parse_body
 from audit_trail.integrity._seal import (
-    _insert,
-    _last,
-    _missing,
-    _regclass,
     block_table,
+    insert_block,
+    last_block,
+    missing_block_table,
 )
 from audit_trail.integrity._types import Xid8
 from audit_trail.integrity._verify import (
@@ -66,8 +65,6 @@ DEFAULT_CHUNK_ROWS = 2_000
 """Rows read per ``READ ONLY`` transaction."""
 
 _BLOCK_CHUNK = 1_000
-
-_UNDEFINED_TABLE = "42P01"
 
 _XMAX = text("SELECT pg_snapshot_xmax(pg_current_snapshot())::text")
 
@@ -256,7 +253,7 @@ def _run(
                     .where(table.c[_schema.XID].is_(None))
                 ).scalar_one()
         except DBAPIError as exc:
-            if not _is_undefined_table(exc):
+            if not _pg.is_sqlstate(exc, _pg.UNDEFINED_TABLE):
                 raise
             if retry:
                 raise _Vanished(leaf.partition.name) from exc
@@ -264,13 +261,6 @@ def _run(
         verifier.null_xid_rows(leaf.partition, int(nulls))
     verifier.schema(detached)
     return verifier.report()
-
-
-def _is_undefined_table(exc: DBAPIError) -> bool:
-    """Whether the statement failed on a relation that does not exist."""
-    orig = exc.orig
-    code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
-    return code == _UNDEFINED_TABLE
 
 
 @contextmanager
@@ -456,20 +446,17 @@ def acknowledge(
     with connection.begin():
         connection.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
         # Blocks until no sealer runs; later statements see its block.
-        connection.execute(
-            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-            {"key": _pg.lock_key(block)},
-        )
+        _pg.xact_lock(connection, _pg.lock_key(block))
         created = connection.execute(
             text("SELECT to_regclass(:block) IS NOT NULL"),
-            {"block": _regclass(connection, block)},
+            {"block": _pg.regclass(connection, block)},
         ).scalar_one()
         if not created:
-            raise ValueError(_missing(block))
+            raise ValueError(missing_block_table(block))
         genesis = connection.execute(
             select(block.c.kind, block.c.body).where(block.c.seq == 1)
         ).one_or_none()
-        last = _last(connection, block)
+        last = last_block(connection, block)
         if genesis is None or genesis.kind != "genesis" or last is None:
             raise ValueError(
                 f"{block.fullname} has no genesis block; run "
@@ -485,7 +472,7 @@ def acknowledge(
             waives=waives,
             reason=reason,
         )
-        _insert(connection, block, seq, "ack", bytes(last.block_hash), body)
+        insert_block(connection, block, seq, "ack", bytes(last.block_hash), body)
     return seq
 
 

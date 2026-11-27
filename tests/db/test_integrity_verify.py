@@ -175,9 +175,9 @@ def append_block(env: Env, kind: str, make_body: Any) -> int:
     with env.engine.begin() as conn:
         first = conn.execute(select(block.c.body).where(block.c.seq == 1)).scalar_one()
         chain = parse_body(bytes(first))["chain"]
-        last = _seal._last(conn, block)
+        last = _seal.last_block(conn, block)
         seq = int(last.seq) + 1
-        _seal._insert(
+        _seal.insert_block(
             conn, block, seq, kind, bytes(last.block_hash), make_body(chain, seq)
         )
     return seq
