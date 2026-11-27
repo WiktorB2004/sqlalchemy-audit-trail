@@ -25,11 +25,12 @@ never an edit of the existing one.
 
 from __future__ import annotations
 
-import json
 import math
 import sys
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
+from json.encoder import encode_basestring
+from operator import itemgetter
 
 MAX_INT_DIGITS = sys.int_info.default_max_str_digits
 """Most digits of an encoded int or ``Decimal``, Python's default ``str()`` limit.
@@ -74,6 +75,13 @@ def canonical(value: object) -> bytes:
 
 
 def _encode(value: object, parts: list[str]) -> None:
+    # Most values of a leaf are exactly str or dict: skip the match for them.
+    if type(value) is str:
+        parts.append(_string(value))
+        return
+    if type(value) is dict:
+        _object(value, parts)
+        return
     match value:
         case None:
             parts.append("null")
@@ -147,33 +155,49 @@ def _decimal(value: Decimal) -> str:
 def _string(value: str) -> str:
     if "\x00" in value:
         raise CanonicalEncodingError("cannot encode a string holding \\u0000")
-    try:
-        value.encode()
-    except UnicodeEncodeError:
-        raise CanonicalEncodingError(
-            "cannot encode a string holding a lone surrogate"
-        ) from None
-    return json.dumps(value, ensure_ascii=False)
+    if not value.isascii():
+        try:
+            value.encode()
+        except UnicodeEncodeError:
+            raise CanonicalEncodingError(
+                "cannot encode a string holding a lone surrogate"
+            ) from None
+    # What json.dumps(value, ensure_ascii=False) returns for a str, without
+    # building an encoder per call.
+    return encode_basestring(value)
 
 
 def _object(value: Mapping[object, object], parts: list[str]) -> None:
-    keys: list[str] = []
+    keys: list[tuple[str, str]] = []
+    ascii_keys = True
     for key in value:
         if not isinstance(key, str):
             raise CanonicalEncodingError(
                 f"cannot encode an object key of type {type(key).__qualname__}"
             )
-        _string(key)  # refuses \u0000 and lone surrogates first
-        keys.append(key)
-    keys.sort(key=lambda key: key.encode("utf-16-be"))
+        # Refuses \u0000 and lone surrogates before any value is encoded.
+        keys.append((key, _string(key)))
+        ascii_keys = ascii_keys and key.isascii()
+    if ascii_keys:
+        # For ASCII, code point order is UTF-16 code unit order.
+        keys.sort(key=_first)
+    else:
+        keys.sort(key=_utf16)
     parts.append("{")
-    for index, key in enumerate(keys):
+    for index, (key, encoded) in enumerate(keys):
         if index:
             parts.append(",")
-        parts.append(_string(key))
+        parts.append(encoded)
         parts.append(":")
         _encode(value[key], parts)
     parts.append("}")
+
+
+_first = itemgetter(0)
+
+
+def _utf16(item: tuple[str, str]) -> bytes:
+    return item[0].encode("utf-16-be")
 
 
 def _array(value: Sequence[object], parts: list[str]) -> None:
