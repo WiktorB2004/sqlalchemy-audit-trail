@@ -1,0 +1,41 @@
+{
+  "comment": "C2SP signed-note vectors; a change to one is a format change.",
+  "spec_example": {
+    "source": "c2sp.org/signed-note, section Verifier keys, Example",
+    "vkey": "example.com/foo+530d903a+AekyeRrm56hApGFkyQR4ZCbV54Id2LKaANYcrnKv3U2k",
+    "note": "This is an example message.\n\n— example.com/foo Uw2QOkn8srV1yJGh2VYRlL1Tnagv1YEq6TfXppzi2ONncAlTgK7Ztg1ERYNZXsYjOBH3mFXmRKuwHjG1Yu72IneyaQM=\n"
+  },
+  "keys": [
+    {
+      "name": "audit.example/sealer-2026",
+      "seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "key_id": "audit.example/sealer-2026+22822d98",
+      "vkey": "audit.example/sealer-2026+22822d98+AQOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4",
+      "skey": "PRIVATE+KEY+audit.example/sealer-2026+22822d98+AQABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f"
+    },
+    {
+      "name": "audit.example/sealer-2027",
+      "seed": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "key_id": "audit.example/sealer-2027+8ec842d4",
+      "vkey": "audit.example/sealer-2027+8ec842d4+ASmsuuFBvMrwsi4alNNNC8c2HlJtC/4SyJeUvJMilm3X",
+      "skey": "PRIVATE+KEY+audit.example/sealer-2027+8ec842d4+ASAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/"
+    }
+  ],
+  "checkpoint": {
+    "chain": "3f2b8c1e-6a4d-4e2f-9c1b-7d5e3a2f1b0c",
+    "seq": 3,
+    "block_hash": "09b6f2d13250de8a66a74677b587ca6484a705bf57bea2afd772ec17f5d96d50",
+    "xid_to": 4294968100,
+    "sealed_at": "2026-11-27T10:30:00.123456Z",
+    "text": "sqlalchemy-audit-trail/checkpoint/v1\n{\"block_hash\":\"Cbby0TJQ3opmp0Z3tYfKZISnBb9XvqKv13LsF/XZbVA=\",\"chain\":\"3f2b8c1e-6a4d-4e2f-9c1b-7d5e3a2f1b0c\",\"sealed_at\":\"2026-11-27T10:30:00.123456Z\",\"seq\":3,\"v\":1,\"xid_to\":4294968100}\n",
+    "unsigned_note": "sqlalchemy-audit-trail/checkpoint/v1\n{\"block_hash\":\"Cbby0TJQ3opmp0Z3tYfKZISnBb9XvqKv13LsF/XZbVA=\",\"chain\":\"3f2b8c1e-6a4d-4e2f-9c1b-7d5e3a2f1b0c\",\"sealed_at\":\"2026-11-27T10:30:00.123456Z\",\"seq\":3,\"v\":1,\"xid_to\":4294968100}\n",
+    "signed_note": "sqlalchemy-audit-trail/checkpoint/v1\n{\"block_hash\":\"Cbby0TJQ3opmp0Z3tYfKZISnBb9XvqKv13LsF/XZbVA=\",\"chain\":\"3f2b8c1e-6a4d-4e2f-9c1b-7d5e3a2f1b0c\",\"sealed_at\":\"2026-11-27T10:30:00.123456Z\",\"seq\":3,\"v\":1,\"xid_to\":4294968100}\n\n— audit.example/sealer-2026 IoItmNat/mb3lUpS03LjaSO2CXAyoGs+dXgaDR/8w0lNXeLy8vI+U/Bjmrpbe6ojZGfPr5q5lnZpQWVfdD0mtkX2Lws=\n",
+    "cosigned_note": "sqlalchemy-audit-trail/checkpoint/v1\n{\"block_hash\":\"Cbby0TJQ3opmp0Z3tYfKZISnBb9XvqKv13LsF/XZbVA=\",\"chain\":\"3f2b8c1e-6a4d-4e2f-9c1b-7d5e3a2f1b0c\",\"sealed_at\":\"2026-11-27T10:30:00.123456Z\",\"seq\":3,\"v\":1,\"xid_to\":4294968100}\n\n— audit.example/sealer-2026 IoItmNat/mb3lUpS03LjaSO2CXAyoGs+dXgaDR/8w0lNXeLy8vI+U/Bjmrpbe6ojZGfPr5q5lnZpQWVfdD0mtkX2Lws=\n— audit.example/sealer-2027 jshC1KfMKi055RnE6bw6H9djyPrFcFPrnks2/+a3i4nGuOgeLZ7+EiJ/h7cSPDXQ+2XXSpcn5Le8dRklAKe6DXqm6AI=\n"
+  },
+  "block_signature": {
+    "block_hash": "a649df6f813455d9c86fc24e574b21b86812491b68914c9405b6ed11d4163347",
+    "message": "73716c616c6368656d792d61756469742d747261696c2f626c6f636b2d7369676e61747572652f763100a649df6f813455d9c86fc24e574b21b86812491b68914c9405b6ed11d4163347",
+    "key_id": "audit.example/sealer-2026+22822d98",
+    "signature": "GVEFleKL3mNcwGRDyQtIcJdr3Eps3h6a9wlsYlFvCIw21vTNIVzpGUqbaf7purod3TqMkTZ98A2o82TKzXgtAw=="
+  }
+}
