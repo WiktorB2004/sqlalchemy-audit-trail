@@ -78,8 +78,10 @@ from audit_trail.integrity._seal import (
     last_block,
     seal,
     sealed_horizon,
+    signature_columns,
     snapshot_horizon,
 )
+from audit_trail.integrity._sign import Signer
 from audit_trail.integrity._types import Xid8
 from audit_trail.integrity._verify import ACTIVITY, TRANSACTION, FailureKind
 from audit_trail.integrity._verify_db import (
@@ -156,6 +158,8 @@ class Retirer:
             detach, and skip those it fails. Retention is not judged there
             (``RETIRED_EARLY`` is for a verifier given the retention from
             elsewhere): a retire block already written stays either way.
+        signer: Signs the seal and retire blocks; ``None`` leaves them
+            unsigned.
     """
 
     def __init__(
@@ -164,7 +168,9 @@ class Retirer:
         tables: AuditTables,
         *,
         verify_before_drop: bool,
+        signer: Signer | None = None,
     ) -> None:
+        self._signer = signer
         self._engine = connection.engine
         self._tables = tables
         self._block = block_table(tables)
@@ -230,7 +236,7 @@ class Retirer:
         # would keep a loop to the moving horizon capped forever.
         with self.conn.begin():
             up_to = snapshot_horizon(self.conn)
-        while seal(self.conn, self._tables, up_to=up_to).capped:
+        while seal(self.conn, self._tables, up_to=up_to, signer=self._signer).capped:
             pass
         self._scan()
         if not self._verify_before_drop or not children:
@@ -314,6 +320,7 @@ class Retirer:
                 segments=self._sealed.get(child.name, {}).values(),
             )
             prev = bytes(last.block_hash)
+            digest = block_hash(prev, body)
             inserted = conn.execute(
                 pg_insert(block)
                 .values(
@@ -321,8 +328,9 @@ class Retirer:
                     kind="retire",
                     body=body,
                     prev_hash=prev,
-                    block_hash=block_hash(prev, body),
+                    block_hash=digest,
                     retired_partition=child.name,
+                    **signature_columns(self._signer, digest),
                 )
                 .on_conflict_do_nothing(
                     index_elements=[block.c.retired_partition],

@@ -56,6 +56,7 @@ from audit_trail.integrity._block import (
     seal_body,
     transaction_leaf_row,
 )
+from audit_trail.integrity._sign import Signer, sign_block
 from audit_trail.tables import AuditTables
 
 DEFAULT_MAX_ROWS = 50_000
@@ -182,7 +183,9 @@ def block_table(tables: AuditTables) -> Table:
     return block
 
 
-def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
+def write_genesis(
+    connection: Connection, tables: AuditTables, *, signer: Signer | None = None
+) -> Genesis:
     """Start the chain, once; see ``migrations.write_genesis``."""
     block = block_table(tables)
     _check_transactional(connection, "write_genesis")
@@ -206,7 +209,7 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
         # A savepoint, so a conflict leaves the caller's transaction usable.
         with connection.begin_nested():
             body = genesis_body(chain, horizon)
-            insert_block(connection, block, 1, "genesis", ZERO_HASH, body)
+            insert_block(connection, block, 1, "genesis", ZERO_HASH, body, signer)
     except IntegrityError as exc:
         if not _pg.is_sqlstate(exc, _pg.UNIQUE_VIOLATION):
             raise
@@ -239,6 +242,7 @@ def seal(
     *,
     max_rows: int = DEFAULT_MAX_ROWS,
     up_to: int | None = None,
+    signer: Signer | None = None,
 ) -> SealResult:
     """Seal the finished transactions since the last block into a new block.
 
@@ -270,6 +274,7 @@ def seal(
         up_to: Seal no transaction at or above this ``xid``: ``H`` is
             lowered to it. A catch-up loop that passes the horizon it read
             first ends even while writers outpace the sealer.
+        signer: Signs the block (``_sign``); ``None`` leaves it unsigned.
 
     Returns:
         What was sealed. On a standby, on a logical-replication subscriber of
@@ -293,7 +298,7 @@ def seal(
             "that is not in a transaction"
         )
     try:
-        return _seal(connection, tables, block, max_rows, up_to)
+        return _seal(connection, tables, block, max_rows, up_to, signer)
     except _StaleSnapshotError:
         # The transaction was rolled back on the way out.
         return SealResult(0, 0, None, skipped="busy")
@@ -309,6 +314,7 @@ def _seal(
     block: Table,
     max_rows: int,
     up_to: int | None,
+    signer: Signer | None,
 ) -> SealResult:
     with connection.begin():
         # Before any query, so the snapshot is taken at REPEATABLE READ.
@@ -359,7 +365,7 @@ def _seal(
         seq = last.seq + 1
         body = seal_body(chain, seq, xid_from, xid_to, builder.segments())
         try:
-            insert_block(connection, block, seq, "seal", last.block_hash, body)
+            insert_block(connection, block, seq, "seal", last.block_hash, body, signer)
         except IntegrityError as exc:
             if _pg.is_sqlstate(exc, _pg.UNIQUE_VIOLATION):
                 raise _StaleSnapshotError from exc
@@ -626,14 +632,28 @@ def insert_block(
     kind: str,
     prev_hash: bytes,
     body: bytes,
-) -> None:
-    """Insert one block, hashed onto ``prev_hash``."""
+    signer: Signer | None = None,
+    **columns: Any,
+) -> bytes:
+    """Insert a block, signed by ``signer`` if given; its ``block_hash``."""
+    digest = block_hash(prev_hash, body)
     connection.execute(
         insert(block).values(
             seq=seq,
             kind=kind,
             body=body,
             prev_hash=prev_hash,
-            block_hash=block_hash(prev_hash, body),
+            block_hash=digest,
+            **signature_columns(signer, digest),
+            **columns,
         )
     )
+    return digest
+
+
+def signature_columns(signer: Signer | None, digest: bytes) -> dict[str, Any]:
+    """The ``signature``, ``key_id`` and ``alg`` of a block; none unsigned."""
+    if signer is None:
+        return {}
+    signature, key_id, alg = sign_block(signer, digest)
+    return {"signature": signature, "key_id": key_id, "alg": alg}
