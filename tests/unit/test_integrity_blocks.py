@@ -27,11 +27,11 @@ from audit_trail.integrity._block import (
     fork_body,
     genesis_body,
     parse_body,
-    rfc3339,
     seal_body,
     transaction_leaf_row,
 )
 from audit_trail.integrity._canonical import CanonicalEncodingError, canonical
+from audit_trail.integrity._codec import rfc3339
 from audit_trail.integrity._commit import leaf_hash
 from audit_trail.integrity._merkle import MerkleTree, merkle_root, node_hash
 

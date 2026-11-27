@@ -28,23 +28,23 @@ Hashes inside a body are base64, as in ``seal_commitments``.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from audit_trail.integrity._canonical import CanonicalEncodingError, canonical
+from audit_trail.integrity._canonical import canonical
+from audit_trail.integrity._codec import b64, context, rfc3339
 from audit_trail.integrity._commit import ACTOR_FIELDS, leaf_hash
 from audit_trail.integrity._merkle import MerkleTree
 
 FORMAT_VERSION = 1
 """Value of ``v`` in every body."""
 
-BLOCK_CONTEXT = b"sqlalchemy-audit-trail/block/v1"
+BLOCK_CONTEXT = context("block")
 """Domain separation string of a block hash."""
 
 ZERO_HASH = bytes(32)
@@ -147,17 +147,6 @@ def clear_data(data: Mapping[str, Any]) -> dict[str, Any]:
             key: value for key, value in context.items() if key not in ACTOR_FIELDS
         }
     return clear
-
-
-def rfc3339(value: datetime) -> str:
-    """A timestamp as RFC 3339 UTC text with six fraction digits and ``Z``.
-
-    Raises:
-        CanonicalEncodingError: The timestamp is naive.
-    """
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise CanonicalEncodingError("cannot encode a naive timestamp")
-    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _value(value: object) -> object:
@@ -318,11 +307,6 @@ def parse_body(body: bytes) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("a block body is a JSON object")
     return parsed
-
-
-def b64(raw: bytes) -> str:
-    """Base64 text of a hash, as bodies hold it."""
-    return base64.b64encode(raw).decode("ascii")
 
 
 def _body(fields: Mapping[str, object]) -> bytes:

@@ -33,7 +33,7 @@ from audit_trail import (
     migrations,
     testing,
 )
-from audit_trail.integrity import _block, _seal
+from audit_trail.integrity import _block, _codec, _seal
 from audit_trail.integrity._block import (
     ZERO_HASH,
     activity_leaf_row,
@@ -164,7 +164,7 @@ def rebuilt_segments(env: Env, lower: int, upper: int) -> list[dict[str, Any]]:
             "stream": stream,
             "partition": partition,
             "rows": len(hashes),
-            "root": _block.b64(reference_root(hashes)),
+            "root": _codec.b64(reference_root(hashes)),
         }
         for (stream, partition), hashes in sorted(leaves.items())
     ]
