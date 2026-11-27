@@ -166,8 +166,8 @@ def verify(
             report is ``ANCHORED`` when one matched, and the blocks after
             the newest match are an ``UNANCHORED_TAIL`` note.
         verifier: Checks the signatures of signed blocks and checkpoints.
-        require_signatures: Every block must be signed by a key
-            ``verifier`` knows.
+        require_signatures: Every block and every checkpoint must be
+            signed by a key ``verifier`` knows.
 
     Returns:
         The report.

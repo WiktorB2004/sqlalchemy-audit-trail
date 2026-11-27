@@ -773,8 +773,9 @@ class Verifier:
         signatures: Checks the signatures of signed blocks: one by a key it
             does not know is ``UNKNOWN_KEY``, one that does not verify
             ``BAD_SIGNATURE``. ``None`` checks none.
-        require_signatures: Every block must be signed (``BAD_SIGNATURE``
-            for one that is not); for a chain whose writers all sign.
+        require_signatures: Every block and every checkpoint must be signed
+            (``BAD_SIGNATURE`` for one that is not); for a chain whose
+            writers all sign.
         checkpoints: Trusted checkpoints to check the chain against; see
             ``report``.
     """
@@ -1639,7 +1640,8 @@ class Verifier:
         """Match the chain against each trusted checkpoint; whether one matched.
 
         A checkpoint whose signatures do not verify (with a signature
-        verifier given) is not used. One that names a block the chain does
+        verifier given) is not used, nor is an unsigned one when signatures
+        are required (``BAD_SIGNATURE``). One that names a block the chain does
         not have is ``TRUNCATED``, one whose block has another hash, or that
         is of another chain, ``CHAIN_MISMATCH``. A ``TRUNCATED`` or
         ``CHAIN_MISMATCH`` is a ``FORKED`` note instead when a fork block at
@@ -1652,6 +1654,11 @@ class Verifier:
         matched: list[int] = []
         for checkpoint in self._checkpoints:
             where: dict[str, Any] = {"seq": checkpoint.seq}
+            if self._require_signatures and not checkpoint.signatures:
+                self._fail(
+                    FailureKind.BAD_SIGNATURE, "the checkpoint is not signed", **where
+                )
+                continue
             if self._signatures is not None and checkpoint.signatures:
                 try:
                     checkpoint.verify(self._signatures)

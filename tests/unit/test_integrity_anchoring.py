@@ -263,6 +263,31 @@ def test_a_badly_signed_checkpoint_is_not_used(sealed: Sealed) -> None:
     assert failures(unknown) == {FailureKind.UNKNOWN_KEY}
 
 
+def test_an_unsigned_checkpoint_fails_when_signatures_are_required(
+    sealed: Sealed,
+) -> None:
+    chain, transactions, activities = sealed
+    sign(chain, OLD)
+    unsigned = take_checkpoint(chain)
+    sign(chain, OLD, unsigned.seq)
+    options: dict[str, Any] = {"signatures": BOTH, "checkpoints": [unsigned]}
+    assert check(chain, transactions, activities, **options).anchor is (Anchor.ANCHORED)
+    report = check(chain, transactions, activities, require_signatures=True, **options)
+    assert failures(report) == {FailureKind.BAD_SIGNATURE}
+    assert [f.seq for f in report.failures] == [unsigned.seq]
+    assert report.anchor is Anchor.UNANCHORED
+    signed = unsigned.signed([OLD])
+    report = check(
+        chain,
+        transactions,
+        activities,
+        signatures=BOTH,
+        require_signatures=True,
+        checkpoints=[signed],
+    )
+    assert (report.status, report.anchor) == (Status.VALID, Anchor.ANCHORED)
+
+
 # -- forks ----------------------------------------------------------------------
 
 
