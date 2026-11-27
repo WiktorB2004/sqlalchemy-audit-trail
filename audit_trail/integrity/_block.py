@@ -160,11 +160,13 @@ def rfc3339(value: datetime) -> str:
 
 
 def _value(value: object) -> object:
-    if isinstance(value, datetime):
-        return rfc3339(value)
-    if isinstance(value, UUID):
-        return str(value)
-    return value
+    match value:
+        case datetime():
+            return rfc3339(value)
+        case UUID():
+            return str(value)
+        case _:
+            return value
 
 
 def node_hash(left: bytes, right: bytes) -> bytes:
