@@ -19,7 +19,6 @@ import pytest
 
 from audit_trail.integrity._block import (
     ZERO_HASH,
-    MerkleTree,
     Segment,
     SegmentBuilder,
     activity_leaf_row,
@@ -27,8 +26,6 @@ from audit_trail.integrity._block import (
     clear_data,
     fork_body,
     genesis_body,
-    merkle_root,
-    node_hash,
     parse_body,
     rfc3339,
     seal_body,
@@ -36,6 +33,7 @@ from audit_trail.integrity._block import (
 )
 from audit_trail.integrity._canonical import CanonicalEncodingError, canonical
 from audit_trail.integrity._commit import leaf_hash
+from audit_trail.integrity._merkle import MerkleTree, merkle_root, node_hash
 
 VECTOR_DIR = Path(__file__).parent.parent / "fixtures" / "integrity" / "vectors"
 VECTORS = json.loads((VECTOR_DIR / "blocks.json").read_text())

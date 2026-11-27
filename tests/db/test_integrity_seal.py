@@ -39,12 +39,12 @@ from audit_trail.integrity._block import (
     activity_leaf_row,
     activity_stream,
     block_hash,
-    node_hash,
     parse_body,
     seal_body,
     transaction_leaf_row,
 )
 from audit_trail.integrity._commit import leaf_hash
+from audit_trail.integrity._merkle import node_hash
 from audit_trail.integrity._options import Integrity
 from audit_trail.integrity._seal import SealRefusedError, SealResult
 from audit_trail.maintenance import PartitionManager, health
