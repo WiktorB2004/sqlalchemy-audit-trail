@@ -46,6 +46,14 @@ longer than ``lock_timeout`` therefore makes ``drop_expired`` fail with
 ``PartitionLockTimeoutError``; this is expected. If that happens after a
 detach has started, the partition stays "pending detach" and the next call
 finalizes and drops it.
+
+Poolers: ``ensure_partitions`` holds its advisory lock and ``lock_timeout``
+for one transaction, so it works behind a pooler in transaction mode.
+``drop_expired`` cannot: ``DETACH ... CONCURRENTLY`` must run outside a
+transaction, so its lock and ``lock_timeout`` belong to the session and stay
+on whichever backend they were set on. It needs a direct connection or a
+session-mode pool, and raises ``PartitionError`` when its statements reach
+more than one backend.
 """
 
 from __future__ import annotations
@@ -338,8 +346,17 @@ def drop_expired(
     open transaction makes this call fail; that is expected, and retrying
     later is safe.
 
+    The advisory lock and ``lock_timeout`` are held by the session, not a
+    transaction, so every statement must reach the same backend. Use a direct
+    connection or a session-mode pool: behind a pooler in transaction or
+    statement mode (PgBouncer ``pool_mode=transaction``), the call checks the
+    backend before setting anything and before each DDL statement, and raises
+    ``PartitionError`` when it changed. ``ensure_partitions`` runs in one
+    transaction and works behind such a pooler.
+
     Args:
-        connection: ``AUTOCOMMIT`` connection with DDL privileges.
+        connection: ``AUTOCOMMIT`` connection with DDL privileges, direct or
+            through a session-mode pool.
         tables: The audit tables, from ``audit_trail.tables.build_tables``.
         retention: Retention by severity value. ``None`` keeps a severity
             forever. A severity that has a partition but no key here is also
@@ -362,7 +379,9 @@ def drop_expired(
     Raises:
         ValueError: If the connection is not in ``AUTOCOMMIT`` mode, a
             retention is negative, or ``now`` is naive.
-        PartitionError: If a parent table does not exist.
+        PartitionError: If a parent table does not exist, or the statements
+            reached more than one backend, as behind a transaction-mode
+            pooler. Partitions dropped before that stay dropped.
         PartitionLockTimeoutError: If a lock was not granted within
             ``lock_timeout``. Partitions dropped before that stay dropped.
     """
@@ -805,14 +824,22 @@ def _drop(
     activity_oid = _oid(conn, _qualified(activity))
     limits = {int(k): v for k, v in retention.items()}
 
-    previous_timeout: str | None = None
-    if lock_timeout is not None:
-        previous_timeout = _set_session(conn, "lock_timeout", lock_timeout)
+    # Checked before any session state is set, so a pooler that moves
+    # statements between backends is caught before it can strand a lock.
+    session = _Session(conn)
+    session.check()
     key = {"key": _lock_key(tables)}
+    previous_timeout: str | None = None
     locked = False
     try:
-        conn.execute(text("SELECT pg_advisory_lock(hashtext(:key))"), key)
+        if lock_timeout is not None:
+            previous_timeout = _set_session(session, "lock_timeout", lock_timeout)
+        pid = conn.execute(
+            text("SELECT pg_backend_pid() FROM pg_advisory_lock(hashtext(:key))"),
+            key,
+        ).scalar_one()
         locked = True
+        session.check(pid)
         if now is None:
             now = conn.execute(text("SELECT now()")).scalar_one()
 
@@ -848,21 +875,45 @@ def _drop(
 
         dropped: list[str] = []
         for target in targets:
-            dropped += _drop_months(conn, target, now)
-        return dropped
-    finally:
+            dropped += _drop_months(session, target, now)
+    except BaseException:
         # A broken connection is discarded by the pool, which releases the
         # session's lock and setting; touching it would hide the real error.
         if not conn.invalidated:
-            if locked:
-                conn.execute(text("SELECT pg_advisory_unlock(hashtext(:key))"), key)
-            if previous_timeout is not None:
-                _set_session(conn, "lock_timeout", previous_timeout)
+            _release(session, key, locked, previous_timeout)
+        raise
+    if not _release(session, key, locked, previous_timeout):
+        raise PartitionError(session.error())
+    return dropped
+
+
+def _release(
+    session: _Session,
+    key: dict[str, str],
+    locked: bool,
+    previous_timeout: str | None,
+) -> bool:
+    """Undo ``_drop``'s session state; whether it was still on its backend."""
+    conn = session.conn
+    held = True
+    if locked:
+        unlocked, pid = conn.execute(
+            text("SELECT pg_advisory_unlock(hashtext(:key)), pg_backend_pid()"), key
+        ).one()
+        held = bool(unlocked) and pid == session.pid
+    if previous_timeout is not None:
+        pid = conn.execute(
+            text("SELECT pg_backend_pid() FROM set_config(:name, :value, false)"),
+            {"name": "lock_timeout", "value": previous_timeout},
+        ).scalar_one()
+        held = held and pid == session.pid
+    return held
 
 
 def _drop_months(
-    conn: Connection, target: _RetentionTarget, now: datetime
+    session: _Session, target: _RetentionTarget, now: datetime
 ) -> list[str]:
+    conn = session.conn
     cutoff = None if target.limit is None else now - target.limit
 
     def expired(child: _Child) -> bool:
@@ -877,8 +928,10 @@ def _drop_months(
     dropped: list[str] = []
     # At most one partition per parent can be pending; finish it first.
     for child in (c for c in children if c.pending):
+        session.check()
         _execute_ddl(conn, _detach_sql(target.parent, child, "FINALIZE"))
         if expired(child):
+            session.check()
             dropped.append(_drop_table(conn, child))
         else:
             logger.warning(
@@ -888,7 +941,9 @@ def _drop_months(
             )
     live = [c for c in children if not c.pending and expired(c)]
     for child in sorted(live, key=lambda c: c.upper or now):
+        session.check()
         _execute_ddl(conn, _detach_sql(target.parent, child, "CONCURRENTLY"))
+        session.check()
         dropped.append(_drop_table(conn, child))
     return dropped
 
@@ -1016,13 +1071,52 @@ def _lock_key(tables: AuditTables) -> str:
     return "audit_trail.partitions:" + ",".join(parents)
 
 
-def _set_session(conn: Connection, setting: str, value: str) -> str:
+class _Session:
+    """The backend ``drop_expired`` runs on, and a check that it stays there.
+
+    ``drop_expired`` holds a session-level advisory lock and ``lock_timeout``
+    across statements, because ``DETACH ... CONCURRENTLY`` cannot run in a
+    transaction. Behind a pooler in transaction or statement mode, statements
+    of one connection can reach different backends, which would strand the
+    lock and the setting on one of them.
+    """
+
+    def __init__(self, conn: Connection) -> None:
+        self.conn = conn
+        self.pid = self._current()
+        self.other: int | None = None
+
+    def _current(self) -> int:
+        pid: int = self.conn.execute(text("SELECT pg_backend_pid()")).scalar_one()
+        return pid
+
+    def check(self, pid: int | None = None) -> None:
+        """Raise ``PartitionError`` if ``pid``, or the current backend, moved."""
+        pid = self._current() if pid is None else pid
+        if pid != self.pid:
+            self.other = pid
+            raise PartitionError(self.error())
+
+    def error(self) -> str:
+        moved = "" if self.other is None else f" ({self.pid}, then {self.other})"
+        return (
+            "drop_expired needs a direct or session-pooled connection: its "
+            f"statements reached more than one server backend{moved}, as "
+            "they do behind a pooler in transaction or statement mode, such "
+            "as PgBouncer with pool_mode=transaction. It holds a session-level "
+            "advisory lock and lock_timeout across statements because DETACH "
+            "PARTITION ... CONCURRENTLY cannot run in a transaction"
+        )
+
+
+def _set_session(session: _Session, setting: str, value: str) -> str:
     """Set ``setting`` for the session; return the old value."""
-    previous: str = conn.execute(
-        text("SELECT current_setting(:name)"), {"name": setting}
-    ).scalar_one()
-    conn.execute(
+    previous, pid = session.conn.execute(
+        text("SELECT current_setting(:name), pg_backend_pid()"), {"name": setting}
+    ).one()
+    session.check(pid)
+    session.conn.execute(
         text("SELECT set_config(:name, :value, false)"),
         {"name": setting, "value": value},
     )
-    return previous
+    return str(previous)
