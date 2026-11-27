@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from sqlalchemy import create_engine
 
-from audit_trail.integrity._block import checkpoint_body, fork_body, parse_body
+from audit_trail.integrity._block import (
+    SegmentBuilder,
+    activity_leaf_row,
+    checkpoint_body,
+    fork_body,
+    parse_body,
+    seal_body,
+)
 from audit_trail.integrity._checkpoint import Checkpoint
 from audit_trail.integrity._ed25519 import Ed25519Signer, Ed25519Verifier
 from audit_trail.integrity._seal import window_clause
@@ -33,6 +41,8 @@ from tests.unit.test_integrity_verify import (
     activity_row,
     check,
     failures,
+    record,
+    scrub,
     transaction_row,
 )
 
@@ -686,3 +696,113 @@ def test_the_sealer_window_of_a_stream_the_fork_does_not_name() -> None:
     assert window_sql(only_activity, above=False, table="activity") == (
         "severity = 20 AND id <= 5"
     )
+
+
+# -- scrubs in two xid spaces -------------------------------------------------
+
+REC_PART = "audit_activity_20_p2026_01"
+
+
+def two_spaces(
+    old: list[dict[str, Any]],
+    new: list[dict[str, Any]],
+    *,
+    retired: Sequence[dict[str, Any]] = (),
+    closing: Sequence[dict[str, Any]] = (),
+) -> Chain:
+    """A chain restored by ``pg_dump`` into a new cluster, as ``dumped``.
+
+    ``old`` rows are sealed in ``[100, 300)``, with ``retired`` ones in a
+    partition retired since, and ``closing`` ones by the closing seal up to
+    901; the fork's floor is the highest old id, the new cluster starts at
+    xid 150, and ``new`` rows are sealed in ``[150, 400)``.
+    """
+    chain = Chain()
+    builder = SegmentBuilder()
+    for row in old:
+        builder.add("activity.20", ACT_PART, activity_leaf_row(row))
+    for row in retired:
+        builder.add("activity.20", REC_PART, activity_leaf_row(row))
+    chain.add("seal", seal_body(CHAIN, chain.next, 100, 300, builder.segments()))
+    chain.sealed_to = 300
+    if retired:
+        chain.retire(REC_PART, ["activity.20"], datetime(2026, 2, 1, tzinfo=UTC))
+    good = take_checkpoint(chain)
+    if closing:
+        chain.seal(901, [], closing)
+    floor = max(row["id"] for row in [*old, *retired, *closing])
+    floors = {"activity.20": floor}
+    fork = declare_fork(chain, good, 150, floors=floors, counts=dict(floors))
+    sign(chain, OLD, fork)
+    chain.seal(400, [], new)
+    return chain
+
+
+def check_spaces(
+    chain: Chain, rows: list[dict[str, Any]], *, horizon: int = 500, xmax: int = 500
+) -> VerificationReport:
+    verifier = Verifier(chain.blocks, horizon=horizon, xmax=xmax, system_severity=20)
+    verifier.check_partition(Partition("transaction", TX_PART), [])
+    ordered = sorted(rows, key=lambda r: (r["xid"], r["id"]))
+    verifier.check_partition(Partition("activity", ACT_PART), ordered)
+    verifier.schema([])
+    return verifier.report()
+
+
+def test_an_old_scrub_with_a_retired_record_and_a_new_one_at_its_xid() -> None:
+    # Old cluster: row 1 scrubbed at xid 250, its record (2) retired since.
+    # New cluster: row 3 scrubbed at xid 250 too, its record (4) present.
+    old_row, new_row = activity_row(1, 200), activity_row(3, 240)
+    scrub(old_row, 250)
+    scrub(new_row, 250)
+    old_record = record(2, 250, operation="scrub", activity_rows=1)
+    new_record = record(4, 250, operation="scrub", activity_rows=1)
+    chain = two_spaces([old_row], [new_row, new_record], retired=[old_record])
+    report = check_spaces(chain, [old_row, new_row, new_record])
+    assert report.failures == []
+    assert NoteKind.ERASED_RECEIPT_RETIRED in notes(report)
+
+
+def test_a_new_erasure_is_not_explained_by_an_old_retired_record() -> None:
+    # The old cluster's block over [100, 300) has a retired partition; a new
+    # row erased at xid 260, with no record, is in the new cluster's block.
+    kept = activity_row(1, 200)
+    gone = activity_row(2, 210)
+    erased = activity_row(3, 245)
+    chain = two_spaces([kept], [erased], retired=[gone])
+    assert check_spaces(chain, [kept, erased]).failures == []
+    scrub(erased, 260)
+    report = check_spaces(chain, [kept, erased])
+    assert failures(report) == {FailureKind.SCRUB_COUNT_MISMATCH}
+    assert NoteKind.ERASED_RECEIPT_RETIRED not in notes(report)
+
+
+def test_an_old_record_at_a_running_xid_of_the_new_cluster_is_counted() -> None:
+    # An old record at xid 455 that accounts for a row nobody stamped. 455
+    # is between the new cluster's horizon and xmax, where a scrub of the
+    # new cluster could still be running; the old one cannot.
+    old_row = activity_row(1, 200)
+    old_record = record(2, 455, operation="scrub", activity_rows=1)
+    chain = two_spaces([old_row], [], closing=[old_record])
+    report = check_spaces(chain, [old_row, old_record], horizon=450, xmax=460)
+    assert failures(report) == {FailureKind.SCRUB_COUNT_MISMATCH}
+    assert {(f.xid, f.group) for f in report.failures} == {
+        (455, "label"),
+        (455, "changes"),
+        (455, "payload"),
+    }
+
+
+def test_an_old_row_scrubbed_after_the_fork_is_counted_in_the_new_space() -> None:
+    # Row 1 of the old cluster, scrubbed at xid 250 of the new one: the
+    # stamp fits both spaces, and the new record accounts for it.
+    old_row = activity_row(1, 200)
+    scrub(old_row, 250)
+    new_record = record(4, 250, operation="scrub", activity_rows=1)
+    chain = two_spaces([old_row], [new_record])
+    report = check_spaces(chain, [old_row, new_record])
+    assert report.failures == []
+    # Without the record, nothing accounts for it.
+    chain = two_spaces([old_row], [])
+    report = check_spaces(chain, [old_row])
+    assert failures(report) == {FailureKind.SCRUB_COUNT_MISMATCH}

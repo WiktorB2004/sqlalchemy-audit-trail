@@ -22,11 +22,13 @@ What it checks:
   removed, a stamp and the erased form (``ERASURE_UNEXPLAINED``); erased
   groups are counted in ``ERASED`` notes.
 - The ``audit.scrubbed`` records against the stamps that point to them, per
-  operation and group (``SCRUB_COUNT_MISMATCH``). A stamp must name a
-  transaction after its row's and before the snapshot's ``xmax``; a record
-  or stamp from before the genesis block is no receipt. Scrubs at or above
-  the horizon may still be running and are noted (``UNSEALED_TAIL``), to be
-  counted by a later run.
+  operation and group (``SCRUB_COUNT_MISMATCH``), within one xid space: a
+  scrub of one cluster never explains a stamp of another that happens to
+  have the same number. A stamp must name a transaction after its row's
+  and before the snapshot's ``xmax``; a record or stamp from before the
+  genesis block is no receipt. Scrubs at or above the horizon of the
+  current space may still be running and are noted (``UNSEALED_TAIL``), to
+  be counted by a later run.
 - The partitions named by segments: present ones are checked, retired ones
   (a ``retire`` block) are accepted with a ``RETIRED`` note, detached or
   pending ones are ``DETACHED_PARTITION`` and absent ones
@@ -743,6 +745,7 @@ class _Fork:
 
 @dataclass(frozen=True)
 class _Record:
+    space: int
     xid: int
     id: int
     partition: str
@@ -837,8 +840,14 @@ class Verifier:
         self._detached: set[str] = set()
         self._checked: set[str] = set()
         self._records: list[_Record] = []
-        # (group, xid) -> rows stamped, per table.
-        self._stamps: dict[str, Counter[tuple[str, int]]] = {
+        # (group, xid space, xid) -> rows stamped, per table.
+        self._stamps: dict[str, Counter[tuple[str, int, int]]] = {
+            TRANSACTION: Counter(),
+            ACTIVITY: Counter(),
+        }
+        # (group, xid space, xid) -> rows of that earlier space whose stamp
+        # may name a scrub of it or one of the current space since the fork.
+        self._shared: dict[str, Counter[tuple[str, int, int]]] = {
             TRANSACTION: Counter(),
             ACTIVITY: Counter(),
         }
@@ -1235,6 +1244,7 @@ class Verifier:
             raise ValueError("set the horizon before checking rows")
         marks = (len(self._failures), len(self._notes), len(self._records))
         stamps = {table: Counter(counts) for table, counts in self._stamps.items()}
+        shared = {table: Counter(counts) for table, counts in self._shared.items()}
         try:
             state = _PartitionState(partition)
             for row in rows:
@@ -1244,6 +1254,7 @@ class Verifier:
             del self._notes[marks[1] :]
             del self._records[marks[2] :]
             self._stamps = stamps
+            self._shared = shared
             raise
         self._checked.add(partition.name)
         self._close(state, final=True)
@@ -1330,7 +1341,15 @@ class Verifier:
         ):
             data = row.get("data")
             payload = data.get("payload") if isinstance(data, Mapping) else None
-            self._records.append(_Record(xid, row_id, state.partition.name, payload))
+            self._records.append(
+                _Record(
+                    self._space_of(incarnation),
+                    xid,
+                    row_id,
+                    state.partition.name,
+                    payload,
+                )
+            )
         if incarnation is None or pre_genesis:
             state.pre_genesis += 1
             return
@@ -1392,7 +1411,9 @@ class Verifier:
         explain it. A scrub of a row before genesis, itself before genesis,
         is out of scope. A row of an earlier xid space (before a fork with
         an id window) may also carry the stamp of a scrub run since the
-        fork, in the current space.
+        fork, in the current space. Each stamp is counted in its space; one
+        that fits both is counted as shared, and ``_check_scrubs`` gives it
+        to whichever space's records account for it.
         """
         stamps = row.get("seal_erased")
         if not isinstance(stamps, Mapping):
@@ -1403,12 +1424,11 @@ class Verifier:
                 continue
             if pre_genesis and xid < enforce_from:
                 continue
+            space, current = self._space_of(incarnation), self.incarnations[-1].space
             # A scrub in the row's own xid space, after the row...
             own = where["xid"] <= xid < self._xid_limit(incarnation)
             # ... or, for a row of an earlier space, one since the fork.
-            since_fork = not self._in_current_space(incarnation) and (
-                self._space_start() <= xid < self._xmax
-            )
+            since_fork = space != current and (self._space_start() <= xid < self._xmax)
             if not own and not since_fork:
                 why = "older than its row" if xid < where["xid"] else "in the future"
                 self._fail(
@@ -1418,7 +1438,16 @@ class Verifier:
                     **where,
                 )
                 continue
-            self._stamps[table][(str(group), xid)] += 1
+            if own and since_fork:
+                self._shared[table][(str(group), space, xid)] += 1
+            else:
+                self._stamps[table][(str(group), space if own else current, xid)] += 1
+
+    def _space_of(self, incarnation: Incarnation | None) -> int:
+        """The xid space of a row's incarnation; the current one for none."""
+        if incarnation is None:
+            return self.incarnations[-1].space
+        return incarnation.space
 
     def _space_start(self) -> int:
         """The first ``xid`` of the current xid space."""
@@ -1540,10 +1569,17 @@ class Verifier:
                 )
 
     def _check_scrubs(self) -> None:
-        recorded: Counter[tuple[str, str, int]] = Counter()
-        seen: set[int] = set()
+        """Compare the records of each scrub with the stamps that name it.
+
+        Per table, group, xid space and xid. Stamps shared between an
+        earlier space and the current one go to the space whose records
+        account for them, when some split does.
+        """
+        current = self.incarnations[-1].space
+        recorded: Counter[tuple[str, str, int, int]] = Counter()
+        seen: set[tuple[int, int]] = set()
         for record in self._records:
-            seen.add(record.xid)
+            seen.add((record.space, record.xid))
             counts = _record_counts(record.payload)
             where = {
                 "table": ACTIVITY,
@@ -1559,61 +1595,113 @@ class Verifier:
                 )
                 continue
             for (table, group), count in counts.items():
-                recorded[(table, group, record.xid)] += count
-        stamped: dict[tuple[str, str, int], int] = {
-            (table, group, xid): count
-            for table, stamps in self._stamps.items()
-            for (group, xid), count in stamps.items()
-        }
-        for key in sorted(set(recorded) | set(stamped)):
-            table, group, xid = key
-            want, have = recorded.get(key, 0), stamped.get(key, 0)
-            if self._horizon <= xid < self._xmax:
-                # The scrub may still be running: its rows are not all
-                # visible yet. A later run, past it, counts them.
-                self._note(
-                    NoteKind.UNSEALED_TAIL,
-                    "a scrub not finished when verify started; not counted yet",
-                    table=table,
-                    xid=xid,
-                    group=group,
-                    count=have,
-                )
-                continue
-            if want == have:
-                continue
-            if xid not in seen and self._receipt_retired(xid):
-                self._note(
-                    NoteKind.ERASED_RECEIPT_RETIRED,
-                    "rows erased by a scrub whose record was retired",
-                    table=table,
-                    xid=xid,
-                    group=group,
-                    count=have,
-                )
-                continue
-            self._fail(
-                FailureKind.SCRUB_COUNT_MISMATCH,
-                f"scrubs at this xid recorded {want} rows, {have} rows carry the stamp",
+                recorded[(table, group, record.space, record.xid)] += count
+        stamped: Counter[tuple[str, str, int, int]] = Counter(
+            {
+                (table, group, space, xid): count
+                for table, stamps in self._stamps.items()
+                for (group, space, xid), count in stamps.items()
+            }
+        )
+        shared: dict[tuple[str, str, int], dict[int, int]] = {}
+        for table, stamps in self._shared.items():
+            for (group, space, xid), count in stamps.items():
+                shared.setdefault((table, group, xid), {})[space] = count
+        scrubs: dict[tuple[str, str, int], set[int]] = {}
+        for table, group, space, xid in (*recorded, *stamped):
+            scrubs.setdefault((table, group, xid), set()).add(space)
+        for key, pools in shared.items():
+            scrubs.setdefault(key, set()).update((*pools, current))
+        for (table, group, xid), spaces in sorted(scrubs.items()):
+            want = {s: recorded[(table, group, s, xid)] for s in spaces}
+            have = {s: stamped[(table, group, s, xid)] for s in spaces}
+            pools = shared.get((table, group, xid), {})
+            if pools:
+                bounds = {s: self._bounds(s, xid, want[s], seen) for s in spaces}
+                for space, count in _split(pools, current, have, bounds).items():
+                    have[space] += count
+            for space in sorted(spaces):
+                self._judge(table, group, space, xid, want[space], have[space], seen)
+
+    def _running(self, space: int, xid: int) -> bool:
+        """Whether a scrub may still be running: only in the current space."""
+        return (
+            space == self.incarnations[-1].space and self._horizon <= xid < self._xmax
+        )
+
+    def _bounds(
+        self, space: int, xid: int, want: int, seen: set[tuple[int, int]]
+    ) -> tuple[int, int | None]:
+        """How many stamps the records of a scrub accept: ``(low, high)``.
+
+        Exactly the recorded rows, or any number (``high`` ``None``) for a
+        scrub that may still be running or whose record was retired.
+        """
+        if self._running(space, xid) or (
+            (space, xid) not in seen and self._receipt_retired(space, xid)
+        ):
+            return 0, None
+        return want, want
+
+    def _judge(
+        self,
+        table: str,
+        group: str,
+        space: int,
+        xid: int,
+        want: int,
+        have: int,
+        seen: set[tuple[int, int]],
+    ) -> None:
+        """Report a scrub whose stamps and records disagree."""
+        if self._running(space, xid):
+            # The scrub may still be running: its rows are not all visible
+            # yet. A later run, past it, counts them.
+            self._note(
+                NoteKind.UNSEALED_TAIL,
+                "a scrub not finished when verify started; not counted yet",
                 table=table,
                 xid=xid,
                 group=group,
                 count=have,
             )
+            return
+        if want == have:
+            return
+        where = {"table": table, "xid": xid, "group": group, "count": have}
+        if (space, xid) not in seen and self._receipt_retired(space, xid):
+            self._note(
+                NoteKind.ERASED_RECEIPT_RETIRED,
+                "rows erased by a scrub whose record was retired",
+                **where,
+            )
+            return
+        earlier = (
+            ""
+            if space == self.incarnations[-1].space
+            else (f" (in the xid space of incarnation {space})")
+        )
+        self._fail(
+            FailureKind.SCRUB_COUNT_MISMATCH,
+            f"scrubs at this xid{earlier} recorded {want} rows, {have} rows "
+            "carry the stamp",
+            **where,
+        )
 
-    def _receipt_retired(self, xid: int) -> bool:
+    def _receipt_retired(self, space: int, xid: int) -> bool:
         """Whether the record of the scrub at ``xid`` was sealed and retired.
 
         The record has the xid of its scrub, so it was sealed by the block
-        whose range holds that xid, in the stream of its severity. A retire
-        block attests it when it names that stream and covers the segment of
-        that block and stream in its partition, and the partition is gone.
+        of an incarnation of the scrub's xid space whose range holds that
+        xid, in the stream of its severity. A retire block attests it when
+        it names that stream and covers the segment of that block and stream
+        in its partition, and the partition is gone.
         """
         stream = self._scrubbed_stream
         if stream is None:
             return False
         for incarnation in self.incarnations:
-            sealed = incarnation.seal_of(xid)
+            sealed = incarnation.seal_of(xid) if incarnation.space == space else None
             if sealed is None:
                 continue
             for name, retired in self._retired.items():
@@ -1759,6 +1847,40 @@ class Verifier:
             ):
                 return fork
         return None
+
+
+def _split(
+    pools: Mapping[int, int],
+    current: int,
+    have: Mapping[int, int],
+    bounds: Mapping[int, tuple[int, int | None]],
+) -> dict[int, int]:
+    """Share out the stamps that fit an earlier space and the current one.
+
+    ``pools`` holds, by earlier space, the stamps that may name a scrub of
+    that space or of the current one; ``have`` the stamps counted in each
+    space already, and ``bounds`` how many each space's records accept.
+    Returns the stamps to add to each space: a split that satisfies every
+    bound when there is one, else one that leaves the mismatch to report.
+    """
+    low: dict[int, int] = {}
+    high: dict[int, int] = {}
+    for space, pool in pools.items():
+        least, most = bounds[space]
+        low[space] = min(max(least - have[space], 0), pool)
+        high[space] = pool if most is None else min(max(most - have[space], 0), pool)
+    least = bounds[current][0]
+    base = have[current] + sum(pools.values())
+    # The current space gets base - taken; aim for its lowest acceptable.
+    taken = min(max(base - least, sum(low.values())), sum(high.values()))
+    split: dict[int, int] = {}
+    rest = taken - sum(low.values())
+    for space in sorted(pools):
+        extra = min(rest, high[space] - low[space])
+        rest -= extra
+        split[space] = low[space] + extra
+    split[current] = base - have[current] - taken
+    return split
 
 
 def _acknowledged(finding: Finding, ack: int) -> Finding:
