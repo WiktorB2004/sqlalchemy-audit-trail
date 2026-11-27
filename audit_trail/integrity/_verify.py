@@ -64,10 +64,12 @@ from audit_trail.integrity._block import (
     FORMAT_VERSION,
     TRANSACTION_STREAM,
     ZERO_HASH,
+    ExpectedSegment,
     activity_leaf_row,
     activity_stream,
     block_hash,
     parse_body,
+    parse_segments,
     transaction_leaf_row,
 )
 from audit_trail.integrity._canonical import CanonicalEncodingError
@@ -283,17 +285,6 @@ class StoredBlock:
     prev_hash: bytes
     block_hash: bytes
     sealed_at: datetime
-
-
-@dataclass(frozen=True)
-class ExpectedSegment:
-    """A segment as a seal block names it."""
-
-    seq: int
-    stream: str
-    partition: str
-    rows: int
-    root: bytes
 
 
 @dataclass(frozen=True)
@@ -843,7 +834,7 @@ class Verifier:
             if xid_from != incarnation.sealed_to:
                 malformed("the seal block does not start where the last one ended")
                 return
-            parsed = _segments(block.seq, segments)
+            parsed = parse_segments(block.seq, segments)
             if parsed is None:
                 malformed("the seal block has malformed segments")
                 return
@@ -1343,28 +1334,6 @@ def _leaf(table: str, row: Mapping[str, Any]) -> bytes:
     except (CanonicalEncodingError, KeyError, TypeError, AttributeError):
         # A row that cannot be encoded matches no sealed leaf.
         return bytes(32)
-
-
-def _segments(seq: int, value: object) -> list[ExpectedSegment] | None:
-    if not isinstance(value, list):
-        return None
-    parsed: list[ExpectedSegment] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            return None
-        stream, partition, rows = (item.get(k) for k in ("stream", "partition", "rows"))
-        root = decode_strict(item.get("root"), 32)
-        if not (
-            isinstance(stream, str)
-            and isinstance(partition, str)
-            and is_int(rows)
-            and rows > 0
-            and root is not None
-        ):
-            return None
-        parsed.append(ExpectedSegment(seq, stream, partition, rows, root))
-    keys = [(s.stream, s.partition) for s in parsed]
-    return parsed if len(set(keys)) == len(keys) else None
 
 
 def stream_retention(

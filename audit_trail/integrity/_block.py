@@ -37,7 +37,7 @@ from typing import Any
 from uuid import UUID
 
 from audit_trail.integrity._canonical import canonical
-from audit_trail.integrity._codec import b64, context, rfc3339
+from audit_trail.integrity._codec import b64, context, decode_strict, is_int, rfc3339
 from audit_trail.integrity._commit import ACTOR_FIELDS, leaf_hash
 from audit_trail.integrity._merkle import MerkleTree
 
@@ -201,6 +201,50 @@ class SegmentBuilder:
             Segment(stream, partition, tree.size, tree.root())
             for (stream, partition), tree in sorted(self._trees.items())
         ]
+
+
+@dataclass(frozen=True)
+class ExpectedSegment:
+    """A segment as a seal block names it."""
+
+    seq: int
+    stream: str
+    partition: str
+    rows: int
+    root: bytes
+
+
+def parse_segments(seq: int, value: object) -> list[ExpectedSegment] | None:
+    """The segments a parsed seal body names, or ``None`` when malformed.
+
+    Args:
+        seq: The block's number.
+        value: The body's ``segments``.
+
+    Returns:
+        The segments, or ``None`` unless ``value`` is a list of distinct
+        (stream, partition) entries, each with a positive ``rows`` and a
+        32-byte ``root``.
+    """
+    if not isinstance(value, list):
+        return None
+    parsed: list[ExpectedSegment] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            return None
+        stream, partition, rows = (item.get(k) for k in ("stream", "partition", "rows"))
+        root = decode_strict(item.get("root"), 32)
+        if not (
+            isinstance(stream, str)
+            and isinstance(partition, str)
+            and is_int(rows)
+            and rows > 0
+            and root is not None
+        ):
+            return None
+        parsed.append(ExpectedSegment(seq, stream, partition, rows, root))
+    keys = [(s.stream, s.partition) for s in parsed]
+    return parsed if len(set(keys)) == len(keys) else None
 
 
 def genesis_body(chain: str, enforce_from: int) -> bytes:
