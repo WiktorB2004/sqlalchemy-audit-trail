@@ -52,6 +52,7 @@ from sqlalchemy.dialects.postgresql.base import PGDialect
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.schema import CreateIndex, CreateTable
 
+from audit_trail import _pg
 from audit_trail.integrity import _schema as integrity_schema
 from audit_trail.tables import AuditTables
 
@@ -276,7 +277,7 @@ def create_audit_tables(
         severities: A severity ``IntEnum`` class, or any iterable of ints.
     """
     for statement in create_statements(tables, severities):
-        _execute_ddl(connection, statement)
+        _pg.execute_ddl(connection, statement)
 
 
 def drop_audit_tables(connection: Connection, tables: AuditTables) -> None:
@@ -287,7 +288,7 @@ def drop_audit_tables(connection: Connection, tables: AuditTables) -> None:
         tables: The audit tables.
     """
     for statement in drop_statements(tables):
-        _execute_ddl(connection, statement)
+        _pg.execute_ddl(connection, statement)
 
 
 def add_integrity_statements(tables: AuditTables) -> list[str]:
@@ -376,16 +377,16 @@ def add_integrity(
     def alter() -> None:
         with connection.begin_nested():
             for statement in statements:
-                _execute_ddl(connection, statement)
+                _pg.execute_ddl(connection, statement)
 
-    previous = _set_lock_timeout(connection, lock_timeout, local=True)
+    previous = _pg.set_config(connection, "lock_timeout", lock_timeout, local=True)
     try:
         _retry("add_integrity", alter, lock_timeout, attempts)
     finally:
         # A broken connection is discarded by the pool; touching it would
         # hide the real error.
         if not connection.invalidated:
-            _set_lock_timeout(connection, previous, local=True)
+            _pg.set_config(connection, "lock_timeout", previous, local=True)
 
 
 def add_integrity_indexes(
@@ -450,7 +451,7 @@ def add_integrity_indexes(
             "INDEX CONCURRENTLY cannot run inside a transaction block"
         )
     builder = _IndexBuilder(connection, lock_timeout, attempts)
-    previous = _set_lock_timeout(connection, lock_timeout, local=False)
+    previous = _pg.set_config(connection, "lock_timeout", lock_timeout, local=False)
     try:
         for table in (tables.transaction, tables.activity):
             oid: int | None = connection.execute(
@@ -465,7 +466,7 @@ def add_integrity_indexes(
             builder.partitioned(oid, integrity_schema.xid_index_name(table.name))
     finally:
         if not connection.invalidated:
-            _set_lock_timeout(connection, previous, local=False)
+            _pg.set_config(connection, "lock_timeout", previous, local=False)
     return builder.built
 
 
@@ -556,29 +557,31 @@ class _IndexBuilder:
         ).one_or_none()
         if existing is not None and existing.indisvalid:
             return
-        _set_lock_timeout(self.connection, "0", local=False)
+        _pg.set_config(self.connection, "lock_timeout", "0", local=False)
         try:
             if existing is not None:
                 # Left invalid by a build that failed.
-                _execute_ddl(
+                _pg.execute_ddl(
                     self.connection,
                     f"DROP INDEX CONCURRENTLY IF EXISTS "
                     f"{qualified_name(schema, index)}",
                 )
-            _execute_ddl(
+            _pg.execute_ddl(
                 self.connection,
                 f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {_PREPARER.quote(index)} "
                 f"ON {qualified_name(schema, name)} ({_XID_KEY})",
             )
         finally:
             if not self.connection.invalidated:
-                _set_lock_timeout(self.connection, self.lock_timeout, local=False)
+                _pg.set_config(
+                    self.connection, "lock_timeout", self.lock_timeout, local=False
+                )
         self.built.append(f"{schema}.{index}")
 
     def _short(self, statement: str) -> None:
         _retry(
             "add_integrity_indexes",
-            lambda: _execute_ddl(self.connection, statement),
+            lambda: _pg.execute_ddl(self.connection, statement),
             self.lock_timeout,
             self.attempts,
         )
@@ -598,7 +601,6 @@ _XID_KEY = f"{integrity_schema.XID}, id"
 
 # The first retry pauses up to this many seconds, each later one twice as long.
 _RETRY_PAUSE = 0.5
-_LOCK_NOT_AVAILABLE = "55P03"
 _sleep = time.sleep
 
 
@@ -611,7 +613,7 @@ def _retry(
             action()
             return
         except DBAPIError as exc:
-            if attempt == attempts or not _is_lock_timeout(exc):
+            if attempt == attempts or not _pg.is_sqlstate(exc, _pg.LOCK_NOT_AVAILABLE):
                 raise
             pause = random.uniform(0, _RETRY_PAUSE * 2 ** (attempt - 1))
             logger.warning(
@@ -626,39 +628,8 @@ def _retry(
             _sleep(pause)
 
 
-def _is_lock_timeout(exc: DBAPIError) -> bool:
-    orig = exc.orig
-    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
-    return sqlstate == _LOCK_NOT_AVAILABLE
-
-
 def _is_autocommit(connection: Connection) -> bool:
     return bool(getattr(connection.connection.dbapi_connection, "autocommit", False))
-
-
-def _set_lock_timeout(connection: Connection, value: str, *, local: bool) -> str:
-    """Set ``lock_timeout`` for the transaction or the session; return the old value."""
-    previous: str = connection.execute(
-        text("SELECT current_setting('lock_timeout')")
-    ).scalar_one()
-    connection.execute(
-        text("SELECT set_config('lock_timeout', :value, :local)"),
-        {"value": value, "local": local},
-    )
-    return previous
-
-
-def _execute_ddl(connection: Connection, statement: str) -> None:
-    """Execute one DDL statement from this module as-is.
-
-    The statement goes to the driver without parameters, so ``%`` and ``:``
-    inside quoted names are not taken for placeholders.
-
-    Args:
-        connection: Connection to run on.
-        statement: A statement built by this module.
-    """
-    connection.exec_driver_sql(statement, execution_options={"no_parameters": True})
 
 
 def _compile(element: CreateTable | CreateIndex) -> str:

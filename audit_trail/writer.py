@@ -27,6 +27,7 @@ from sqlalchemy import Connection, Table, insert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+from audit_trail import _pg
 from audit_trail._compaction import ActivityData
 from audit_trail.context import AuditContext, ContextSnapshot, context_snapshot
 from audit_trail.events import PayloadError
@@ -56,8 +57,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-CHECK_VIOLATION = "23514"
-UNDEFINED_COLUMN = "42703"
+CHECK_VIOLATION = _pg.CHECK_VIOLATION
+UNDEFINED_COLUMN = _pg.UNDEFINED_COLUMN
 
 MISSING_INTEGRITY_COLUMNS = (
     "Integrity is on, but the audit tables lack a column it writes; "
@@ -431,7 +432,7 @@ def is_missing_partition(exc: DBAPIError) -> bool:
         ``True`` for SQLSTATE ``23514`` with PostgreSQL's "no partition of
         relation" message.
     """
-    return _sqlstate(exc) == CHECK_VIOLATION and _NO_PARTITION in str(exc.orig)
+    return _pg.is_sqlstate(exc, CHECK_VIOLATION) and _NO_PARTITION in str(exc.orig)
 
 
 def is_missing_integrity_column(exc: BaseException, integrity: bool) -> bool:
@@ -447,16 +448,10 @@ def is_missing_integrity_column(exc: BaseException, integrity: bool) -> bool:
         ``True`` for SQLSTATE ``42703`` when ``integrity`` is set.
     """
     return (
-        integrity and isinstance(exc, DBAPIError) and _sqlstate(exc) == UNDEFINED_COLUMN
+        integrity
+        and isinstance(exc, DBAPIError)
+        and _pg.is_sqlstate(exc, UNDEFINED_COLUMN)
     )
-
-
-def _sqlstate(exc: DBAPIError) -> str | None:
-    orig = exc.orig
-    sqlstate: str | None = getattr(orig, "sqlstate", None) or getattr(
-        orig, "pgcode", None
-    )
-    return sqlstate
 
 
 def _log_failure(exc: DBAPIError | CanonicalEncodingError, integrity: bool) -> None:
