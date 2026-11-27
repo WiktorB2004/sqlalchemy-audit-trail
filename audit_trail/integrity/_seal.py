@@ -31,6 +31,7 @@ from sqlalchemy import (
     Integer,
     Table,
     and_,
+    false,
     func,
     insert,
     literal_column,
@@ -563,7 +564,9 @@ def window_clause(
     ``severity`` column), or a partition of either.
 
     ``None`` when there is no floor. A stream the floor does not name had no
-    row at the fork and is not bounded.
+    row at the fork, as if its floor were -1: above the floor it is not
+    bounded, and at or below it there is no row of it (a stream that
+    appears after the fork belongs to the new incarnation alone).
     """
     if floors is None:
         return None
@@ -574,19 +577,23 @@ def window_clause(
 
     if "severity" not in table.c:
         limit = floors.get(TRANSACTION_STREAM)
-        return None if limit is None else bound(limit)
+        if limit is None:
+            return None if above else false()
+        return bound(limit)
     severities = {
         int(stream.removeprefix("activity.")): limit
         for stream, limit in floors.items()
         if stream.startswith("activity.")
     }
-    if not severities:
-        return None
     severity = table.c.severity
-    return or_(
-        *(and_(severity == value, bound(limit)) for value, limit in severities.items()),
-        severity.not_in(list(severities)),
-    )
+    named = [
+        and_(severity == value, bound(limit)) for value, limit in severities.items()
+    ]
+    if not above:
+        return or_(*named) if named else false()
+    if not named:
+        return None
+    return or_(*named, severity.not_in(list(severities)))
 
 
 def _windows(

@@ -43,6 +43,7 @@ VERIFIER = Ed25519Verifier([SIGNER.vkey])
 class RestoreEvent(AuditEvent):
     NOTED = event("restore_test.noted", Severity.INFO)
     KEPT = event("restore_test.kept", Severity.CRITICAL)
+    WARNED = event("restore_test.warned", Severity.WARNING)  # only after a fork
 
 
 _FACTORIES: dict[int, sessionmaker[Session]] = {}
@@ -295,6 +296,47 @@ def test_a_declared_fork_after_a_restore_verifies(
     health = trail.maintenance.health()
     assert health.seal is not None
     assert health.seal.unsealed_rows == 0
+
+
+def test_a_stream_new_after_the_fork_verifies(
+    dump: Dump, restored: tuple[Engine, AuditTrail]
+) -> None:
+    engine, trail = restored
+    with engine.connect() as conn:
+        fork = declare_fork(
+            conn, trail.tables, dump.checkpoint, reason="restore", signer=SIGNER
+        )
+    assert fork.id_floor is not None
+    warned = f"activity.{int(Severity.WARNING)}"
+    assert warned not in fork.id_floor
+    # Its first rows get ids above the floors of the other streams, and xids
+    # inside the old sealed ranges.
+    factory = _FACTORIES[id(trail)]
+    middle = (dump.seals[-1]["xid_from"] + dump.seals[-1]["xid_to"]) // 2
+    burn_to(engine, middle)
+    for n in range(3):
+        with factory() as session:
+            trail.log(session, RestoreEvent.WARNED, payload={"n": n})
+            session.commit()
+    seal_all(trail)
+    new_seals = [b for b in bodies(engine, trail) if b["kind"] == "seal"]
+    streams = {
+        s["stream"] for b in new_seals[len(dump.seals) + 1 :] for s in b["segments"]
+    }
+    assert warned in streams
+    report = verify(
+        engine,
+        trail.tables,
+        checkpoints=[dump.checkpoint],
+        verifier=VERIFIER,
+        require_signatures=True,
+    )
+    assert report.failures == []
+    assert {n.kind for n in report.notes} == {
+        NoteKind.FORKED,
+        NoteKind.UNANCHORED_TAIL,
+    }
+    assert report.anchor is Anchor.ANCHORED
 
 
 def test_a_data_only_restore_without_sequences_is_refused(

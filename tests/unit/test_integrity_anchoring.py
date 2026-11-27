@@ -7,10 +7,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from sqlalchemy import create_engine
 
 from audit_trail.integrity._block import checkpoint_body, fork_body, parse_body
 from audit_trail.integrity._checkpoint import Checkpoint
 from audit_trail.integrity._ed25519 import Ed25519Signer, Ed25519Verifier
+from audit_trail.integrity._seal import window_clause
 from audit_trail.integrity._sign import Signer, sign_block
 from audit_trail.integrity._verify import (
     Anchor,
@@ -21,6 +23,7 @@ from audit_trail.integrity._verify import (
     VerificationReport,
     Verifier,
 )
+from audit_trail.tables import build_tables
 from tests.unit.test_integrity_verify import (
     ACT_PART,
     CHAIN,
@@ -581,6 +584,30 @@ def test_a_fork_with_an_id_window_verifies(
     assert (forked.kind, forked.seq) == (NoteKind.FORKED, 5)
 
 
+def test_a_stream_that_appears_after_a_windowed_fork_verifies() -> None:
+    chain = Chain()
+    old = [transaction_row(1, 200)]
+    old_activity = [activity_row(1, 210)]
+    chain.seal(300, old, old_activity)
+    good = take_checkpoint(chain)
+    floors = {"transaction": 1, "activity.20": 1}
+    fork = declare_fork(chain, good, 150, floors=floors, counts=dict(floors))
+    sign(chain, OLD, fork)
+    # Severity 3 had no row before the fork; its first one, in the new
+    # cluster, has an xid inside the old sealed range.
+    new_stream = activity_row(500, 260)
+    new_stream["severity"] = 3
+    new = [transaction_row(2, 250)]
+    chain.seal(400, new, [new_stream])
+    verifier = Verifier(chain.blocks, horizon=500)
+    assert verifier.incarnation_of("activity.3", 500, 260) is verifier.incarnations[1]
+    assert verifier.incarnation_of("activity.20", 1, 210) is verifier.incarnations[0]
+    activities = sorted([*old_activity, new_stream], key=lambda r: (r["xid"], r["id"]))
+    report = check(chain, [*old, *new], activities, horizon=500)
+    assert report.failures == []
+    assert notes(report) == {NoteKind.FORKED}
+
+
 def test_old_rows_above_the_new_xmax_are_not_from_the_future(
     dumped: tuple[Chain, list[dict[str, Any]], list[dict[str, Any]]],
 ) -> None:
@@ -626,3 +653,36 @@ def test_an_old_row_left_past_the_closing_seal_fails(
     report = check(chain, rows, activities, horizon=500)
     assert failures(report) == {FailureKind.ROW_COUNT_MISMATCH}
     assert report.failures[0].xid == 950
+
+
+def window_sql(floors: dict[str, int], *, above: bool, table: str) -> str | None:
+    tables = build_tables(integrity=True)
+    clause = window_clause(getattr(tables, table), floors, above=above)
+    if clause is None:
+        return None
+    compiled = clause.compile(
+        dialect=create_engine("postgresql+psycopg://").dialect,
+        compile_kwargs={"literal_binds": True},
+    )
+    return (
+        str(compiled)
+        .replace("audit.audit_activity.", "")
+        .replace("audit.audit_transaction.", "")
+    )
+
+
+def test_the_sealer_window_of_a_stream_the_fork_does_not_name() -> None:
+    # A stream the fork does not name had no row then: above its floor every
+    # row of it, at or below it none.
+    only_tx = {"transaction": 5}
+    assert window_sql(only_tx, above=True, table="activity") is None
+    assert window_sql(only_tx, above=False, table="activity") == "false"
+    only_activity = {"activity.20": 5}
+    assert window_sql(only_activity, above=True, table="transaction") is None
+    assert window_sql(only_activity, above=False, table="transaction") == "false"
+    assert window_sql(only_activity, above=True, table="activity") == (
+        "severity = 20 AND id > 5 OR (severity NOT IN (20))"
+    )
+    assert window_sql(only_activity, above=False, table="activity") == (
+        "severity = 20 AND id <= 5"
+    )

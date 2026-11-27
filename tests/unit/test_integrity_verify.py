@@ -460,7 +460,9 @@ def test_an_incarnation_judges_only_its_id_window() -> None:
     assert incarnation.holds("transaction", 101)
     assert incarnation.holds("transaction", 200)
     assert not incarnation.holds("transaction", 201)
-    assert incarnation.holds("activity.20", 1)
+    # A stream the closing fork did not name had no row then: none is held.
+    assert not incarnation.holds("activity.20", 1)
+    assert Incarnation(1, 10, id_floor={"transaction": 100}).holds("activity.20", 1)
     assert incarnation.is_pre_genesis(9)
     assert incarnation.seal_of(19) == Seal(5, 10, 20)
     assert incarnation.seal_of(20) == Seal(6, 20, 30)

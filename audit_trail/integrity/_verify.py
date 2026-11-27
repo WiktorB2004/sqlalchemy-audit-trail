@@ -347,7 +347,9 @@ class Incarnation:
         id_floor: Rows of a stream with ``id`` at or below this belong to an
             earlier incarnation; set by a fork with an id window.
         id_ceiling: Rows of a stream with ``id`` above this belong to a later
-            incarnation; set by the next fork with an id window.
+            incarnation; set by the next fork with an id window. A stream
+            it does not name had no row at that fork: its ceiling is -1, so
+            the incarnation holds none of its rows.
         space: ``number`` of the first incarnation of its xid space. A fork
             with an id window starts a new one (the restored cluster counts
             xids from low again); a fork without one keeps the space.
@@ -369,8 +371,7 @@ class Incarnation:
         """Whether a row of ``stream`` with this ``id`` is in its window."""
         if self.id_floor is not None and row_id <= self.id_floor.get(stream, -1):
             return False
-        ceiling = None if self.id_ceiling is None else self.id_ceiling.get(stream)
-        return ceiling is None or row_id <= ceiling
+        return self.id_ceiling is None or row_id <= self.id_ceiling.get(stream, -1)
 
     def is_pre_genesis(self, xid: int) -> bool:
         """Whether a row of this incarnation is below its scope."""
