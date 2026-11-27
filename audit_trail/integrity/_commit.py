@@ -29,7 +29,6 @@ its own transaction id.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import ipaddress
 import secrets
@@ -37,6 +36,7 @@ from collections.abc import Mapping
 from typing import TypedDict
 
 from audit_trail.integrity._canonical import CanonicalEncodingError, canonical
+from audit_trail.integrity._codec import b64, context
 
 ACTOR_FIELDS: tuple[str, ...] = ("actor_label", "remote_addr", "user_agent", "meta")
 """The fields of the ``actor`` group: the columns of ``audit_transaction``,
@@ -54,10 +54,10 @@ TRANSACTION_GROUPS: tuple[str, ...] = ("actor",)
 SALT_LENGTH = 16
 """Bytes of one salt."""
 
-COMMIT_CONTEXT = b"sqlalchemy-audit-trail/commit/v1"
+COMMIT_CONTEXT = context("commit")
 """Domain separation string of a commitment."""
 
-LEAF_CONTEXT = b"sqlalchemy-audit-trail/leaf/v1"
+LEAF_CONTEXT = context("leaf")
 """Domain separation string of a Merkle leaf."""
 
 
@@ -147,8 +147,8 @@ def seal_columns(groups: Mapping[str, object]) -> SealColumns:
         if value is None:
             continue
         salt = new_salt()
-        commitments[group] = _b64(commitment(group, salt, value))
-        salts[group] = _b64(salt)
+        commitments[group] = b64(commitment(group, salt, value))
+        salts[group] = b64(salt)
     return {"seal_commitments": commitments, "seal_salts": salts, "seal_erased": None}
 
 
@@ -295,7 +295,3 @@ def _ipv6_text(packed: bytes) -> str:
 def _present(fields: dict[str, object]) -> dict[str, object] | None:
     present = {key: value for key, value in fields.items() if value is not None}
     return present or None
-
-
-def _b64(raw: bytes) -> str:
-    return base64.b64encode(raw).decode("ascii")
