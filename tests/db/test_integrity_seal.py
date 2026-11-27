@@ -607,6 +607,9 @@ def test_an_idle_read_only_session_does_not_hold_the_horizon(env: Env) -> None:
         no_xid = reader.execute(text("SELECT pg_current_xact_id_if_assigned()"))
         assert no_xid.scalar() is None
         xid = write(env)
+        # Other tests' transactions on the same server can hold the horizon;
+        # wait for them, not for the idle reader, which holds no xid.
+        wait_for_horizon_past(env.engine, xid)
         result = seal(env)
         reader.rollback()
     assert result.rows == 2
