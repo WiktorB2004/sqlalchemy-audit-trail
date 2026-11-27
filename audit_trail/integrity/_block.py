@@ -30,14 +30,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from audit_trail.integrity._canonical import canonical
-from audit_trail.integrity._codec import b64, context, rfc3339
+from audit_trail.integrity._codec import b64, context, decode_strict, is_int, rfc3339
 from audit_trail.integrity._commit import ACTOR_FIELDS, leaf_hash
 from audit_trail.integrity._merkle import MerkleTree
 
@@ -203,6 +203,50 @@ class SegmentBuilder:
         ]
 
 
+@dataclass(frozen=True)
+class ExpectedSegment:
+    """A segment as a seal block names it."""
+
+    seq: int
+    stream: str
+    partition: str
+    rows: int
+    root: bytes
+
+
+def parse_segments(seq: int, value: object) -> list[ExpectedSegment] | None:
+    """The segments a parsed seal body names, or ``None`` when malformed.
+
+    Args:
+        seq: The block's number.
+        value: The body's ``segments``.
+
+    Returns:
+        The segments, or ``None`` unless ``value`` is a list of distinct
+        (stream, partition) entries, each with a positive ``rows`` and a
+        32-byte ``root``.
+    """
+    if not isinstance(value, list):
+        return None
+    parsed: list[ExpectedSegment] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            return None
+        stream, partition, rows = (item.get(k) for k in ("stream", "partition", "rows"))
+        root = decode_strict(item.get("root"), 32)
+        if not (
+            isinstance(stream, str)
+            and isinstance(partition, str)
+            and is_int(rows)
+            and rows > 0
+            and root is not None
+        ):
+            return None
+        parsed.append(ExpectedSegment(seq, stream, partition, rows, root))
+    keys = [(s.stream, s.partition) for s in parsed]
+    return parsed if len(set(keys)) == len(keys) else None
+
+
 def genesis_body(chain: str, enforce_from: int) -> bytes:
     """Body of the genesis block (``seq`` 1).
 
@@ -295,6 +339,81 @@ def horizon_of(body: Mapping[str, Any]) -> int:
     if body["kind"] == "genesis":
         return int(body["enforce_from"])
     return int(body["xid_to"])
+
+
+def ack_body(
+    chain: str,
+    seq: int,
+    *,
+    failure: str,
+    scope: Mapping[str, object],
+    waives: Sequence[Mapping[str, object]],
+    reason: str,
+) -> bytes:
+    """Body of an ack block, which waives failures of one kind in a scope.
+
+    Args:
+        chain: The chain id.
+        seq: The block's number.
+        failure: Name of the failure kind it waives.
+        scope: The findings it covers, as the verifier matches them.
+        waives: The failures it waives, each pinned as it was observed: the
+            row for a row, the root and count for a segment.
+        reason: Why, as the operator wrote it.
+    """
+    return _body(
+        {
+            "v": FORMAT_VERSION,
+            "kind": "ack",
+            "chain": chain,
+            "seq": seq,
+            "failure": failure,
+            "scope": dict(scope),
+            "waives": [dict(pin) for pin in waives],
+            "reason": reason,
+        }
+    )
+
+
+def retire_body(
+    chain: str,
+    seq: int,
+    *,
+    stream: str,
+    partition: str,
+    upper_bound: datetime,
+    retention: int | None,
+    rows: int,
+    segments_digest: bytes,
+) -> bytes:
+    """Body of a retire block, written before a partition is dropped.
+
+    Args:
+        chain: The chain id.
+        seq: The block's number.
+        stream: The partition's stream.
+        partition: Name of the partition, without schema.
+        upper_bound: The partition's exclusive upper bound.
+        retention: The retention it was dropped under, in whole seconds;
+            ``None`` when it had none.
+        rows: Rows the partition held.
+        segments_digest: SHA-256 over the roots of its segments, in chain
+            order.
+    """
+    return _body(
+        {
+            "v": FORMAT_VERSION,
+            "kind": "retire",
+            "chain": chain,
+            "seq": seq,
+            "stream": stream,
+            "partition": partition,
+            "upper_bound": rfc3339(upper_bound),
+            "retention": retention,
+            "rows": rows,
+            "segments_digest": b64(segments_digest),
+        }
+    )
 
 
 def block_hash(prev_hash: bytes, body: bytes) -> bytes:

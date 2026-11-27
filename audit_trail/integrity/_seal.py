@@ -191,10 +191,10 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
             f"SELECT {_pg.XACT_LOCK} AS locked, "
             "to_regclass(:block) IS NOT NULL AS created"
         ),
-        {"key": _pg.lock_key(block), "block": _regclass(connection, block)},
+        {"key": _pg.lock_key(block), "block": _pg.regclass(connection, block)},
     ).one()
     if not start.created:
-        raise ValueError(_missing(block))
+        raise ValueError(missing_block_table(block))
     existing = _genesis(connection, block)
     if existing is not None:
         return existing
@@ -206,7 +206,7 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
         # A savepoint, so a conflict leaves the caller's transaction usable.
         with connection.begin_nested():
             body = genesis_body(chain, horizon)
-            _insert(connection, block, 1, "genesis", ZERO_HASH, body)
+            insert_block(connection, block, 1, "genesis", ZERO_HASH, body)
     except IntegrityError as exc:
         if not _pg.is_sqlstate(exc, _pg.UNIQUE_VIOLATION):
             raise
@@ -309,7 +309,7 @@ def _seal(
                 f"{_pg.TRY_XACT_LOCK} AS locked, "
                 "pg_snapshot_xmin(pg_current_snapshot())::text AS horizon"
             ),
-            {"key": _pg.lock_key(block), "table": _regclass(connection, block)},
+            {"key": _pg.lock_key(block), "table": _pg.regclass(connection, block)},
         ).one()
         if start.standby:
             return SealResult(0, 0, None, skipped="standby")
@@ -320,7 +320,7 @@ def _seal(
         if not start.locked:
             return SealResult(0, 0, None, skipped="busy")
         horizon = int(start.horizon)
-        last = _last(connection, block)
+        last = last_block(connection, block)
         sealed = _sealed_to(connection, block)
         if last is None or sealed is None:
             raise SealRefusedError(
@@ -346,7 +346,7 @@ def _seal(
         seq = last.seq + 1
         body = seal_body(chain, seq, xid_from, xid_to, builder.segments())
         try:
-            _insert(connection, block, seq, "seal", last.block_hash, body)
+            insert_block(connection, block, seq, "seal", last.block_hash, body)
         except IntegrityError as exc:
             if _pg.is_sqlstate(exc, _pg.UNIQUE_VIOLATION):
                 raise _StaleSnapshotError from exc
@@ -386,12 +386,19 @@ def seal_health(
             "WHERE database = current_database() AND prepared < :cutoff "
             "ORDER BY prepared, gid) AS prepared"
         ),
-        {"block": _regclass(connection, block), "cutoff": now - max_seal_lag},
+        {"block": _pg.regclass(connection, block), "cutoff": now - max_seal_lag},
     ).one()
     prepared = list(start.prepared)
     if not start.created:
         return SealHealth(
-            False, None, None, 0, None, max_seal_lag, prepared, _missing(block)
+            False,
+            None,
+            None,
+            0,
+            None,
+            max_seal_lag,
+            prepared,
+            missing_block_table(block),
         )
     horizon = connection.execute(
         select(block.c.body, block.c.sealed_at)
@@ -429,11 +436,8 @@ def seal_health(
     )
 
 
-def _regclass(connection: Connection, table: Table) -> str:
-    return connection.dialect.identifier_preparer.format_table(table)
-
-
-def _missing(block: Table) -> str:
+def missing_block_table(block: Table) -> str:
+    """The error message for a block table that does not exist."""
     return (
         f"the block table {block.fullname} does not exist; run "
         "migrations.add_integrity() first"
@@ -454,7 +458,8 @@ def _horizon(connection: Connection) -> int:
     )
 
 
-def _last(connection: Connection, block: Table) -> Any:
+def last_block(connection: Connection, block: Table) -> Any:
+    """The ``seq`` and ``block_hash`` of the newest block, or ``None``."""
     return connection.execute(
         select(block.c.seq, block.c.block_hash).order_by(block.c.seq.desc()).limit(1)
     ).one_or_none()
@@ -595,12 +600,12 @@ _LEAF_PARTITIONS = text(
 def _leaf_partitions(connection: Connection, table: Table) -> dict[int, str]:
     """Names of the partitions that hold the rows of a partitioned table."""
     rows = connection.execute(
-        _LEAF_PARTITIONS, {"parent": _regclass(connection, table)}
+        _LEAF_PARTITIONS, {"parent": _pg.regclass(connection, table)}
     ).all()
     return {int(oid): str(name) for oid, name in rows}
 
 
-def _insert(
+def insert_block(
     connection: Connection,
     block: Table,
     seq: int,
@@ -608,6 +613,7 @@ def _insert(
     prev_hash: bytes,
     body: bytes,
 ) -> None:
+    """Insert one block, hashed onto ``prev_hash``."""
     connection.execute(
         insert(block).values(
             seq=seq,

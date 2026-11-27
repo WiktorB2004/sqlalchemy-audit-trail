@@ -449,6 +449,7 @@ def test_scrub_removes_salts_and_points_to_its_record(env: Env, models: Models) 
     assert result.activity_rows == 3
     record = scrubbed_record(env)
     check_activity(record)
+    assert record["data"]["payload"]["stamped_activity_rows"] == 3
     pointer = str(record["xid"])
     for row in env.activities():
         if row["verb"] == "audit.scrubbed":
@@ -696,7 +697,11 @@ def test_scrub_stamps_no_row_written_without_integrity(upgraded: Env) -> None:
     with upgraded.trail.context(ADMIN):
         result = upgraded.trail.scrub("Doc", "1")
     assert result.activity_rows == 2
-    pointer = str(scrubbed_record(upgraded)["xid"])
+    record = scrubbed_record(upgraded)
+    pointer = str(record["xid"])
+    # The record also counts the stamps, which leave out the old row.
+    assert record["data"]["payload"]["activity_rows"] == 2
+    assert record["data"]["payload"]["stamped_activity_rows"] == 1
     old, new = seal_state(upgraded)
     assert old == ("entity.created", True, None)
     stamp = {"label": pointer, "changes": pointer, "payload": pointer}
@@ -711,7 +716,12 @@ def test_scrub_actor_stamps_no_row_written_without_integrity(upgraded: Env) -> N
         result = upgraded.trail.scrub_actor("ann")
     assert result.transaction_rows == 2
     assert result.activity_rows == 2
-    pointer = str(scrubbed_record(upgraded)["xid"])
+    record = scrubbed_record(upgraded)
+    pointer = str(record["xid"])
+    payload = record["data"]["payload"]
+    assert (payload["transaction_rows"], payload["activity_rows"]) == (2, 2)
+    assert payload["stamped_transaction_rows"] == 1
+    assert payload["stamped_activity_rows"] == 1
     old, new = seal_state(upgraded)
     assert old == ("entity.created", True, None)
     assert new == ("entity.updated", False, {"actor": pointer})

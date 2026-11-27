@@ -51,6 +51,10 @@ ACTIVITY_GROUPS: tuple[str, ...] = ("label", "changes", "payload", "actor")
 TRANSACTION_GROUPS: tuple[str, ...] = ("actor",)
 """The groups of an ``audit_transaction`` row."""
 
+SCRUB_GROUPS: tuple[str, ...] = ("label", "changes", "payload")
+"""The groups ``privacy.scrub`` erases; it stamps all three together, also
+on a row without a label or payload."""
+
 SALT_LENGTH = 16
 """Bytes of one salt."""
 

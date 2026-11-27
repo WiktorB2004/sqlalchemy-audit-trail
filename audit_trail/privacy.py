@@ -30,6 +30,7 @@ from sqlalchemy import (
     not_,
     null,
     or_,
+    select,
     update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
@@ -39,6 +40,7 @@ from audit_trail.diff import ERASED
 from audit_trail.events import AuditSystem
 from audit_trail.integrity import _schema as integrity_schema
 from audit_trail.integrity._commit import ACTOR_FIELDS as _ACTOR_FIELDS
+from audit_trail.integrity._commit import SCRUB_GROUPS
 from audit_trail.query import _check_collection, _member_of
 from audit_trail.writer import (
     ENVELOPE_VERSION,
@@ -108,9 +110,7 @@ _ERASED_DATA = (
     f"'{{payload}}', {_ERASED_PAYLOAD}, false)"
 )
 
-# The integrity groups each operation erases; scrub always stamps all three
-# together, also for a row without a label or payload.
-_SCRUB_GROUPS = ("label", "changes", "payload")
+# The integrity groups scrub_actor erases.
 _ACTOR_GROUPS = ("actor",)
 
 _ACTOR_KEYS = "ARRAY[" + ", ".join(f"'{key}'" for key in ACTOR_FIELDS) + "]"
@@ -251,7 +251,7 @@ def scrub_statement(
         .values(
             object_label=null(),
             data=erased,
-            **_seal_erased(tables.activity, _SCRUB_GROUPS),
+            **_seal_erased(tables.activity, SCRUB_GROUPS),
         )
     )
 
@@ -311,7 +311,7 @@ def scrub(
         since=since,
         scope_ids=scope_ids,
     )
-    erased = connection.execute(statement).rowcount
+    erased, stamped = _count_stamped(connection, tables.activity, statement)
     _write_record(
         connection,
         tables,
@@ -327,6 +327,7 @@ def scrub(
             "since": None if since is None else since.isoformat(),
             "scope_ids": _recorded(scope_ids),
             "activity_rows": erased,
+            **_stamped_counts(tables, activity_rows=stamped),
         },
     )
     return ScrubResult(activity_rows=erased, transaction_rows=0)
@@ -390,7 +391,9 @@ def scrub_actor(
     if in_scope is not None:
         tx_conditions.append(_all_entries_match(tables, in_scope))
         activity_conditions.append(in_scope)
-    cleared = connection.execute(
+    cleared, cleared_stamped = _count_stamped(
+        connection,
+        transaction,
         update(transaction)
         .where(*tx_conditions)
         .values(
@@ -398,12 +401,14 @@ def scrub_actor(
                 **{name: null() for name in ACTOR_FIELDS},
                 **_seal_erased(transaction, _ACTOR_GROUPS),
             }
-        )
-    ).rowcount
+        ),
+    )
 
     keys = literal_column(_ACTOR_KEYS, ARRAY(Text))
     context = activity.c.data["context"]
-    stripped = connection.execute(
+    stripped, stripped_stamped = _count_stamped(
+        connection,
+        activity,
         update(activity)
         .where(*activity_conditions, context.has_any(keys))
         .values(
@@ -415,8 +420,8 @@ def scrub_actor(
                 type_=JSONB,
             ),
             **_seal_erased(activity, _ACTOR_GROUPS),
-        )
-    ).rowcount
+        ),
+    )
 
     ctx = record.context
     if ctx.actor_id == actor_id:
@@ -436,6 +441,11 @@ def scrub_actor(
             "scope_ids": _recorded(scope_ids),
             "transaction_rows": cleared,
             "activity_rows": stripped,
+            **_stamped_counts(
+                tables,
+                activity_rows=stripped_stamped,
+                transaction_rows=cleared_stamped,
+            ),
         },
     )
     return ScrubResult(activity_rows=stripped, transaction_rows=cleared)
@@ -487,6 +497,38 @@ def _seal_erased(table: Table, groups: Sequence[str]) -> dict[str, ColumnElement
             else_=table.c[integrity_schema.ERASED],
         ),
     }
+
+
+def _count_stamped(
+    connection: Connection, table: Table, statement: Update
+) -> tuple[int, int]:
+    """Run a scrub ``UPDATE``; the rows it changed, and those it stamped.
+
+    Without the integrity columns the second number is ``0`` and the
+    statement runs as it is. With them, the rows written without integrity
+    (``NULL`` ``seal_commitments``) are changed but not stamped, so the
+    verifier needs the stamped number to compare its count of stamps with.
+    """
+    if not integrity_schema.has_integrity(table):
+        return connection.execute(statement).rowcount, 0
+    sealed = table.c[integrity_schema.COMMITMENTS].is_not(None).label("sealed")
+    changed = statement.returning(sealed).cte("changed")
+    counts = connection.execute(
+        select(func.count(), func.count().filter(changed.c.sealed))
+    ).one()
+    return int(counts[0]), int(counts[1])
+
+
+def _stamped_counts(tables: AuditTables, **counts: int) -> dict[str, JSONValue]:
+    """The ``stamped_*`` keys of an ``audit.scrubbed`` payload.
+
+    Only with integrity: each is the number of rows of that table the scrub
+    stamped in ``seal_erased``, which leaves out the rows written without
+    integrity that ``activity_rows`` and ``transaction_rows`` count.
+    """
+    if not integrity_schema.has_integrity(tables.activity):
+        return {}
+    return {f"stamped_{name}": value for name, value in counts.items()}
 
 
 def _recorded(scope_ids: Collection[str] | None) -> JSONValue:

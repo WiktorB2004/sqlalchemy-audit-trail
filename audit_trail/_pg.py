@@ -19,6 +19,9 @@ CHECK_VIOLATION = "23514"
 UNDEFINED_COLUMN = "42703"
 """SQLSTATE of a statement naming a column the table lacks."""
 
+UNDEFINED_TABLE = "42P01"
+"""SQLSTATE of a statement naming a relation that does not exist."""
+
 LOCK_NOT_AVAILABLE = "55P03"
 """SQLSTATE raised when ``lock_timeout`` expires."""
 
@@ -88,6 +91,11 @@ def execute_ddl(connection: Connection, statement: str) -> None:
 def lock_key(block: Table) -> str:
     """Key of the advisory lock that lets one writer of a seal chain run at a time."""
     return f"audit_trail.seal:{block.schema}.{block.name}"
+
+
+def regclass(connection: Connection, table: Table) -> str:
+    """The quoted, schema-qualified name of a table, as ``to_regclass`` takes it."""
+    return connection.dialect.identifier_preparer.format_table(table)
 
 
 def xact_lock(connection: Connection, key: str) -> None:
