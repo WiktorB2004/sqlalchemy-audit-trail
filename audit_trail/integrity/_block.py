@@ -380,7 +380,7 @@ def ack_body(
     )
 
 
-RETIRE_CONTEXT = b"sqlalchemy-audit-trail/retire/v1"
+RETIRE_CONTEXT = context("retire")
 """Domain separation string of a retire block's ``segments_digest``."""
 
 
