@@ -36,9 +36,10 @@ from sqlalchemy import (
     text,
     union_all,
 )
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql.selectable import Subquery
 
+from audit_trail import _pg
 from audit_trail.integrity import _schema
 from audit_trail.integrity._block import (
     ACTIVITY_LEAF_COLUMNS,
@@ -62,8 +63,6 @@ DEFAULT_MAX_ROWS = 50_000
 DEFAULT_MAX_SEAL_LAG = timedelta(minutes=5)
 """Default age past which ``health`` flags unsealed rows and prepared
 transactions."""
-
-_UNIQUE_VIOLATION = "23505"
 
 UNSEALED_ROWS_CAP = 10_000
 """``health`` counts unsealed rows up to this many."""
@@ -168,11 +167,6 @@ class SealHealth:
         return self.started and not lagging and not self.prepared
 
 
-def lock_key(block: Table) -> str:
-    """Key of the advisory lock that lets one sealer of a chain run at a time."""
-    return f"audit_trail.seal:{block.schema}.{block.name}"
-
-
 def block_table(tables: AuditTables) -> Table:
     """The table of sealed blocks of tables built with integrity.
 
@@ -194,10 +188,10 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
     _check_transactional(connection, "write_genesis")
     start = connection.execute(
         text(
-            "SELECT pg_advisory_xact_lock(hashtext(:key)) AS locked, "
+            f"SELECT {_pg.XACT_LOCK} AS locked, "
             "to_regclass(:block) IS NOT NULL AS created"
         ),
-        {"key": lock_key(block), "block": _regclass(connection, block)},
+        {"key": _pg.lock_key(block), "block": _regclass(connection, block)},
     ).one()
     if not start.created:
         raise ValueError(_missing(block))
@@ -214,7 +208,7 @@ def write_genesis(connection: Connection, tables: AuditTables) -> Genesis:
             body = genesis_body(chain, horizon)
             _insert(connection, block, 1, "genesis", ZERO_HASH, body)
     except IntegrityError as exc:
-        if _sqlstate(exc) != _UNIQUE_VIOLATION:
+        if not _pg.is_sqlstate(exc, _pg.UNIQUE_VIOLATION):
             raise
         # Another call committed block 1 after this transaction's snapshot
         # was taken (at REPEATABLE READ), so only a new snapshot sees it.
@@ -311,10 +305,10 @@ def _seal(
         start = connection.execute(
             text(
                 "SELECT pg_is_in_recovery() AS standby, "
-                "pg_try_advisory_xact_lock(hashtext(:key)) AS locked, "
+                f"{_pg.TRY_XACT_LOCK} AS locked, "
                 "pg_snapshot_xmin(pg_current_snapshot())::text AS horizon"
             ),
-            {"key": lock_key(block)},
+            {"key": _pg.lock_key(block)},
         ).one()
         if start.standby:
             return SealResult(0, 0, None, skipped="standby")
@@ -349,7 +343,7 @@ def _seal(
         try:
             _insert(connection, block, seq, "seal", last.block_hash, body)
         except IntegrityError as exc:
-            if _sqlstate(exc) == _UNIQUE_VIOLATION:
+            if _pg.is_sqlstate(exc, _pg.UNIQUE_VIOLATION):
                 raise _StaleSnapshotError from exc
             raise
         return SealResult(1, builder.rows, xid_to, capped=capped)
@@ -428,14 +422,6 @@ def seal_health(
     return SealHealth(
         True, sealed_to, horizon.sealed_at, rows, lag, max_seal_lag, prepared
     )
-
-
-def _sqlstate(exc: DBAPIError) -> str | None:
-    orig = exc.orig
-    sqlstate: str | None = getattr(orig, "sqlstate", None) or getattr(
-        orig, "pgcode", None
-    )
-    return sqlstate
 
 
 def _regclass(connection: Connection, table: Table) -> str:

@@ -792,10 +792,7 @@ def _ensure(
         previous_timeout = _pg.set_config(
             conn, "lock_timeout", lock_timeout, local=True
         )
-    conn.execute(
-        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-        {"key": _lock_key(tables)},
-    )
+    _pg.xact_lock(conn, _lock_key(tables))
     if now is None:
         now = conn.execute(text("SELECT now()")).scalar_one()
     months = _months(now, months_ahead)
@@ -907,16 +904,13 @@ def _drop(
     # statements between backends is caught before it can strand a lock.
     session = _Session(conn)
     session.check()
-    key = {"key": _lock_key(tables)}
+    key = _lock_key(tables)
     previous_timeout: str | None = None
     locked = False
     try:
         if lock_timeout is not None:
             previous_timeout = _set_session(session, "lock_timeout", lock_timeout)
-        pid = conn.execute(
-            text("SELECT pg_backend_pid() FROM pg_advisory_lock(hashtext(:key))"),
-            key,
-        ).scalar_one()
+        pid = _pg.session_lock(conn, key)
         locked = True
         session.check(pid)
         if now is None:
@@ -968,7 +962,7 @@ def _drop(
 
 def _release(
     session: _Session,
-    key: dict[str, str],
+    key: str,
     locked: bool,
     previous_timeout: str | None,
 ) -> bool:
@@ -976,10 +970,8 @@ def _release(
     conn = session.conn
     held = True
     if locked:
-        unlocked, pid = conn.execute(
-            text("SELECT pg_advisory_unlock(hashtext(:key)), pg_backend_pid()"), key
-        ).one()
-        held = bool(unlocked) and pid == session.pid
+        unlocked, pid = _pg.session_unlock(conn, key)
+        held = unlocked and pid == session.pid
     if previous_timeout is not None:
         pid = conn.execute(
             text("SELECT pg_backend_pid() FROM set_config(:name, :value, false)"),

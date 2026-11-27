@@ -29,6 +29,7 @@ from audit_trail import (
     AuditEvent,
     AuditTrail,
     Severity,
+    _pg,
     event,
     migrations,
     testing,
@@ -448,10 +449,7 @@ def test_two_sets_of_tables_in_one_schema_seal_independently(
     own = _seal.block_table(env.trail.tables)
     with env.engine.connect() as holder:
         # The sealer lock of the first chain does not hold the other back.
-        holder.execute(
-            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-            {"key": _seal.lock_key(own)},
-        )
+        _pg.xact_lock(holder, _pg.lock_key(own))
         assert seal(env) == SealResult(0, 0, None, skipped="busy")
         sealed = manager.seal()
         holder.rollback()
