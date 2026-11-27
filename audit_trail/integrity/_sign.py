@@ -24,6 +24,7 @@ the key hash is ``SHA-256(key name || 0x0A || 0x01 || public key)[:4]``.
 from __future__ import annotations
 
 import hashlib
+import unicodedata
 from typing import Protocol, runtime_checkable
 
 ED25519 = "ed25519"
@@ -116,11 +117,23 @@ def split_key_id(key_id: str) -> tuple[str, bytes]:
 def check_key_name(name: str) -> None:
     """Refuse a key name that c2sp.org/signed-note does not allow.
 
+    The spec forbids Unicode spaces and ``+``; control characters (DEL and
+    the C0 and C1 ranges) are refused too, so a name cannot hide in a log
+    or a terminal.
+
     Raises:
-        ValueError: Empty, or with a Unicode space or a ``+``.
+        ValueError: Empty, or with a Unicode space, a control character or
+            a ``+``.
     """
-    if not name or "+" in name or any(c.isspace() for c in name):
-        raise ValueError(f"key name {name!r} must be non-empty, without spaces or '+'")
+    if (
+        not name
+        or "+" in name
+        or any(c.isspace() or unicodedata.category(c) == "Cc" for c in name)
+    ):
+        raise ValueError(
+            f"key name {name!r} must be non-empty, without spaces, control "
+            "characters or '+'"
+        )
 
 
 def block_signature_message(block_hash: bytes) -> bytes:

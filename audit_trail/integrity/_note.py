@@ -11,7 +11,8 @@ read on 2026-11-27):
 - The note is UTF-8 with no ASCII control character but the newline.
 - The text includes its final newline, not the blank line; the text is
   separated from the signatures by the last empty line.
-- A key name is non-empty, with no Unicode space and no ``+``.
+- A key name is non-empty, with no Unicode space and no ``+``; here also no
+  control character (DEL included).
 - A signature is the base64 (RFC 4648 section 4, ``=`` padded, canonical:
   decoders reject other encodings) of the 4-byte big-endian key ID and the
   signature over the text.
@@ -19,7 +20,9 @@ read on 2026-11-27):
   ID (not both); they verify every one of a known key; one that fails
   rejects the note (the spec says SHOULD; here it always does), and a note
   with no verified signature of a known key is rejected. They accept at
-  least 16 signatures; this one stops at ``MAX_SIGNATURES``.
+  least 16 signatures; this one stops at ``MAX_SIGNATURES``. Two
+  signatures of one key (the same name and key ID) make a note malformed,
+  so that no signature can be counted twice.
 
 A note without signatures is not a signed note. ``parse_note`` still reads
 one, a text alone, so that a checkpoint exported without a key can be fed
@@ -136,21 +139,39 @@ def sign_note(text: str, signers: Iterable[Signer]) -> Note:
         signatures.append(
             NoteSignature(name, key_hash, bytes(signer.sign(text.encode())))
         )
+    _check_unique(signatures)
     return Note(text, tuple(signatures))
 
 
 def add_signatures(note: Note, signers: Iterable[Signer]) -> Note:
-    """The note with more signatures over the same text."""
+    """The note with more signatures over the same text.
+
+    Raises:
+        NoteError: ``MALFORMED``: a signer's key signed the note already.
+    """
     more = sign_note(note.text, signers).signatures
+    _check_unique(note.signatures + more)
     return Note(note.text, note.signatures + more)
+
+
+def _check_unique(signatures: Iterable[NoteSignature]) -> None:
+    """Refuse two signatures of one key: the same name and key ID."""
+    seen: set[tuple[str, bytes]] = set()
+    for signature in signatures:
+        key = (signature.name, signature.key_hash)
+        if key in seen:
+            raise NoteError(
+                "MALFORMED", f"two signatures of the key {signature.key_id}"
+            )
+        seen.add(key)
 
 
 def parse_note(note: str) -> Note:
     """Read a note; one without a blank line is a text with no signature.
 
     Raises:
-        NoteError: ``MALFORMED``: not a note in the format, or with more than
-            ``MAX_SIGNATURES`` signatures.
+        NoteError: ``MALFORMED``: not a note in the format, with more than
+            ``MAX_SIGNATURES`` signatures, or with two of one key.
     """
     if not isinstance(note, str):
         raise NoteError("MALFORMED", "a note is text")
@@ -169,6 +190,7 @@ def parse_note(note: str) -> Note:
     signatures = [_signature(line) for line in lines[:-1].split("\n")]
     if len(signatures) > MAX_SIGNATURES:
         raise NoteError("MALFORMED", f"more than {MAX_SIGNATURES} signatures")
+    _check_unique(signatures)
     return Note(text, tuple(signatures))
 
 
@@ -205,9 +227,11 @@ def verify_note(note: Note, verifier: SignatureVerifier) -> list[str]:
     Signatures of keys the verifier does not know are ignored.
 
     Raises:
-        NoteError: ``BAD_SIGNATURE`` when a signature of a known key does
-            not verify; ``UNKNOWN_KEY`` when no signature is of a known key.
+        NoteError: ``MALFORMED`` for two signatures of one key;
+            ``BAD_SIGNATURE`` when a signature of a known key does not
+            verify; ``UNKNOWN_KEY`` when no signature is of a known key.
     """
+    _check_unique(note.signatures)
     verified: list[str] = []
     message = note.text.encode()
     for signature in note.signatures:

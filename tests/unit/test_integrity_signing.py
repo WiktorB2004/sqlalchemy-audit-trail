@@ -116,10 +116,35 @@ def test_a_skey_with_a_wrong_hash_is_refused() -> None:
         Ed25519Signer.from_skey(skey)
 
 
-@pytest.mark.parametrize("name", ["", "a b", "a+b", "a\u00a0b"])
+@pytest.mark.parametrize(
+    "name", ["", "a b", "a+b", "a\u00a0b", "a\x7fb", "a\x00b", "a\x1bb", "a\x85b"]
+)
 def test_key_names_follow_the_spec(name: str) -> None:
     with pytest.raises(ValueError, match="key name"):
         Ed25519Signer.generate(name)
+
+
+@pytest.mark.parametrize("control", ["\x7f", "\x00", "\x1b", "\x9b"])
+def test_a_note_with_a_control_character_in_a_key_name_is_refused(
+    control: str,
+) -> None:
+    note = signed().replace(KEYS[0]["name"], KEYS[0]["name"] + control)
+    with pytest.raises(NoteError) as info:
+        parse_note(note)
+    assert info.value.reason == "MALFORMED"
+
+
+def test_two_keys_with_one_key_id_are_refused() -> None:
+    # Two real Ed25519 keys whose 4-byte key hashes collide (found by a
+    # birthday search over the seeds).
+    first = Ed25519Signer.from_seed("audit.example/k", (36918).to_bytes(32, "big"))
+    second = Ed25519Signer.from_seed("audit.example/k", (72891).to_bytes(32, "big"))
+    assert first.key_id == second.key_id
+    assert first.public_key != second.public_key
+    with pytest.raises(ValueError, match="two different keys"):
+        Ed25519Verifier([first.vkey, second.vkey])
+    # The same key twice is one key.
+    assert Ed25519Verifier([first.vkey, first.vkey]).key_algorithm(first.key_id)
 
 
 # -- block signatures -----------------------------------------------------------
@@ -327,11 +352,38 @@ def test_the_text_may_hold_empty_lines() -> None:
 
 
 def test_at_least_sixteen_signatures_are_read_and_too_many_refused() -> None:
-    many = sign_note("hello\n", [signer(0)] * 16)
+    keys = [
+        Ed25519Signer.from_seed(f"audit.example/k{n}", n.to_bytes(32, "big"))
+        for n in range(MAX_SIGNATURES + 1)
+    ]
+    many = sign_note("hello\n", keys[:16])
     assert len(parse_note(str(many)).signatures) == 16
-    too_many = sign_note("hello\n", [signer(0)] * (MAX_SIGNATURES + 1))
+    too_many = sign_note("hello\n", keys)
     with pytest.raises(NoteError, match="more than"):
         parse_note(str(too_many))
+
+
+def test_two_signatures_of_one_key_are_refused() -> None:
+    note = signed()
+    line = note.split("\n\n")[1]
+    doubled = note + line
+    with pytest.raises(NoteError) as info:
+        parse_note(doubled)
+    assert info.value.reason == "MALFORMED"
+    # Also when the second line carries another signature of the same key.
+    (signature,) = parse_note(note).signatures
+    other = NoteSignature(signature.name, signature.key_hash, bytes(64))
+    with pytest.raises(NoteError) as info:
+        parse_note(str(Note("hello\n", (signature, other))))
+    assert info.value.reason == "MALFORMED"
+    with pytest.raises(NoteError) as info:
+        verify_note(Note("hello\n", (signature, signature)), verifier(0))
+    assert info.value.reason == "MALFORMED"
+    with pytest.raises(NoteError, match="two signatures"):
+        sign_note("hello\n", [signer(0), signer(0)])
+    checkpoint = vector_checkpoint().signed([signer(0)])
+    with pytest.raises(NoteError, match="two signatures"):
+        checkpoint.signed([signer(0)])
 
 
 # -- the optional dependency ---------------------------------------------------

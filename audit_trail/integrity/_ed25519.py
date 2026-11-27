@@ -126,17 +126,21 @@ class Ed25519Verifier:
             by them are still checked.
 
     Raises:
-        ValueError: A key is not an Ed25519 verifier key, or its key hash
-            does not match it.
+        ValueError: A key is not an Ed25519 verifier key, its key hash does
+            not match it, or two keys have one ``key_id`` (a collision of
+            the 4-byte key hash): a signature could not tell them apart.
     """
 
     def __init__(self, vkeys: Iterable[str]) -> None:
         self._keys: dict[str, Ed25519PublicKey] = {}
+        self._material: dict[str, bytes] = {}
         for vkey in vkeys:
             name, key_hash, material = _parts(vkey)
             if note_key_hash(name, _TYPE, material) != key_hash:
                 raise ValueError(f"the key hash of {vkey!r} does not match its key")
             key_id = make_key_id(name, key_hash)
+            if self._material.setdefault(key_id, material) != material:
+                raise ValueError(f"two different keys have the key id {key_id}")
             self._keys[key_id] = Ed25519PublicKey.from_public_bytes(material)
 
     def key_algorithm(self, key_id: str) -> str | None:
