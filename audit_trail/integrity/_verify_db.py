@@ -63,8 +63,6 @@ from audit_trail.tables import AuditTables
 DEFAULT_CHUNK_ROWS = 2_000
 """Rows read per ``READ ONLY`` transaction."""
 
-_BLOCK_CHUNK = 1_000
-
 _XMAX = text("SELECT pg_snapshot_xmax(pg_current_snapshot())::text")
 
 
@@ -301,7 +299,7 @@ def _blocks(conn: Connection, block: Table) -> Iterator[StoredBlock]:
                 )
                 .where(block.c.seq > after)
                 .order_by(block.c.seq)
-                .limit(_BLOCK_CHUNK)
+                .limit(_schema.BLOCK_CHUNK_ROWS)
             ).all()
         for row in rows:
             yield StoredBlock(
@@ -312,7 +310,7 @@ def _blocks(conn: Connection, block: Table) -> Iterator[StoredBlock]:
                 bytes(row.block_hash),
                 row.sealed_at,
             )
-        if len(rows) < _BLOCK_CHUNK:
+        if len(rows) < _schema.BLOCK_CHUNK_ROWS:
             return
         after = int(rows[-1].seq)
 

@@ -97,8 +97,6 @@ from audit_trail.tables import AuditTables
 
 logger = logging.getLogger("audit_trail.maintenance")
 
-_SCAN_CHUNK = 1_000
-
 _DDL_SKIPS: dict[str, SkipReason] = {
     _pg.LOCK_NOT_AVAILABLE: "lock_not_available",
     _pg.OBJECT_NOT_IN_PREREQUISITE_STATE: "detach_pending",
@@ -452,7 +450,7 @@ class Retirer:
                 )
                 .where(block.c.seq > after)
                 .order_by(block.c.seq)
-                .limit(_SCAN_CHUNK)
+                .limit(_schema.BLOCK_CHUNK_ROWS)
             )
             if conn is None:
                 with _pg.read_only(self.conn):
@@ -483,7 +481,7 @@ class Retirer:
                     None,
                     [Segment(s.stream, s.partition, s.rows, s.root) for s in parsed],
                 )
-            if len(rows) < _SCAN_CHUNK:
+            if len(rows) < _schema.BLOCK_CHUNK_ROWS:
                 return
 
 

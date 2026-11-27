@@ -47,6 +47,9 @@ XID_DEFAULT = "pg_current_xact_id()"
 DEFAULT_CHUNK_ROWS = 2_000
 """Audit rows fetched per round trip by the readers that stream them."""
 
+BLOCK_CHUNK_ROWS = 1_000
+"""Blocks read per page by the readers that page through the block table."""
+
 
 def columns() -> list[Column[Any]]:
     """New ``Column`` objects for one audit table.
