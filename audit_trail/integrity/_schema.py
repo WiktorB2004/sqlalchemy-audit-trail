@@ -44,6 +44,9 @@ INTEGRITY_COLUMNS: tuple[str, ...] = (XID, *SEAL_COLUMNS)
 XID_DEFAULT = "pg_current_xact_id()"
 """Default of the ``xid`` column."""
 
+DEFAULT_CHUNK_ROWS = 2_000
+"""Audit rows fetched per round trip by the readers that stream them."""
+
 
 def columns() -> list[Column[Any]]:
     """New ``Column`` objects for one audit table.

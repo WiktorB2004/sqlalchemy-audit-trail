@@ -68,9 +68,6 @@ transactions."""
 UNSEALED_ROWS_CAP = 10_000
 """``health`` counts unsealed rows up to this many."""
 
-# Rows fetched per round trip while streaming a block's rows.
-_CHUNK = 2_000
-
 SealRefusal = Literal["XID_REWIND", "NO_GENESIS"]
 
 
@@ -560,7 +557,9 @@ def _rows(
             .where(xid >= lower, xid < upper)
             .order_by(xid, table.c.id)
         )
-        result = connection.execute(statement, execution_options={"yield_per": _CHUNK})
+        result = connection.execute(
+            statement, execution_options={"yield_per": _schema.DEFAULT_CHUNK_ROWS}
+        )
         for row in result.mappings():
             partition = names[int(row["tableoid"])]
             if table is tables.transaction:
