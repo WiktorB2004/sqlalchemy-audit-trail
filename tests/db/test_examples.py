@@ -382,7 +382,6 @@ BACKDATE = (
 
 class IntegrityRolesEvent(AuditEvent):
     CHECKED = event("docs_integrity_roles.checked", Severity.NOTICE)
-    ALERTED = event("docs_integrity_roles.alerted", Severity.CRITICAL)
 
 
 def denied(eng: Engine, *statements: str) -> None:
@@ -538,7 +537,6 @@ def test_roles_sql_with_integrity_grants_what_each_role_needs(
         assert write_genesis(conn, maintenance.tables, signer=SIGNER).created
     write_gadget(app, factory, "sealed")
     with factory() as session:
-        app.log(session, IntegrityRolesEvent.ALERTED, durable=True)
         assert len(app.query.object_history(session, "Gadget", "1").groups) == 6
     assert app.maintenance.health().seal is not None
     # ... and nothing else.
