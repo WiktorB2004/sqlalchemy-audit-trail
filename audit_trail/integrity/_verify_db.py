@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -76,7 +75,7 @@ class _Leaf:
 
 
 @dataclass(frozen=True)
-class _Options:
+class VerifyOptions:
     """What a run takes besides the connection and the tables."""
 
     streams: dict[str, timedelta | None] | None
@@ -91,13 +90,13 @@ def _options(
     transaction_retention: timedelta | None,
     system_severity: int | None,
     chunk_rows: int,
-) -> _Options:
+) -> VerifyOptions:
     if chunk_rows < 1:
         raise ValueError("chunk_rows must be at least 1")
     streams = None
     if retention is not None:
         streams = stream_retention(retention, transaction_retention)
-    return _Options(streams, system_severity, chunk_rows)
+    return VerifyOptions(streams, system_severity, chunk_rows)
 
 
 def verify(
@@ -151,7 +150,7 @@ def verify(
     options = _options(retention, transaction_retention, system_severity, chunk_rows)
     block = block_table(tables)
     with engine.connect() as conn:
-        return _verify(conn, tables, block, options)
+        return run_verification(conn, tables, block, options)
 
 
 async def averify(
@@ -178,7 +177,7 @@ async def averify(
     block = block_table(tables)
     async with engine.connect() as conn:
         return await conn.run_sync(
-            lambda sync_conn: _verify(sync_conn, tables, block, options)
+            lambda sync_conn: run_verification(sync_conn, tables, block, options)
         )
 
 
@@ -186,8 +185,8 @@ class _Vanished(Exception):
     """A partition in the catalog read was gone when its rows were read."""
 
 
-def _verify(
-    conn: Connection, tables: AuditTables, block: Table, options: _Options
+def run_verification(
+    conn: Connection, tables: AuditTables, block: Table, options: VerifyOptions
 ) -> VerificationReport:
     """One run, read again from the catalog once if a partition vanishes.
 
@@ -197,7 +196,7 @@ def _verify(
     block. A partition that vanishes during the second run is not retried:
     it is reported as absent, like one dropped before the run.
     """
-    with _read_only(conn):
+    with _pg.read_only(conn):
         subscribed = conn.execute(
             text(f"SELECT {_pg.SUBSCRIBED}"), {"table": _pg.regclass(conn, block)}
         ).scalar_one()
@@ -219,7 +218,7 @@ def _run(
     conn: Connection,
     tables: AuditTables,
     block: Table,
-    options: _Options,
+    options: VerifyOptions,
     *,
     retry: bool,
 ) -> VerificationReport:
@@ -227,7 +226,7 @@ def _run(
     # after its retire block was read is still listed, and its read is
     # retried. The chain before the horizon: every seal block read ends at
     # or below an xmin taken after it.
-    with _read_only(conn):
+    with _pg.read_only(conn):
         leaves, detached = _catalog(conn, tables)
     blocks = _blocks(conn, block)
     first = next(blocks, None)
@@ -242,7 +241,7 @@ def _run(
         system_severity=options.system_severity,
         count_scrubs=options.partitions is None,
     )
-    with _read_only(conn):
+    with _pg.read_only(conn):
         horizon, xmax = (
             int(value)
             for value in conn.execute(
@@ -269,7 +268,7 @@ def _run(
             verifier.check_partition(
                 leaf.partition, _rows(conn, table, options.chunk_rows, verifier)
             )
-            with _read_only(conn):
+            with _pg.read_only(conn):
                 nulls = conn.execute(
                     select(func.count())
                     .select_from(table)
@@ -286,23 +285,11 @@ def _run(
     return verifier.report()
 
 
-@contextmanager
-def _read_only(conn: Connection) -> Iterator[Connection]:
-    """A short ``READ ONLY`` transaction on a connection."""
-    transaction = conn.begin()
-    try:
-        conn.execute(text("SET TRANSACTION READ ONLY"))
-        yield conn
-    finally:
-        # Nothing was written; ending it either way releases the snapshot.
-        transaction.rollback()
-
-
 def _blocks(conn: Connection, block: Table) -> Iterator[StoredBlock]:
     """Every block in ``seq`` order, in chunks of short transactions."""
     after = 0
     while True:
-        with _read_only(conn):
+        with _pg.read_only(conn):
             rows = conn.execute(
                 select(
                     block.c.seq,
@@ -388,7 +375,7 @@ def _rows(
                 )
             )
         statement = statement.order_by(xid, row_id).limit(chunk_rows)
-        with _read_only(conn):
+        with _pg.read_only(conn):
             rows = [dict(row) for row in conn.execute(statement).mappings()]
             xmax = conn.execute(_XMAX).scalar_one()
         verifier.observe_xmax(int(xmax))
@@ -458,7 +445,7 @@ def acknowledge(
             "acknowledge runs its own transaction; pass a connection that is "
             "not in a transaction"
         )
-    report = _verify(connection, tables, block, options)
+    report = run_verification(connection, tables, block, options)
     wanted = Ack(0, failure, checked)
     pins = {pin_key(f): pin(f) for f in report.failures if wanted.in_scope(f)}
     if not pins:

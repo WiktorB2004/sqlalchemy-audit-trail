@@ -191,7 +191,7 @@ def append_block(env: Env, kind: str, make_body: Any) -> int:
 def sealed_to(env: Env) -> int:
     block = _seal.block_table(env.trail.tables)
     with env.engine.connect() as conn:
-        found = _seal._sealed_to(conn, block)
+        found = _seal.sealed_horizon(conn, block)
     assert found is not None
     return found[1]
 

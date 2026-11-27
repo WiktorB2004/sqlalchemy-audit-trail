@@ -321,7 +321,7 @@ def _seal(
             return SealResult(0, 0, None, skipped="busy")
         horizon = int(start.horizon)
         last = last_block(connection, block)
-        sealed = _sealed_to(connection, block)
+        sealed = sealed_horizon(connection, block)
         if last is None or sealed is None:
             raise SealRefusedError(
                 "NO_GENESIS",
@@ -465,7 +465,7 @@ def last_block(connection: Connection, block: Table) -> Any:
     ).one_or_none()
 
 
-def _sealed_to(connection: Connection, block: Table) -> tuple[str, int] | None:
+def sealed_horizon(connection: Connection, block: Table) -> tuple[str, int] | None:
     """The chain id and the horizon of the newest genesis or seal block."""
     body = connection.execute(
         select(block.c.body)

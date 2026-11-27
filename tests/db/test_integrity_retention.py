@@ -291,7 +291,7 @@ def test_a_partition_dropped_without_a_retire_block_is_segment_missing(
     block = _seal.block_table(tables)
     with engine.begin() as conn:
         last = _seal.last_block(conn, block)
-        chain = _seal._sealed_to(conn, block)
+        chain = _seal.sealed_horizon(conn, block)
         assert chain is not None
         body = retire_body(
             chain[0],
@@ -556,7 +556,7 @@ def test_a_detached_table_under_a_forged_retire_block_is_kept(
     block = _seal.block_table(tables)
     with engine.begin() as conn:
         last = _seal.last_block(conn, block)
-        chain = _seal._sealed_to(conn, block)
+        chain = _seal.sealed_horizon(conn, block)
         assert chain is not None
         seq = int(last.seq) + 1
         # It claims the partition held nothing; the chain sealed a row of it.

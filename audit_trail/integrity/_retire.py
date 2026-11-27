@@ -74,18 +74,17 @@ from audit_trail.integrity._block import (
 )
 from audit_trail.integrity._codec import rfc3339
 from audit_trail.integrity._seal import (
-    _sealed_to,
     block_table,
     last_block,
     seal,
+    sealed_horizon,
 )
 from audit_trail.integrity._types import Xid8
 from audit_trail.integrity._verify import ACTIVITY, TRANSACTION, FailureKind
 from audit_trail.integrity._verify_db import (
     DEFAULT_CHUNK_ROWS,
-    _Options,
-    _read_only,
-    _verify,
+    VerifyOptions,
+    run_verification,
 )
 from audit_trail.maintenance import (
     LOCK_NOT_AVAILABLE,
@@ -235,8 +234,8 @@ class Retirer:
         self._scan()
         if not self._verify_before_drop or not children:
             return
-        options = _Options(None, None, DEFAULT_CHUNK_ROWS, frozenset(self._wanted))
-        report = _verify(self.conn, self._tables, self._block, options)
+        options = VerifyOptions(None, None, DEFAULT_CHUNK_ROWS, frozenset(self._wanted))
+        report = run_verification(self.conn, self._tables, self._block, options)
         # A pending detach is what this call finishes; an orphan, what it
         # drops.
         pending = {child.name for child in children if child.pending}
@@ -279,12 +278,9 @@ class Retirer:
         with conn.begin():
             conn.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             # Waits for a running sealer; later statements see its block.
-            conn.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-                {"key": _pg.lock_key(block)},
-            )
+            _pg.xact_lock(conn, _pg.lock_key(block))
             last = last_block(conn, block)
-            sealed = _sealed_to(conn, block)
+            sealed = sealed_horizon(conn, block)
             if last is None or sealed is None:
                 raise ValueError(
                     f"{block.fullname} has no genesis block; run "
@@ -377,9 +373,9 @@ class Retirer:
     def check_detached(self, child: _Child) -> bool:
         """Whether the detached ``child`` is wholly covered by its retire block."""
         conn = self.conn
-        with _read_only(conn):
+        with _pg.read_only(conn):
             self._scan(conn)
-            sealed = _sealed_to(conn, self._block)
+            sealed = sealed_horizon(conn, self._block)
             unsealed = sealed is not None and self._unsealed(conn, child, sealed[1])
         retired = self._retired.get(child.name)
         later = retired is not None and any(
@@ -461,7 +457,7 @@ class Retirer:
                 .limit(_SCAN_CHUNK)
             )
             if conn is None:
-                with _read_only(self.conn):
+                with _pg.read_only(self.conn):
                     rows = self.conn.execute(statement).all()
             else:
                 rows = conn.execute(statement).all()
