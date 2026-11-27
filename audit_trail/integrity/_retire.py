@@ -87,8 +87,6 @@ from audit_trail.integrity._verify_db import (
     run_verification,
 )
 from audit_trail.maintenance import (
-    LOCK_NOT_AVAILABLE,
-    OBJECT_NOT_IN_PREREQUISITE_STATE,
     PartitionError,
     SkippedPartition,
     SkipReason,
@@ -102,8 +100,8 @@ logger = logging.getLogger("audit_trail.maintenance")
 _SCAN_CHUNK = 1_000
 
 _DDL_SKIPS: dict[str, SkipReason] = {
-    LOCK_NOT_AVAILABLE: "lock_not_available",
-    OBJECT_NOT_IN_PREREQUISITE_STATE: "detach_pending",
+    _pg.LOCK_NOT_AVAILABLE: "lock_not_available",
+    _pg.OBJECT_NOT_IN_PREREQUISITE_STATE: "detach_pending",
 }
 
 

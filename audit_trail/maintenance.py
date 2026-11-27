@@ -97,7 +97,7 @@ if TYPE_CHECKING:
 LOCK_NOT_AVAILABLE = _pg.LOCK_NOT_AVAILABLE
 """SQLSTATE raised when ``lock_timeout`` expires."""
 
-OBJECT_NOT_IN_PREREQUISITE_STATE = "55000"
+OBJECT_NOT_IN_PREREQUISITE_STATE = _pg.OBJECT_NOT_IN_PREREQUISITE_STATE
 """SQLSTATE of a ``DETACH`` while a detach from the same parent is pending."""
 
 logger = logging.getLogger(__name__)

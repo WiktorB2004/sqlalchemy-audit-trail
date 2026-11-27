@@ -27,6 +27,9 @@ UNDEFINED_TABLE = "42P01"
 LOCK_NOT_AVAILABLE = "55P03"
 """SQLSTATE raised when ``lock_timeout`` expires."""
 
+OBJECT_NOT_IN_PREREQUISITE_STATE = "55000"
+"""SQLSTATE of a ``DETACH`` while a detach from the same parent is pending."""
+
 
 XACT_LOCK = "pg_advisory_xact_lock(hashtext(:key))"
 """SQL that waits for the transaction-level advisory lock named by ``:key``."""
