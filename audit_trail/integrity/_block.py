@@ -25,6 +25,10 @@ stores it exactly as hashed::
 The first block is a ``genesis`` block with ``prev_hash`` of 32 zero bytes.
 Hashes inside a body are base64, as in ``seal_commitments``.
 
+A ``checkpoint`` block records that a checkpoint naming it was exported
+(``_checkpoint``). A ``fork`` block starts a new incarnation of the chain
+after a restore (``_anchor.declare_fork``).
+
 A ``retire`` block is written before a partition is dropped. It names the
 partition, its table and streams, and covers every segment of it in the
 seal blocks before it: their seal range, count, rows and a digest of them

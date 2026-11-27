@@ -40,11 +40,26 @@ What it checks:
   is lower, and for a row whose ``xid`` is at or above the ``xmax`` of the
   snapshot that read it (a row from the future).
 
+- Signatures, given a ``SignatureVerifier``: a signed block by an unknown
+  key is ``UNKNOWN_KEY``, one that does not verify ``BAD_SIGNATURE``, and
+  with ``require_signatures`` so is an unsigned one.
+- Trusted checkpoints (``_checkpoint``): ``TRUNCATED`` when the chain ends
+  below one, ``CHAIN_MISMATCH`` when its block has another hash, a
+  ``FORKED`` note instead when a signed fork block explains it. A match
+  makes the report ``ANCHORED``; the blocks after the newest match are an
+  ``UNANCHORED_TAIL`` note.
+
 Rows are judged per *incarnation* of the chain: an ``xid`` below its
 ``enforce_from`` is ``PRE_GENESIS``, one at or above its sealed horizon is
 in the ``UNSEALED_TAIL``, and anything between belongs to one of its seal
-blocks. There is one incarnation until forks exist; ``Incarnation`` holds
-what a fork will add (an ``id`` window).
+blocks. The genesis block starts the first incarnation, and each ``fork``
+block the next one (a ``FORKED`` note). A fork with an id window
+(``id_floor``, after ``pg_restore`` into a new cluster, whose transaction
+ids start low again) splits the rows by ``id``: those at or below the floor
+belong to the incarnations before it, which it caps there, and those above
+to the new one, in a new xid space. A row of an earlier xid space is never
+"from the future", and a row left past the last seal of an incarnation a
+fork closed is ``ROW_COUNT_MISMATCH``.
 
 ``ack`` blocks waive failures of one kind in a scope, each pinned as it was
 observed (``pin``); such a failure is reported as an ``ACKNOWLEDGED`` note
@@ -1148,16 +1163,18 @@ class Verifier:
     def incarnation_of(self, stream: str, row_id: int, xid: int) -> Incarnation | None:
         """The incarnation a row belongs to.
 
-        Of those whose ``id`` window holds the row (several, when forks
-        without an id window share one), the last one that starts at or
-        below its ``xid``; the first one when none does, for which the row
-        is ``PRE_GENESIS``.
+        The first incarnation whose ``id`` window holds the row; forks
+        without an id window share one window in one xid space, and of
+        those the last one that starts at or below the row's ``xid``. The
+        first when none does, for which the row is ``PRE_GENESIS``.
         """
         chosen: Incarnation | None = None
         for incarnation in self.incarnations:
             if not incarnation.holds(stream, row_id):
                 continue
-            if chosen is None or incarnation.enforce_from <= xid:
+            if chosen is None or (
+                incarnation.space == chosen.space and incarnation.enforce_from <= xid
+            ):
                 chosen = incarnation
         return chosen
 
