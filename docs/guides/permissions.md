@@ -61,7 +61,7 @@ The scrub-only role gets the same `INSERT` columns, and `UPDATE` of the two colu
 --8<-- "examples/roles.sql:integrity-scrubber"
 ```
 
-The sealer reads the audit tables and appends blocks; it never updates or deletes anything. `export_checkpoint(require_replicated=True)` needs `pg_monitor`, since the standbys' WAL positions in `pg_stat_replication` are hidden from other roles; leave the grant out if you do not use it:
+The sealer reads the audit tables and appends blocks; it never updates or deletes anything. `export_checkpoint(require_replicated=True)` needs `pg_monitor`, since the standbys' `sync_state` and WAL positions in `pg_stat_replication` are hidden from other roles: without it, every such export fails with `NO_SYNC_STANDBY`. Leave the grant out if you do not use it. On a managed service, whether you may grant `pg_monitor` depends on the provider; some let only their own admin role grant it:
 
 ```sql
 --8<-- "examples/roles.sql:sealer"
@@ -80,6 +80,8 @@ The verifier only reads. `verify()` reads each partition by name, and PostgreSQL
 | `audit_sealer` | `seal()`, `health()`, `export_checkpoint()`, `declare_fork()` | update or delete blocks or entries, insert entries |
 | `audit_verifier` | `verify()`, `health()` | write anything |
 | `audit_maintenance` | as before, plus `write_genesis()`, retire blocks in `drop_expired()`, `acknowledge()` | (owner of the tables) |
+
+After a `pg_restore`, the tables must be owned by `audit_maintenance` again, and the `ALTER DEFAULT PRIVILEGES FOR ROLE audit_maintenance` above must be run by a member of that role; see [restores](integrity.md#restores-and-forks).
 
 Nobody gets `UPDATE` or `DELETE` on `audit_seal_block`. The maintenance role owns it, like the audit tables, so it could change both: run the sealer under its own role, and see the [limitations](../limitations.md#tamper-evidence) for what a table owner or superuser can still do.
 

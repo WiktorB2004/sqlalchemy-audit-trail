@@ -90,6 +90,10 @@ The tables rely on PostgreSQL's declarative partitioning, `jsonb` and `inet`; Po
 
 The log stores diffs, not copies of rows. It cannot answer "which records had status X on date D" in one query, and the library has no function to rebuild or revert a record's state. Excluded, redacted, hashed, scrubbed and `"<unknown>"` values could not be restored from the log in any case.
 
+## Maintenance behind transaction pooling
+
+`drop_expired()` takes a session-level advisory lock and sets a session `lock_timeout`, in `AUTOCOMMIT`. Behind PgBouncer in transaction mode the unlock and the reset reach other server connections, so the lock leaks and later `drop_expired()` and `ensure_partitions()` calls time out. Run the maintenance job on a direct or session-pooled connection (see [PgBouncer](guides/integrity.md#pgbouncer)).
+
 ## Tamper evidence
 
 [Integrity](guides/integrity.md) makes the log tamper-evident, not tamper-proof: it detects changes, it does not prevent them, and it proves what the application wrote, not that it was true. What it detects, with the [roles](guides/permissions.md#with-integrity) of `examples/roles.sql`:
@@ -121,3 +125,6 @@ Accepted risks, by design:
 - **Seal lag is measured from event time.** `health()` measures an unsealed entry's age from its `issued_at` / `created_at`, not from its commit, so a transaction that ran longer than `max_seal_lag` is flagged once it commits, until the next seal.
 - **An unsigned fork can only add notes.** A fork block that no key known to the verifier signed never explains a checkpoint that diverges from the chain: such a checkpoint still fails as `TRUNCATED` or `CHAIN_MISMATCH`. Sign forks with the same key as the blocks.
 - **The table owner can drop or truncate.** `TRUNCATE` or `DROP` by the owner is detected (missing segments), not prevented.
+- **A restored chain is sealed on silently.** After a point-in-time recovery, or `pg_resetwal --epoch` after a `pg_restore`, the transaction ids still move forward, so nothing refuses to go on sealing into the restored block table. Only a checkpoint stored before the restore shows the divergence; declare a fork after every such restore (see [restores and forks](guides/integrity.md#restores-and-forks)).
+- **Verify on the publisher.** On a logical replication subscriber of the block table, `seal()` skips and `verify()` raises: the rows carry the publisher's transaction ids.
+- **One sealer has a ceiling.** Sealing is bound by the sealer's CPU (see [sizing](guides/integrity.md#sizing)). When writers outpace it, every call is capped and the backlog grows; `health()` reports the lag.
