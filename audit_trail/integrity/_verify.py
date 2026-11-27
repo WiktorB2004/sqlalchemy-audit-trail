@@ -58,7 +58,7 @@ from __future__ import annotations
 import bisect
 import hmac
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -80,6 +80,7 @@ from audit_trail.integrity._block import (
     transaction_leaf_row,
 )
 from audit_trail.integrity._canonical import CanonicalEncodingError
+from audit_trail.integrity._checkpoint import Checkpoint
 from audit_trail.integrity._codec import b64, decode_strict, is_int, parse_rfc3339
 from audit_trail.integrity._commit import (
     ACTIVITY_GROUPS,
@@ -92,6 +93,11 @@ from audit_trail.integrity._commit import (
     transaction_groups,
 )
 from audit_trail.integrity._merkle import MerkleTree
+from audit_trail.integrity._note import NoteError
+from audit_trail.integrity._sign import (
+    SignatureVerifier,
+    block_signature_message,
+)
 
 ERASED_VALUE = "[erased]"
 """The marker a scrub writes; the same as ``audit_trail.diff.ERASED``."""
@@ -284,6 +290,9 @@ class StoredBlock:
         prev_hash: The stored ``prev_hash``.
         block_hash: The stored ``block_hash``.
         sealed_at: When it was written.
+        signature: The stored ``signature``; ``None`` unsigned.
+        key_id: The stored ``key_id``.
+        alg: The stored ``alg``.
     """
 
     seq: int
@@ -292,6 +301,9 @@ class StoredBlock:
     prev_hash: bytes
     block_hash: bytes
     sealed_at: datetime
+    signature: bytes | None = None
+    key_id: str | None = None
+    alg: str | None = None
 
 
 @dataclass(frozen=True)
@@ -308,13 +320,18 @@ class Incarnation:
     """One run of the chain between forks.
 
     Attributes:
-        number: 1 for the chain started by the genesis block.
-        enforce_from: Rows with a lower ``xid`` are out of its scope.
+        number: 1 for the chain started by the genesis block, then one more
+            for each fork block.
+        enforce_from: Rows with a lower ``xid`` are out of its scope: the
+            genesis block's ``enforce_from``, or the fork's ``xid_at_fork``.
         seals: Its seal blocks, in order; their ranges are contiguous.
         id_floor: Rows of a stream with ``id`` at or below this belong to an
-            earlier incarnation; none until forks exist.
+            earlier incarnation; set by a fork with an id window.
         id_ceiling: Rows of a stream with ``id`` above this belong to a later
-            incarnation; none until forks exist.
+            incarnation; set by the next fork with an id window.
+        space: ``number`` of the first incarnation of its xid space. A fork
+            with an id window starts a new one (the restored cluster counts
+            xids from low again); a fork without one keeps the space.
     """
 
     number: int
@@ -322,6 +339,7 @@ class Incarnation:
     seals: list[Seal] = field(default_factory=list)
     id_floor: dict[str, int] | None = None
     id_ceiling: dict[str, int] | None = None
+    space: int = 1
 
     @property
     def sealed_to(self) -> int:
@@ -694,6 +712,14 @@ class _PartitionState:
 
 
 @dataclass(frozen=True)
+class _Fork:
+    """A valid fork block: its number and its prior checkpoint's."""
+
+    seq: int
+    prior_seq: int
+
+
+@dataclass(frozen=True)
 class _Record:
     xid: int
     id: int
@@ -729,6 +755,13 @@ class Verifier:
             stamps. ``False`` for a run that reads only some partitions
             (``skip_partition`` for the others), where neither count is
             whole.
+        signatures: Checks the signatures of signed blocks: one by a key it
+            does not know is ``UNKNOWN_KEY``, one that does not verify
+            ``BAD_SIGNATURE``. ``None`` checks none.
+        require_signatures: Every block must be signed (``BAD_SIGNATURE``
+            for one that is not); for a chain whose writers all sign.
+        checkpoints: Trusted checkpoints to check the chain against; see
+            ``report``.
     """
 
     def __init__(
@@ -740,7 +773,25 @@ class Verifier:
         retention: Mapping[str, timedelta | None] | None = None,
         system_severity: int | None = None,
         count_scrubs: bool = True,
+        signatures: SignatureVerifier | None = None,
+        require_signatures: bool = False,
+        checkpoints: Sequence[Checkpoint] = (),
     ) -> None:
+        if require_signatures and signatures is None:
+            raise ValueError("require_signatures needs a signature verifier")
+        self._signatures = signatures
+        self._require_signatures = require_signatures
+        self.signed: set[int] = set()
+        """Blocks whose signature verified with a known key."""
+        self._checkpoints = tuple(checkpoints)
+        self._chain_id: str | None = None
+        # Stored hashes of the blocks the checkpoints name.
+        self._hashes: dict[int, bytes] = {}
+        # Hashes of the blocks a fork may name as its prior checkpoint.
+        self._anchors: dict[int, bytes] = {}
+        self._forks: list[_Fork] = []
+        # Seal block -> the incarnation it belongs to.
+        self._seal_owner: dict[int, int] = {}
         self._count_scrubs = count_scrubs
         self._failures: list[Finding] = []
         self._notes: list[Finding] = []
@@ -779,9 +830,11 @@ class Verifier:
     def _chain(self, blocks: Iterable[StoredBlock]) -> None:
         previous: bytes | None = None
         chain: str | None = None
-        incarnation: Incarnation | None = None
+        wanted = {checkpoint.seq for checkpoint in self._checkpoints}
         for number, block in enumerate(blocks, start=1):
             self._last_seq = block.seq
+            if block.seq in wanted:
+                self._hashes[block.seq] = block.block_hash
             expected_prev = ZERO_HASH if previous is None else previous
             if block.prev_hash != expected_prev:
                 self._fail(
@@ -798,18 +851,70 @@ class Verifier:
                     seq=block.seq,
                 )
             previous = block.block_hash
+            self._check_signature(block)
             body = self._body(block, number, chain)
             if body is None:
                 continue
             if number == 1:
-                chain = str(body["chain"])
-                incarnation = Incarnation(1, int(body["enforce_from"]))
-                self.incarnations.append(incarnation)
+                chain = self._chain_id = str(body["chain"])
+                self.incarnations.append(Incarnation(1, int(body["enforce_from"])))
+                self._anchors[block.seq] = block.block_hash
                 continue
-            assert incarnation is not None
-            self._read(block, body, incarnation)
+            if not self.incarnations:
+                # Block 1 was malformed: nothing after it can be read.
+                continue
+            self._read(block, body, self.incarnations[-1])
         if not self.incarnations:
             raise ValueError("the chain has no genesis block")
+
+    def _check_signature(self, block: StoredBlock) -> None:
+        """``UNKNOWN_KEY`` or ``BAD_SIGNATURE`` for a block's signature.
+
+        The signature is over ``block_signature_message(block_hash)`` of the
+        stored hash; a block whose hash does not match its body already fails
+        with ``HASH_MISMATCH``.
+        """
+        verifier = self._signatures
+        columns = (block.signature, block.key_id, block.alg)
+        if verifier is None:
+            return
+        if all(column is None for column in columns):
+            if self._require_signatures:
+                self._fail(
+                    FailureKind.BAD_SIGNATURE, "the block is not signed", seq=block.seq
+                )
+            return
+        if block.signature is None or block.key_id is None or block.alg is None:
+            self._fail(
+                FailureKind.BAD_SIGNATURE,
+                "the block has a partial signature",
+                seq=block.seq,
+            )
+            return
+        algorithm = verifier.key_algorithm(block.key_id)
+        if algorithm is None:
+            self._fail(
+                FailureKind.UNKNOWN_KEY,
+                f"the block is signed by an unknown key {block.key_id}",
+                seq=block.seq,
+            )
+            return
+        try:
+            message = block_signature_message(block.block_hash)
+        except ValueError:
+            message = b""
+        if (
+            algorithm != block.alg
+            or not message
+            or not verifier.verify(block.key_id, algorithm, message, block.signature)
+        ):
+            self._fail(
+                FailureKind.BAD_SIGNATURE,
+                f"the signature by {block.key_id} does not verify",
+                seq=block.seq,
+            )
+            return
+        self.signed.add(block.seq)
 
     def _body(
         self, block: StoredBlock, number: int, chain: str | None
@@ -865,6 +970,7 @@ class Verifier:
                 malformed("the seal block has malformed segments")
                 return
             incarnation.seals.append(Seal(block.seq, xid_from, xid_to))
+            self._seal_owner[block.seq] = incarnation.number
             for segment in parsed:
                 self._segments.setdefault(segment.partition, {})[
                     (segment.seq, segment.stream)
@@ -882,9 +988,82 @@ class Verifier:
         elif kind == "retire":
             self._read_retire(block, body)
         elif kind == "checkpoint":
-            pass
+            if not is_int(body.get("xid_to")):
+                malformed("the checkpoint block has no xid_to")
+                return
+            self._anchors[block.seq] = block.block_hash
+        elif kind == "fork":
+            self._read_fork(block, body, incarnation)
         else:
             malformed(f"{kind!r} blocks are not supported by this verifier")
+
+    def _read_fork(
+        self, block: StoredBlock, body: Mapping[str, Any], current: Incarnation
+    ) -> None:
+        """Start the next incarnation, as a valid fork block declares it.
+
+        The fork must be the next incarnation and name a genesis, checkpoint
+        or fork block before it, with its hash, as its prior checkpoint. A
+        fork with an id window (``id_floor``) caps every incarnation of the
+        current xid space at the floor, and the new one starts above it, in
+        a new xid space; one without continues the xid space, and must not
+        start below where the current incarnation is sealed to.
+        """
+
+        def malformed(why: str) -> None:
+            self._fail(FailureKind.MALFORMED_BLOCK, why, seq=block.seq)
+
+        number, reason = body.get("incarnation"), body.get("reason")
+        prior, xid_at_fork = body.get("prior_checkpoint"), body.get("xid_at_fork")
+        if number != current.number + 1 or not isinstance(reason, str):
+            malformed("the fork block does not start the next incarnation")
+            return
+        if not is_int(xid_at_fork) or xid_at_fork < 0:
+            malformed("the fork block has no valid xid_at_fork")
+            return
+        prior_seq = prior.get("seq") if isinstance(prior, Mapping) else None
+        prior_hash = (
+            decode_strict(prior.get("block_hash"), 32)
+            if isinstance(prior, Mapping)
+            else None
+        )
+        if (
+            not is_int(prior_seq)
+            or prior_hash is None
+            or self._anchors.get(prior_seq) != prior_hash
+        ):
+            malformed("the fork block names no checkpoint of this chain before it")
+            return
+        try:
+            floors = _id_window(body.get("id_floor"), body.get("id_count"))
+        except ValueError:
+            malformed("the fork block has no valid id_floor and id_count")
+            return
+        if floors is None and xid_at_fork < current.sealed_to:
+            malformed("a fork without an id window starts below the sealed horizon")
+            return
+        if floors is None:
+            started = Incarnation(
+                current.number + 1,
+                xid_at_fork,
+                id_floor=current.id_floor,
+                space=current.space,
+            )
+        else:
+            for earlier in self.incarnations:
+                if earlier.space == current.space:
+                    earlier.id_ceiling = dict(floors)
+            started = Incarnation(
+                current.number + 1, xid_at_fork, id_floor=dict(floors), space=number
+            )
+        self.incarnations.append(started)
+        self._anchors[block.seq] = block.block_hash
+        self._forks.append(_Fork(block.seq, prior_seq))
+        self._note(
+            NoteKind.FORKED,
+            f"incarnation {number} starts here: {reason}",
+            seq=block.seq,
+        )
 
     def _read_retire(self, block: StoredBlock, body: Mapping[str, Any]) -> None:
         """Accept a retire block only as a match for the chain before it.
@@ -966,12 +1145,39 @@ class Verifier:
 
     # -- rows --
 
-    def incarnation_of(self, stream: str, row_id: int) -> Incarnation | None:
-        """The incarnation whose ``id`` window holds a row."""
+    def incarnation_of(self, stream: str, row_id: int, xid: int) -> Incarnation | None:
+        """The incarnation a row belongs to.
+
+        Of those whose ``id`` window holds the row (several, when forks
+        without an id window share one), the last one that starts at or
+        below its ``xid``; the first one when none does, for which the row
+        is ``PRE_GENESIS``.
+        """
+        chosen: Incarnation | None = None
         for incarnation in self.incarnations:
-            if incarnation.holds(stream, row_id):
-                return incarnation
-        return None
+            if not incarnation.holds(stream, row_id):
+                continue
+            if chosen is None or incarnation.enforce_from <= xid:
+                chosen = incarnation
+        return chosen
+
+    def _in_current_space(self, incarnation: Incarnation | None) -> bool:
+        """Whether an incarnation counts xids the way the database does now."""
+        return incarnation is None or incarnation.space == self.incarnations[-1].space
+
+    def _xid_limit(self, incarnation: Incarnation | None) -> int:
+        """No row or stamp of the incarnation has this ``xid`` or a higher one.
+
+        ``xmax`` in the current xid space; in an earlier one, the end of its
+        last incarnation, which a fork closed with a seal block up to the
+        highest ``xid`` stored then.
+        """
+        if self._in_current_space(incarnation):
+            return self._xmax
+        assert incarnation is not None
+        return max(
+            i.sealed_to for i in self.incarnations if i.space == incarnation.space
+        )
 
     def check_partition(
         self, partition: Partition, rows: Iterable[Mapping[str, Any]]
@@ -1060,7 +1266,8 @@ class Verifier:
             "id": row_id,
             "xid": xid,
         }
-        if xid >= self._xmax:
+        incarnation = self.incarnation_of(stream, row_id, xid)
+        if xid >= self._xmax and self._in_current_space(incarnation):
             # No transaction with this xid had started when the row was
             # read; left alone, it would sit in the unsealed tail forever.
             self._fail(
@@ -1069,10 +1276,9 @@ class Verifier:
                 **where,
             )
             return
-        incarnation = self.incarnation_of(stream, row_id)
         pre_genesis = incarnation is None or incarnation.is_pre_genesis(xid)
         enforce_from = (incarnation or self.incarnations[0]).enforce_from
-        self._count_stamps(table, row, where, pre_genesis, enforce_from)
+        self._count_stamps(table, row, where, pre_genesis, enforce_from, incarnation)
         if (
             table == ACTIVITY
             and row.get("verb") == SCRUBBED_VERB
@@ -1086,11 +1292,20 @@ class Verifier:
             state.pre_genesis += 1
             return
         if incarnation.is_unsealed(xid):
+            if incarnation is not self.incarnations[-1]:
+                # A fork closed the incarnation: nothing seals it any more.
+                self._fail(
+                    FailureKind.ROW_COUNT_MISMATCH,
+                    "a row past the last seal block of an incarnation a fork "
+                    "closed; no block can seal it",
+                    **where,
+                )
+                return
             state.unsealed += 1
             return
         sealed = incarnation.seal_of(xid)
         assert sealed is not None  # the ranges are contiguous
-        self._close(state, before=sealed.seq)
+        self._close(state, before=sealed.seq, incarnation=incarnation.number)
         key = (sealed.seq, stream)
         tree = state.trees.get(key)
         if tree is None:
@@ -1125,13 +1340,16 @@ class Verifier:
         where: Mapping[str, Any],
         pre_genesis: bool,
         enforce_from: int,
+        incarnation: Incarnation | None = None,
     ) -> None:
         """Count the stamps of a row by the scrub they name.
 
         A scrub runs after the row was written and before the snapshot that
         reads it; a stamp outside that names no real scrub, so no record can
         explain it. A scrub of a row before genesis, itself before genesis,
-        is out of scope.
+        is out of scope. A row of an earlier xid space (before a fork with
+        an id window) may also carry the stamp of a scrub run since the
+        fork, in the current space.
         """
         stamps = row.get("seal_erased")
         if not isinstance(stamps, Mapping):
@@ -1142,7 +1360,13 @@ class Verifier:
                 continue
             if pre_genesis and xid < enforce_from:
                 continue
-            if xid < where["xid"] or xid >= self._xmax:
+            # A scrub in the row's own xid space, after the row...
+            own = where["xid"] <= xid < self._xid_limit(incarnation)
+            # ... or, for a row of an earlier space, one since the fork.
+            since_fork = not self._in_current_space(incarnation) and (
+                self._space_start() <= xid < self._xmax
+            )
+            if not own and not since_fork:
                 why = "older than its row" if xid < where["xid"] else "in the future"
                 self._fail(
                     FailureKind.SCRUB_COUNT_MISMATCH,
@@ -1153,16 +1377,37 @@ class Verifier:
                 continue
             self._stamps[table][(str(group), xid)] += 1
 
+    def _space_start(self) -> int:
+        """The first ``xid`` of the current xid space."""
+        space = self.incarnations[-1].space
+        return min(i.enforce_from for i in self.incarnations if i.space == space)
+
     def _close(
-        self, state: _PartitionState, *, before: int | None = None, final: bool = False
+        self,
+        state: _PartitionState,
+        *,
+        before: int | None = None,
+        incarnation: int | None = None,
+        final: bool = False,
     ) -> None:
-        """Compare the finished segments of a partition with their blocks."""
+        """Compare the finished segments of a partition with their blocks.
+
+        Rows come in ``(xid, id)`` order, so within one incarnation a row of
+        seal block ``before`` ends every segment of an earlier one. Rows of
+        several incarnations interleave (their xid ranges overlap after a
+        fork with an id window), so only the incarnation's own end.
+        """
         name = state.partition.name
         expected = self._segments.get(name, {})
         done = [
             key
             for key in state.trees
-            if final or (before is not None and key[0] < before)
+            if final
+            or (
+                before is not None
+                and key[0] < before
+                and self._seal_owner.get(key[0]) == incarnation
+            )
         ]
         for key in done:
             tree = state.trees.pop(key)
@@ -1280,7 +1525,7 @@ class Verifier:
         for key in sorted(set(recorded) | set(stamped)):
             table, group, xid = key
             want, have = recorded.get(key, 0), stamped.get(key, 0)
-            if xid >= self._horizon:
+            if self._horizon <= xid < self._xmax:
                 # The scrub may still be running: its rows are not all
                 # visible yet. A later run, past it, counts them.
                 self._note(
@@ -1352,6 +1597,7 @@ class Verifier:
                 "the database's horizon is below the chain's sealed horizon",
                 xid=self._horizon,
             )
+        anchored = self._check_checkpoints()
         failures: list[Finding] = []
         notes = list(self._notes)
         for finding in self._failures:
@@ -1369,9 +1615,80 @@ class Verifier:
             status = Status.VALID_WITH_NOTES
         else:
             status = Status.VALID
-        return VerificationReport(
-            status, Anchor.UNANCHORED, self._last_seq, failures, notes
-        )
+        anchor = Anchor.ANCHORED if anchored else Anchor.UNANCHORED
+        return VerificationReport(status, anchor, self._last_seq, failures, notes)
+
+    def _check_checkpoints(self) -> bool:
+        """Match the chain against each trusted checkpoint; whether one matched.
+
+        A checkpoint whose signatures do not verify (with a signature
+        verifier given) is not used. One that names a block the chain does
+        not have is ``TRUNCATED``, one whose block has another hash, or that
+        is of another chain, ``CHAIN_MISMATCH``. A ``TRUNCATED`` or
+        ``CHAIN_MISMATCH`` is a ``FORKED`` note instead when a fork block at
+        or below the checkpoint's ``seq``, whose prior checkpoint is below
+        it, carries a signature that verified: the fork declares that the
+        chain was rebuilt from that prior checkpoint, so the checkpoint
+        names a block of the incarnation it ended. An unsigned fork block
+        explains nothing: anyone who can write the block table can add one.
+        """
+        matched: list[int] = []
+        for checkpoint in self._checkpoints:
+            where: dict[str, Any] = {"seq": checkpoint.seq}
+            if self._signatures is not None and checkpoint.signatures:
+                try:
+                    checkpoint.verify(self._signatures)
+                except NoteError as exc:
+                    kind = (
+                        FailureKind.UNKNOWN_KEY
+                        if exc.reason == "UNKNOWN_KEY"
+                        else FailureKind.BAD_SIGNATURE
+                    )
+                    self._fail(kind, f"checkpoint: {exc}", **where)
+                    continue
+            if checkpoint.chain != self._chain_id:
+                self._fail(
+                    FailureKind.CHAIN_MISMATCH,
+                    "the checkpoint is of another chain",
+                    **where,
+                )
+                continue
+            stored = self._hashes.get(checkpoint.seq)
+            if stored is not None and hmac.compare_digest(
+                stored, checkpoint.block_hash
+            ):
+                matched.append(checkpoint.seq)
+                continue
+            kind = FailureKind.CHAIN_MISMATCH if stored else FailureKind.TRUNCATED
+            fork = self._fork_explaining(checkpoint.seq)
+            if fork is not None:
+                self._note(
+                    NoteKind.FORKED,
+                    f"the checkpoint names a block before the fork in block "
+                    f"{fork.seq} ({kind} explained)",
+                    **where,
+                )
+                continue
+            if stored is None:
+                detail = f"the chain ends below the checkpoint, at {self._last_seq}"
+            else:
+                detail = "the block at the checkpoint's seq has another hash"
+            self._fail(kind, detail, **where)
+        if matched and self._last_seq is not None and self._last_seq > max(matched):
+            self._note(
+                NoteKind.UNANCHORED_TAIL,
+                "blocks after the newest checkpoint",
+                seq=max(matched) + 1,
+                count=self._last_seq - max(matched),
+            )
+        return bool(matched)
+
+    def _fork_explaining(self, seq: int) -> _Fork | None:
+        """A signed fork block that explains a divergence at ``seq``."""
+        for fork in self._forks:
+            if fork.seq <= seq and fork.prior_seq < seq and fork.seq in self.signed:
+                return fork
+        return None
 
 
 def _acknowledged(finding: Finding, ack: int) -> Finding:
@@ -1424,6 +1741,30 @@ def _leaf(table: str, row: Mapping[str, Any]) -> bytes:
     except (CanonicalEncodingError, KeyError, TypeError, AttributeError):
         # A row that cannot be encoded matches no sealed leaf.
         return bytes(32)
+
+
+def _id_window(floors: object, counts: object) -> dict[str, int] | None:
+    """The ``id_floor`` of a fork block, or ``None`` when it has none.
+
+    Both are ``None``, or objects with the same streams as keys and
+    non-negative integers as values.
+
+    Raises:
+        ValueError: Neither.
+    """
+    if floors is None and counts is None:
+        return None
+    if not isinstance(floors, Mapping) or not isinstance(counts, Mapping):
+        raise ValueError("id_floor and id_count are objects")
+    if set(floors) != set(counts):
+        raise ValueError("id_floor and id_count name other streams")
+    for stream in floors:
+        table = TRANSACTION if stream == TRANSACTION_STREAM else ACTIVITY
+        if not _stream_of(table, stream):
+            raise ValueError("not a stream")
+        if not all(is_int(v[stream]) and v[stream] >= 0 for v in (floors, counts)):
+            raise ValueError("not a count")
+    return {str(stream): int(value) for stream, value in floors.items()}
 
 
 def _stream_of(table: object, stream: object) -> bool:

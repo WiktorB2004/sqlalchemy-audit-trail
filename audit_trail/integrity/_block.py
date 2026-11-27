@@ -317,7 +317,8 @@ def fork_body(
         reason: Why the database was restored, as the operator wrote it.
         prior_seq: ``seq`` of the last good checkpoint.
         prior_hash: ``block_hash`` of that checkpoint.
-        xid_at_fork: ``pg_current_xact_id()`` when the fork was declared.
+        xid_at_fork: The horizon when the fork was declared; the new
+            incarnation's first seal block starts there.
         id_floor: Highest ``id`` of each stream before the fork, or ``None``
             when blocks select by ``xid`` alone.
         id_count: Rows of each stream with ``id <= id_floor``, or ``None``
@@ -344,6 +345,28 @@ def horizon_of(body: Mapping[str, Any]) -> int:
     if body["kind"] == "genesis":
         return int(body["enforce_from"])
     return int(body["xid_to"])
+
+
+def checkpoint_body(chain: str, seq: int, xid_to: int) -> bytes:
+    """Body of a checkpoint block, which records that a checkpoint was taken.
+
+    The exported checkpoint names this block: its ``seq`` and ``block_hash``.
+
+    Args:
+        chain: The chain id.
+        seq: The block's number.
+        xid_to: The ``xid`` the current incarnation was sealed up to
+            (exclusive) when the checkpoint was taken.
+    """
+    return _body(
+        {
+            "v": FORMAT_VERSION,
+            "kind": "checkpoint",
+            "chain": chain,
+            "seq": seq,
+            "xid_to": xid_to,
+        }
+    )
 
 
 def ack_body(

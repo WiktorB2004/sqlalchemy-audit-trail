@@ -12,7 +12,7 @@ lock.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -35,12 +35,14 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from audit_trail import _pg
 from audit_trail.integrity import _schema
 from audit_trail.integrity._block import ack_body, parse_body
+from audit_trail.integrity._checkpoint import Checkpoint
 from audit_trail.integrity._seal import (
     block_table,
     insert_block,
     last_block,
     missing_block_table,
 )
+from audit_trail.integrity._sign import SignatureVerifier, Signer
 from audit_trail.integrity._types import Xid8
 from audit_trail.integrity._verify import (
     ACTIVITY,
@@ -81,6 +83,9 @@ class VerifyOptions:
     chunk_rows: int
     partitions: frozenset[str] | None = None
     """Read only these partitions, by name; ``None`` reads every one."""
+    checkpoints: tuple[Checkpoint, ...] = ()
+    signatures: SignatureVerifier | None = None
+    require_signatures: bool = False
 
 
 def _options(
@@ -88,13 +93,28 @@ def _options(
     transaction_retention: timedelta | None,
     system_severity: int | None,
     chunk_rows: int,
+    checkpoints: Iterable[Checkpoint | str] = (),
+    verifier: SignatureVerifier | None = None,
+    require_signatures: bool = False,
 ) -> VerifyOptions:
     if chunk_rows < 1:
         raise ValueError("chunk_rows must be at least 1")
+    if require_signatures and verifier is None:
+        raise ValueError("require_signatures needs a verifier")
     streams = None
     if retention is not None:
         streams = stream_retention(retention, transaction_retention)
-    return VerifyOptions(streams, system_severity, chunk_rows)
+    read = tuple(
+        Checkpoint.from_note(c) if isinstance(c, str) else c for c in checkpoints
+    )
+    return VerifyOptions(
+        streams,
+        system_severity,
+        chunk_rows,
+        checkpoints=read,
+        signatures=verifier,
+        require_signatures=require_signatures,
+    )
 
 
 def verify(
@@ -105,6 +125,9 @@ def verify(
     transaction_retention: timedelta | None = None,
     system_severity: int | None = None,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    checkpoints: Iterable[Checkpoint | str] = (),
+    verifier: SignatureVerifier | None = None,
+    require_signatures: bool = False,
 ) -> VerificationReport:
     """Check the hash chain and every row it seals; report all failures.
 
@@ -131,6 +154,20 @@ def verify(
             ``ERASED_RECEIPT_RETIRED``; otherwise it is
             ``SCRUB_COUNT_MISMATCH``.
         chunk_rows: Rows read per transaction, at least 1.
+        checkpoints: Trusted checkpoints, kept off the database host, as
+            ``Checkpoint`` objects or the note texts ``to_note`` gave. Each
+            must name a block of the chain with its hash: a chain shorter
+            than one is ``TRUNCATED``, another hash at its ``seq`` is
+            ``CHAIN_MISMATCH``, and either one explained by a fork block
+            after the fork's own prior checkpoint, signed by a key
+            ``verifier`` knows, is a ``FORKED`` note. With ``verifier``, a
+            signed checkpoint must verify by c2sp.org/signed-note rules, or
+            it is ``BAD_SIGNATURE`` / ``UNKNOWN_KEY`` and is not used. The
+            report is ``ANCHORED`` when one matched, and the blocks after
+            the newest match are an ``UNANCHORED_TAIL`` note.
+        verifier: Checks the signatures of signed blocks and checkpoints.
+        require_signatures: Every block must be signed by a key
+            ``verifier`` knows.
 
     Returns:
         The report.
@@ -138,14 +175,23 @@ def verify(
     Raises:
         TypeError: The engine is an ``AsyncEngine``; use ``averify``.
         ValueError: The tables were built without integrity, the chain has
-            no genesis block, ``chunk_rows`` is below 1, or the database is
-            a logical-replication subscriber of the block table: its rows
-            carry the publisher's transaction ids, so verify on the
-            publisher.
+            no genesis block, ``chunk_rows`` is below 1, a checkpoint text
+            is not a checkpoint (a ``NoteError``), ``require_signatures``
+            has no ``verifier``, or the database is a logical-replication
+            subscriber of the block table: its rows carry the publisher's
+            transaction ids, so verify on the publisher.
     """
     if not isinstance(engine, Engine):
         raise TypeError("the engine is async; use averify")
-    options = _options(retention, transaction_retention, system_severity, chunk_rows)
+    options = _options(
+        retention,
+        transaction_retention,
+        system_severity,
+        chunk_rows,
+        checkpoints,
+        verifier,
+        require_signatures,
+    )
     block = block_table(tables)
     with engine.connect() as conn:
         return run_verification(conn, tables, block, options)
@@ -159,6 +205,9 @@ async def averify(
     transaction_retention: timedelta | None = None,
     system_severity: int | None = None,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    checkpoints: Iterable[Checkpoint | str] = (),
+    verifier: SignatureVerifier | None = None,
+    require_signatures: bool = False,
 ) -> VerificationReport:
     """Async ``verify``, for an ``AsyncEngine``; the same arguments.
 
@@ -171,7 +220,15 @@ async def averify(
     """
     if not isinstance(engine, AsyncEngine):
         raise TypeError("the engine is sync; use verify")
-    options = _options(retention, transaction_retention, system_severity, chunk_rows)
+    options = _options(
+        retention,
+        transaction_retention,
+        system_severity,
+        chunk_rows,
+        checkpoints,
+        verifier,
+        require_signatures,
+    )
     block = block_table(tables)
     async with engine.connect() as conn:
         return await conn.run_sync(
@@ -238,6 +295,9 @@ def _run(
         retention=options.streams,
         system_severity=options.system_severity,
         count_scrubs=options.partitions is None,
+        signatures=options.signatures,
+        require_signatures=options.require_signatures,
+        checkpoints=options.checkpoints,
     )
     with _pg.read_only(conn):
         horizon, xmax = (
@@ -296,6 +356,9 @@ def _blocks(conn: Connection, block: Table) -> Iterator[StoredBlock]:
                     block.c.prev_hash,
                     block.c.block_hash,
                     block.c.sealed_at,
+                    block.c.signature,
+                    block.c.key_id,
+                    block.c.alg,
                 )
                 .where(block.c.seq > after)
                 .order_by(block.c.seq)
@@ -309,6 +372,9 @@ def _blocks(conn: Connection, block: Table) -> Iterator[StoredBlock]:
                 bytes(row.prev_hash),
                 bytes(row.block_hash),
                 row.sealed_at,
+                None if row.signature is None else bytes(row.signature),
+                row.key_id,
+                row.alg,
             )
         if len(rows) < _schema.BLOCK_CHUNK_ROWS:
             return
@@ -394,6 +460,7 @@ def acknowledge(
     transaction_retention: timedelta | None = None,
     system_severity: int | None = None,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    signer: Signer | None = None,
 ) -> int:
     """Waive a known incident with an ``ack`` block in the chain.
 
@@ -422,6 +489,7 @@ def acknowledge(
         transaction_retention: As ``verify`` takes it.
         system_severity: As ``verify`` takes it.
         chunk_rows: As ``verify`` takes it.
+        signer: Signs the ack block; ``None`` leaves it unsigned.
 
     Returns:
         The ``seq`` of the ack block.
@@ -480,7 +548,9 @@ def acknowledge(
             waives=waives,
             reason=reason,
         )
-        insert_block(connection, block, seq, "ack", bytes(last.block_hash), body)
+        insert_block(
+            connection, block, seq, "ack", bytes(last.block_hash), body, signer
+        )
     return seq
 
 
@@ -495,6 +565,7 @@ async def aacknowledge(
     transaction_retention: timedelta | None = None,
     system_severity: int | None = None,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    signer: Signer | None = None,
 ) -> int:
     """Async ``acknowledge``, on an ``AsyncConnection``; the same arguments.
 
@@ -517,5 +588,6 @@ async def aacknowledge(
             transaction_retention=transaction_retention,
             system_severity=system_severity,
             chunk_rows=chunk_rows,
+            signer=signer,
         )
     )
