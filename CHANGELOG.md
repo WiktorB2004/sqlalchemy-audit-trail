@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- `drop_expired()` behind a pooler in transaction or statement mode (PgBouncer `pool_mode=transaction`) left its advisory lock and `lock_timeout` on a pooled server connection, so later runs failed with `PartitionLockTimeoutError` or hung. It now checks that its statements stay on one server connection and raises `PartitionError` before taking the lock if they do not; use a direct or session-pooled connection for it. `ensure_partitions()` already worked behind such poolers.
+
 ## 0.3.0 - 2026-11-17
 
 - Python 3.10 is no longer supported; it reached end of life in October 2026. The package now requires Python 3.11+.

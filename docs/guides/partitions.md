@@ -79,6 +79,7 @@ dropped = maintenance.maintenance.drop_expired(
 - `transaction_retention` applies to `audit_transaction`. It is capped at the shortest finite severity retention, with a warning if it is longer, and `None` means that shortest retention. So a request whose entries were all short-lived does not leave its IP address and user agent behind on the transaction row. Entries of longer-kept severities keep their context in `data["context"]`, and listings rebuild the group header from it.
 - Partitions are detached one at a time with `DETACH PARTITION ... CONCURRENTLY`, which does not block audit inserts, then dropped. The call switches its connection to `AUTOCOMMIT`, as `CONCURRENTLY` requires.
 - Waiting for transactions that have used the audit tables counts against `lock_timeout`, so a long-running transaction makes the call fail with `PartitionLockTimeoutError`. Partitions dropped before that stay dropped; a detach left pending is finished by the next call.
+- It needs a direct connection or a session-mode pool, not a pooler in transaction or statement mode (see [operations](operations.md#connection-poolers)).
 
 ## Health
 

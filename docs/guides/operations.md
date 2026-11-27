@@ -55,6 +55,12 @@ Run it daily or weekly. Partitions are monthly, so a partition is dropped once i
 
 Every severity you use should have a key in the retention mapping, with `None` for "keep forever"; one that is missing is kept, with a warning in the log.
 
+### Connection poolers
+
+`DETACH PARTITION ... CONCURRENTLY` cannot run in a transaction, so `drop_expired` holds its advisory lock and `lock_timeout` on the database session for the whole call. Behind a pooler in transaction or statement mode, such as PgBouncer with `pool_mode=transaction`, one client's statements can reach different server connections, and the lock would be left on one of them. `drop_expired` checks that its statements stay on one server connection, before it takes the lock and before each DDL statement, and otherwise stops with a `PartitionError` that says it needs a direct or session-pooled connection. Point the maintenance job at PostgreSQL directly, or at a PgBouncer database with `pool_mode=session`.
+
+`ensure_partitions` holds its lock and `lock_timeout` for one transaction only, so it also works through a transaction-mode pooler.
+
 ### `health`
 
 `health()` only reads the catalog, so any role that can see the audit tables can run it, for example a monitoring probe that alerts when `report.ok` is false:

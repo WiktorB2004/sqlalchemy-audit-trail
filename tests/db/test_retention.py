@@ -519,6 +519,29 @@ def test_session_lock_timeout_and_advisory_lock_are_released(
         assert advisory_locks(auto) == 0
 
 
+def test_concurrent_runs_are_mutually_exclusive(
+    engine: Engine, tables: AuditTables, schema: str, pool: ThreadPoolExecutor
+) -> None:
+    retention = dict.fromkeys(Sev, 30 * DAY)
+    with engine.connect() as blocker:
+        add_rows(blocker, tables, NOW)
+        try:
+            # The first run holds the advisory lock while its detach waits.
+            first = pool.submit(drop, engine, tables, retention, lock_timeout="10s")
+            poll(lambda: detach_waits(engine))
+            with pytest.raises(PartitionLockTimeoutError):
+                drop(engine, tables, retention, lock_timeout="200ms")
+            with pytest.raises(PartitionLockTimeoutError), engine.begin() as conn:
+                ensure_partitions(
+                    conn, tables, Sev, months_ahead=4, now=NOW, lock_timeout="200ms"
+                )
+        finally:
+            blocker.rollback()
+
+    assert len(first.result(timeout=CAP)) == 4 * 2
+    assert pending(engine, schema) == []
+
+
 def test_retention_for_severity_without_partition_warns(
     engine: Engine, tables: AuditTables, caplog: pytest.LogCaptureFixture
 ) -> None:
