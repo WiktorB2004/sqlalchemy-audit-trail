@@ -364,7 +364,10 @@ def test_max_rows_cuts_between_transactions(env: Env) -> None:
 def test_a_concurrent_sealer_returns_without_sealing(
     env: Env, database_url: str
 ) -> None:
-    write(env)
+    # Another transaction of the cluster that is still running holds the
+    # horizon back, and the first sealer would then seal nothing and never
+    # reach its INSERT.
+    wait_for_horizon_past(env.engine, write(env))
     block = _seal.block_table(env.trail.tables)
     results: list[SealResult] = []
     with env.engine.connect() as holder:
@@ -374,7 +377,7 @@ def test_a_concurrent_sealer_returns_without_sealing(
         first = threading.Thread(target=lambda: results.append(seal(env)))
         first.start()
         try:
-            wait_for_insert_waiting(env.engine, block.name)
+            wait_for_insert_waiting(env.engine, block, first, results)
             other = create_engine(
                 database_url, connect_args={"options": "-c lock_timeout=5s"}
             )
@@ -456,21 +459,50 @@ def qualified(table: Any) -> str:
     return f'"{table.schema}"."{table.name}"'
 
 
-def wait_for_insert_waiting(engine: Engine, table: str) -> None:
-    deadline = time.monotonic() + 15
+def wait_for_horizon_past(engine: Engine, xid: int) -> None:
+    """Wait until every transaction up to ``xid`` has ended.
+
+    New xids are always higher, so a later snapshot never has a lower horizon.
+    """
+    deadline = time.monotonic() + 30
+    while current_horizon(engine) <= xid:
+        if time.monotonic() > deadline:
+            raise AssertionError(f"the horizon never passed {xid}")
+        time.sleep(0.05)
+
+
+def wait_for_insert_waiting(
+    engine: Engine,
+    block: Any,
+    sealer: threading.Thread,
+    results: Sequence[SealResult],
+) -> None:
+    """Wait until a backend that holds an advisory lock waits on ``block``.
+
+    Only the first sealer does both: it holds its sealer lock while its
+    INSERT waits for the ``LOCK TABLE`` of the test.
+    """
+    deadline = time.monotonic() + 30
     with engine.connect() as conn:
         while time.monotonic() < deadline:
             waiting = conn.execute(
                 text(
                     "SELECT count(*) FROM pg_locks l "
-                    "JOIN pg_class c ON c.oid = l.relation "
-                    "WHERE NOT l.granted AND c.relname = :table"
+                    "WHERE NOT l.granted AND l.locktype = 'relation' "
+                    "AND l.relation = CAST(:table AS regclass) "
+                    "AND l.mode = 'RowExclusiveLock' "
+                    "AND EXISTS (SELECT FROM pg_locks a WHERE a.pid = l.pid "
+                    "AND a.locktype = 'advisory' AND a.granted)"
                 ),
-                {"table": table},
+                {"table": qualified(block)},
             ).scalar_one()
             conn.rollback()
             if waiting:
                 return
+            if not sealer.is_alive():
+                raise AssertionError(
+                    f"the first sealer returned before its INSERT: {list(results)}"
+                )
             time.sleep(0.05)
     raise AssertionError("the first sealer never reached its INSERT")
 
