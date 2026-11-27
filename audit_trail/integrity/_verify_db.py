@@ -1,6 +1,6 @@
 """``verify`` and ``acknowledge`` against the database.
 
-Private for now. ``verify`` reads the catalog, the chain and then each
+``verify`` reads the catalog, the chain and then each
 partition in short ``READ ONLY`` transactions, one per chunk of rows in
 ``(xid, id)`` order, and feeds them to the pure ``Verifier``. It never holds
 one snapshot over the whole log: a long snapshot would hold back vacuum and
@@ -15,7 +15,7 @@ import itertools
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
     Column,
@@ -30,7 +30,6 @@ from sqlalchemy import (
     tuple_,
 )
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from audit_trail import _pg
 from audit_trail.integrity import _schema
@@ -61,6 +60,10 @@ from audit_trail.integrity._verify import (
 )
 from audit_trail.maintenance import _children, _oid, _orphans, _qualified
 from audit_trail.tables import AuditTables
+
+if TYPE_CHECKING:
+    # Sync-only hosts lack greenlet; only the async variants need asyncio.
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 DEFAULT_CHUNK_ROWS = 2_000
 """Rows read per ``READ ONLY`` transaction."""
@@ -131,7 +134,7 @@ def verify(
 ) -> VerificationReport:
     """Check the hash chain and every row it seals; report all failures.
 
-    Private for now. Runs on one connection of its own from ``engine``,
+    Runs on one connection of its own from ``engine``,
     which it holds only between short ``READ ONLY`` transactions; it takes
     no lock, so runs side by side are fine and a pool of one does. It reads
     the catalog, then the chain, then the horizon, then each partition in
@@ -168,6 +171,8 @@ def verify(
             report is ``ANCHORED`` when one matched, and the blocks after
             the newest match are an ``UNANCHORED_TAIL`` note.
         verifier: Checks the signatures of signed blocks and checkpoints.
+            Given, a fork block that no key it knows signed is also a
+            ``FORKED_UNSIGNED`` note.
         require_signatures: Every block and every checkpoint must be
             signed by a key ``verifier`` knows.
 
@@ -213,13 +218,15 @@ async def averify(
 ) -> VerificationReport:
     """Async ``verify``, for an ``AsyncEngine``; the same arguments.
 
-    Private for now. Runs ``verify``'s reads on one connection through
+    Runs ``verify``'s reads on one connection through
     ``run_sync``.
 
     Raises:
         TypeError: The engine is a sync ``Engine``; use ``verify``.
         ValueError: As ``verify``.
     """
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
     if not isinstance(engine, AsyncEngine):
         raise TypeError("the engine is sync; use verify")
     options = _options(
@@ -466,7 +473,7 @@ def acknowledge(
 ) -> int:
     """Waive a known incident with an ``ack`` block in the chain.
 
-    Private for now. Runs ``verify`` on the connection first, and pins the
+    Runs ``verify`` on the connection first, and pins the
     failures of ``kind`` that ``scope`` matches as it observed them: the
     rows for a failure about a row, the root and row count for a segment,
     every field for the rest. Later verifications report those failures as
@@ -571,7 +578,7 @@ async def aacknowledge(
 ) -> int:
     """Async ``acknowledge``, on an ``AsyncConnection``; the same arguments.
 
-    Private for now. Runs ``acknowledge`` through ``run_sync``.
+    Runs ``acknowledge`` through ``run_sync``.
 
     Returns:
         The ``seq`` of the ack block.

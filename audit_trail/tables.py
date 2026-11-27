@@ -144,8 +144,8 @@ def build_tables(
             is a GIN index on ``data -> 'changes'`` and is off by default.
         integrity: Declare the integrity columns (``xid`` and the ``seal_*``
             columns) and their ``(xid, id)`` indexes on both tables, and the
-            ``seal_block_table`` in the same metadata. Private for now;
-            off by default, which leaves the tables as before.
+            ``seal_block_table`` in the same metadata. Off by default, which
+            leaves the tables as before.
 
     Returns:
         The tables and their metadata.

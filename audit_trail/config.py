@@ -158,7 +158,12 @@ class AuditTrail:
             ``since=ALL_HISTORY`` still lists the whole log. ``None`` reads
             the whole log, which gets slower as it grows.
         integrity: Tamper-evidence settings of this writer, or ``None`` (the
-            default) to leave the audit tables as they are. Private for now.
+            default) to leave the audit tables as they are. With
+            ``Integrity()`` the tables declare the integrity columns, which
+            ``migrations.add_integrity`` adds to an existing install, and
+            every write stores commitments; once the chain is started, every
+            process that writes audit entries needs it. See the integrity
+            guide.
 
     Attributes:
         severities: The severity enum in use.
@@ -236,7 +241,12 @@ class AuditTrail:
         self.tables = build_tables(
             schema=schema, indexes=indexes, integrity=integrity is not None
         )
-        self.maintenance = PartitionManager(engine, self.tables, self.severities)
+        self.maintenance = PartitionManager(
+            engine,
+            self.tables,
+            self.severities,
+            system_severity=self.registry.system_severity,
+        )
         from audit_trail.query import AuditQuery
 
         self.query = AuditQuery(

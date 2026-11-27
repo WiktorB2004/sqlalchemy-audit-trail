@@ -45,6 +45,7 @@ nav:
       - Querying the log: guides/querying.md
       - Privacy and GDPR: guides/privacy.md
       - Partitions and retention: guides/partitions.md
+      - Tamper evidence: guides/integrity.md
       - Testing your application: guides/testing.md
       - Database roles and permissions: guides/permissions.md
       - Operations: guides/operations.md
@@ -64,6 +65,7 @@ nav:
       - audit_trail.query: api/query.md
       - audit_trail.maintenance: api/maintenance.md
       - audit_trail.privacy: api/privacy.md
+      - audit_trail.integrity: api/integrity.md
       - audit_trail.checks: api/checks.md
       - audit_trail.testing: api/testing.md
       - audit_trail.pytest_plugin: api/pytest_plugin.md

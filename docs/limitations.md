@@ -89,3 +89,42 @@ The tables rely on PostgreSQL's declarative partitioning, `jsonb` and `inet`; Po
 ## No state at a point in time
 
 The log stores diffs, not copies of rows. It cannot answer "which records had status X on date D" in one query, and the library has no function to rebuild or revert a record's state. Excluded, redacted, hashed, scrubbed and `"<unknown>"` values could not be restored from the log in any case.
+
+## Maintenance behind transaction pooling
+
+`drop_expired()` holds a session-level advisory lock and a session `lock_timeout` across its statements, in `AUTOCOMMIT`. Behind PgBouncer in transaction mode its statements reach different server connections, so it refuses with a `PartitionError` before it takes the lock. Run it on a direct or session-pooled connection (see [connection poolers](guides/operations.md#connection-poolers)); `ensure_partitions()` works behind transaction pooling.
+
+## Tamper evidence
+
+[Integrity](guides/integrity.md) makes the log tamper-evident, not tamper-proof: it detects changes, it does not prevent them, and it proves what the application wrote, not that it was true. What it detects, with the [roles](guides/permissions.md#with-integrity) of `examples/roles.sql`:
+
+| Attack | Detected? |
+|---|---|
+| The application role edits or deletes entries | Blocked already by the grants (no `UPDATE` or `DELETE`). The chain adds nothing here |
+| The application role inserts a row backdated into a sealed range | Blocked by the column `INSERT` grants, which exclude `xid`. Without them: a root mismatch |
+| A role with `UPDATE` (scrubber, maintenance) rewrites a **sealed** entry | Yes |
+| The scrubber erases a sealed value and inserts a matching forged `audit.scrubbed` entry | No: it looks exactly like a real scrub. Erasure is attributable, not prevented. Keep the scrubber role for admin tasks |
+| Rows or a whole partition deleted without retention | Yes (`ROOT_MISMATCH`, `ROW_COUNT_MISMATCH`, `SEGMENT_MISSING`), unless whoever deletes can also write blocks (see below) |
+| A partition detached but not dropped | Yes (`DETACHED_PARTITION`) |
+| A value erased outside `scrub()` / `scrub_actor()` | Yes: the erasure has no pointer to a scrub, or the scrub's counts disagree |
+| An `audit.scrubbed` entry forged by the application | Yes: its counts match no erased rows, and erasing needs `UPDATE`, which the application lacks |
+| The newest blocks cut off, the database replaced, or a restore to an earlier state | Only against an exported checkpoint (`TRUNCATED`, `CHAIN_MISMATCH`) |
+| A role that may insert blocks (sealer, owner) retires a young partition, or seals rows it changed while they were unsealed | Partly. An early retire is caught when `verify()` gets the retention (`RETIRED_EARLY`). Rows changed before their seal are not. Run the sealer under its own role |
+| A superuser rewrites the rows **and** recomputes the chain | Only for history covered by a checkpoint stored off the database host, or, between checkpoints, by blocks signed with a key the host cannot read. Everything after the newest checkpoint can otherwise be rewritten undetected |
+| An entry changed between its commit and its seal | No. Only roles with `UPDATE` on the audit tables have that chance, and the application role is not one. The window is the seal interval plus the longest open write transaction: a library outside the database engine cannot hash at commit |
+| The application writes a false entry | No |
+
+A `verify()` report without checkpoints is `UNANCHORED`: the chain is internally consistent, which does not mean nobody rewrote it.
+
+Accepted risks, by design:
+
+- **The scrubber can forge scrubs.** It holds `INSERT` and `UPDATE` of the erased columns, so it can erase a value and write a matching `audit.scrubbed` entry. It also needs `UPDATE` of the whole `data` column, because the scrub rewrites it with `jsonb_set`; a change to a part of `data` that is never erased is detected once the row is sealed, since that part is hashed in clear.
+- **Failure logs carry salts.** When an audit write fails under `on_error="log"`, the logged parameters include the salts and commitments next to the values, which were logged before too. Logs are outside the reach of `scrub()`: keep them on a short retention, or treat them as personal data.
+- **Rows changed after the pre-drop verify are dropped.** `drop_expired()` verifies the expired partitions once, before the drops. A sealed row changed in place between that verify and its partition's drop is not seen, and is dropped with the partition.
+- **The count check after a fork is narrow.** After a fork with an id window, each seal checks that the identity sequences are not below the window, and also compares the number of rows at or below the window with the count the fork recorded. The count runs only while a sequence is within that count of the window, so it reads a bounded part of the primary key. An identity reset is therefore missed if more ids than the count are drawn between two seals, or if the sequence is set far above the window (`setval`) while new rows at or below it are left behind. Retention also weakens it: dropping partitions lowers the number of rows at or below the window, so more new rows fit under the recorded count before a seal refuses. The sequence check does not depend on either.
+- **Seal lag is measured from event time.** `health()` measures an unsealed entry's age from its `issued_at` / `created_at`, not from its commit, so a transaction that ran longer than `max_seal_lag` is flagged once it commits, until the next seal.
+- **An unsigned fork can only add notes.** A fork block that no key known to the verifier signed never explains a checkpoint that diverges from the chain: such a checkpoint still fails as `TRUNCATED` or `CHAIN_MISMATCH`. Sign forks with the same key as the blocks.
+- **The table owner can drop or truncate.** `TRUNCATE` or `DROP` by the owner is detected (missing segments), not prevented.
+- **A restored chain is sealed on silently.** After a point-in-time recovery, or `pg_resetwal --epoch` after a `pg_restore`, the transaction ids still move forward, so nothing refuses to go on sealing into the restored block table. Only a checkpoint stored before the restore shows the divergence; declare a fork after every such restore (see [restores and forks](guides/integrity.md#restores-and-forks)).
+- **Verify on the publisher.** On a logical replication subscriber of the block table, `seal()` skips and `verify()` raises: the rows carry the publisher's transaction ids.
+- **One sealer has a ceiling.** Sealing is bound by the sealer's CPU (see [sizing](guides/integrity.md#sizing)). When writers outpace it, every call is capped and the backlog grows; `health()` reports the lag.

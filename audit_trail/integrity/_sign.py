@@ -1,8 +1,9 @@
 """The signing hooks: who signs blocks and checkpoints, and who checks them.
 
-Private for now. The core never imports a crypto library: it calls a
+The core never imports a crypto library: it calls a
 ``Signer`` and a ``SignatureVerifier`` given by the caller. The reference
-implementation, Ed25519 with ``cryptography``, is in ``_ed25519`` behind the
+implementation, Ed25519 with ``cryptography``, is in
+``audit_trail.integrity.ed25519`` behind the
 ``sqlalchemy-audit-trail[integrity]`` extra; a KMS, an HSM or a sealer on
 another machine implement the same two protocols.
 
@@ -41,7 +42,7 @@ BLOCK_SIGNATURE_CONTEXT = context("block-signature")
 
 @runtime_checkable
 class Signer(Protocol):
-    """Signs blocks and checkpoints. Private for now.
+    """Signs blocks and checkpoints.
 
     Attributes:
         key_id: ``<key name>+<8 hex digits of the key hash>``; see the module
@@ -62,7 +63,7 @@ class Signer(Protocol):
 
 @runtime_checkable
 class SignatureVerifier(Protocol):
-    """Checks signatures made by known keys. Private for now."""
+    """Checks signatures made by known keys."""
 
     def key_algorithm(self, key_id: str) -> str | None:
         """The algorithm of a known key; ``None`` for an unknown one."""

@@ -1,7 +1,5 @@
 """Checkpoints and forks against the database.
 
-Private for now.
-
 ``export_checkpoint`` appends a ``checkpoint`` block, so the chain records
 that an anchor was taken, and returns the checkpoint naming it. Storing it
 off the database host is the caller's job: S3 Object Lock in compliance
@@ -94,8 +92,10 @@ class ReplicationError(Exception):
         reason: ``NO_SYNC_STANDBY``: ``synchronous_standby_names`` is empty,
             or ``pg_stat_replication`` lists fewer standbys with
             ``sync_state`` ``sync`` (``FIRST n``) or ``quorum`` (``ANY n``)
-            than it asks for, for longer than ``NO_STANDBY_GRACE`` (or the
-            role cannot see them: reading the view needs ``pg_monitor``).
+            than it asks for, for longer than a grace of two seconds
+            (capped by ``replication_timeout``), or the role cannot see them
+            (reading the view needs ``pg_monitor``). An empty setting raises
+            at once.
             ``NOT_REPLICATED``: they are listed, but not as many as it asks
             for flushed the block's WAL within the timeout; or the block's
             ``COMMIT``, waiting for them under ``synchronous_commit``, was
@@ -127,7 +127,7 @@ def export_checkpoint(
 ) -> Checkpoint:
     """Append a checkpoint block and return the checkpoint that names it.
 
-    Private for now. Takes the sealer's advisory lock (waiting for a running
+    Takes the sealer's advisory lock (waiting for a running
     sealer) in a ``READ COMMITTED`` transaction of its own, appends a
     ``checkpoint`` block after the last block, and commits. The statement is
     ``{v, chain, seq, block_hash, xid_to, sealed_at, incarnation}`` of that
@@ -440,7 +440,7 @@ def declare_fork(
 ) -> Fork:
     """Start a new incarnation of the chain after a restore.
 
-    Private for now. Run it after the restore and before any writer starts.
+    Run it after the restore and before any writer starts.
     In one ``READ COMMITTED`` transaction, once it holds the sealer's
     advisory lock (so no seal, retire or ack block is written meanwhile),
     it:

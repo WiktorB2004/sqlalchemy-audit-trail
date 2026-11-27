@@ -69,6 +69,16 @@ Every severity you use should have a key in the retention mapping, with `None` f
 - `pending_detach`: a `drop_expired` was interrupted; the next run finishes it;
 - `orphaned`: a detached table was left behind by a crash between the detach and the drop. Check the name and drop it by hand.
 
+### With integrity
+
+With [tamper evidence](integrity.md) on, three more jobs run, each under its own [role](permissions.md#with-integrity):
+
+- `seal()` every minute, under the sealer role. `health()` flags it when it lags (`report.seal`);
+- `export_checkpoint()` hourly or daily, stored off the database host;
+- `verify()` daily, under the verifier role, ideally from another machine.
+
+`drop_expired()` then seals, verifies and writes a retire block before each drop, on a second connection from the maintenance engine's pool. It still needs a direct or session-pooled connection (see [connection poolers](#connection-poolers)), and behind a transaction-mode pooler it refuses before writing any retire block.
+
 ## Logging
 
 The library logs on `audit_trail` and its child loggers. Alert on errors from:

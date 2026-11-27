@@ -1,6 +1,6 @@
 """Retire blocks: what ``drop_expired`` writes before it drops a partition.
 
-Private for now. With integrity on, ``drop_expired`` hands each expired
+With integrity on, ``drop_expired`` hands each expired
 partition to a ``Retirer``, which works on a second connection of its own
 (the drop runs on an ``AUTOCOMMIT`` connection, and the chain needs
 transactions):
@@ -150,7 +150,7 @@ def chain_started(connection: Connection, tables: AuditTables) -> bool:
 class Retirer:
     """Seals, verifies and retires expired partitions for ``drop_expired``.
 
-    Private for now. A context manager: it holds a second connection from
+    A context manager: it holds a second connection from
     the engine of ``connection`` while it is open. A pool that cannot give
     one at once raises ``PartitionError`` instead of waiting for its
     ``pool_timeout``.

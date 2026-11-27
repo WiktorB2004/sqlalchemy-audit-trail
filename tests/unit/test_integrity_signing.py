@@ -441,7 +441,7 @@ def test_the_core_does_not_import_cryptography() -> None:
         import importlib, pkgutil, sys
         import audit_trail, audit_trail.integrity
         for module in pkgutil.iter_modules(audit_trail.integrity.__path__):
-            if module.name != "_ed25519":
+            if module.name not in ("_ed25519", "ed25519"):
                 importlib.import_module(f"audit_trail.integrity.{module.name}")
         import audit_trail.maintenance, audit_trail.migrations
         assert sys.modules["cryptography"] is None

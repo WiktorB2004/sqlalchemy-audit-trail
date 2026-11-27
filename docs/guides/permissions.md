@@ -29,7 +29,7 @@ Once the maintenance role has created the tables, it grants the application role
 | `audit.query.*`, `LabelResolver`, `health()` | `USAGE` on the schema, `SELECT` on both tables |
 | `create_audit_tables()` | `CREATE` on the database: it runs `CREATE SCHEMA IF NOT EXISTS`, which PostgreSQL checks even when the schema exists. The role that runs it owns the tables it creates |
 | `ensure_partitions()`, `auto_create_partitions=True`, `drop_expired()` | ownership of both parent tables: PostgreSQL requires the owner to create, detach or drop partitions |
-| `scrub()`, `scrub_actor()` | `SELECT`, `INSERT` and `UPDATE` on both tables (the scrub records itself as an `audit.scrubbed` entry) |
+| `scrub()`, `scrub_actor()` | `SELECT` and `INSERT` on both tables (the scrub records itself as an `audit.scrubbed` entry), and `UPDATE` of the columns it erases: `object_label` and `data` of `audit_activity`, `actor_label`, `remote_addr`, `user_agent` and `meta` of `audit_transaction` |
 
 Grants on the partitioned parents are enough: PostgreSQL checks privileges on the table a statement names, not on the partitions it reaches, so partitions created later need no grants. The id columns are identity columns, which need no sequence privileges.
 
@@ -37,11 +37,53 @@ Keep `auto_create_partitions` off (the default) for an application that connects
 
 ## A scrub-only role
 
-If scrubbing should run under a role that cannot manage partitions, give it `UPDATE` without ownership:
+If scrubbing should run under a role that cannot manage partitions, give it `UPDATE` of the erased columns, without ownership:
 
 ```sql
 --8<-- "examples/roles.sql:scrubber"
 ```
+
+Before 0.4.0 this role had `UPDATE` on the whole tables. A column grant does not narrow a table grant, so on an existing install run the `REVOKE` above before the column grants. Even narrowed, the role can rewrite the whole `data` column, since the scrub rewrites it with `jsonb_set`; keep it for admin tasks.
+
+## With integrity
+
+[Tamper evidence](integrity.md) adds two roles and narrows the others. Run these after `migrations.add_integrity()`.
+
+The application loses its table-wide `INSERT`: it may insert every column except `id` and `xid`, so it cannot backdate a row into a range the sealer has already sealed. A column grant does not narrow a table grant, so the `REVOKE` comes first:
+
+```sql
+--8<-- "examples/roles.sql:integrity"
+```
+
+The scrub-only role gets the same `INSERT` columns, and `UPDATE` of the two columns a scrub changes besides the erased ones:
+
+```sql
+--8<-- "examples/roles.sql:integrity-scrubber"
+```
+
+The sealer reads the audit tables and appends blocks; it never updates or deletes anything. `export_checkpoint(require_replicated=True)` needs `pg_monitor`, since the standbys' `sync_state` and WAL positions in `pg_stat_replication` are hidden from other roles: without it, every such export fails with `NO_SYNC_STANDBY`. Leave the grant out if you do not use it. On a managed service, whether you may grant `pg_monitor` depends on the provider; some let only their own admin role grant it:
+
+```sql
+--8<-- "examples/roles.sql:sealer"
+```
+
+The verifier only reads. `verify()` reads each partition by name, and PostgreSQL checks the privileges of a partition read by name on the partition itself, so the grant covers every table in the schema, and the default privileges cover the partitions created later:
+
+```sql
+--8<-- "examples/roles.sql:verifier"
+```
+
+| Role | May | May not |
+|---|---|---|
+| `app_user` | insert entries (no `id`, no `xid`), read them, `health()` | update or delete entries, write blocks, seal, scrub |
+| `audit_scrubber` | `scrub()`, `scrub_actor()` | update `verb`, `xid`, `seal_commitments`, `actor_id` or any other column it does not erase; delete; write blocks |
+| `audit_sealer` | `seal()`, `health()`, `export_checkpoint()`, `declare_fork()` | update or delete blocks or entries, insert entries |
+| `audit_verifier` | `verify()`, `health()` | write anything |
+| `audit_maintenance` | as before, plus `write_genesis()`, retire blocks in `drop_expired()`, `acknowledge()` | (owner of the tables) |
+
+After a `pg_restore`, the tables must be owned by `audit_maintenance` again, and the `ALTER DEFAULT PRIVILEGES FOR ROLE audit_maintenance` above must be run by a member of that role; see [restores](integrity.md#restores-and-forks).
+
+Nobody gets `UPDATE` or `DELETE` on `audit_seal_block`. The maintenance role owns it, like the audit tables, so it could change both: run the sealer under its own role, and see the [limitations](../limitations.md#tamper-evidence) for what a table owner or superuser can still do.
 
 ## Using two roles from Python
 
