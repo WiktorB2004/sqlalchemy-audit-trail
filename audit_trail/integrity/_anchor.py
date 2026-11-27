@@ -41,6 +41,7 @@ from datetime import timedelta
 from typing import Any, Literal
 
 from sqlalchemy import Connection, Table, desc, func, select, text
+from sqlalchemy.exc import OperationalError
 
 from audit_trail import _pg
 from audit_trail.integrity import _schema
@@ -96,9 +97,12 @@ class ReplicationError(Exception):
             than it asks for, for longer than ``NO_STANDBY_GRACE`` (or the
             role cannot see them: reading the view needs ``pg_monitor``).
             ``NOT_REPLICATED``: they are listed, but not as many as it asks
-            for flushed the block's WAL within the timeout.
-            ``CHECK_FAILED``: reading the WAL position or the standbys
-            failed; the cause is chained.
+            for flushed the block's WAL within the timeout; or the block's
+            ``COMMIT``, waiting for them under ``synchronous_commit``, was
+            cut off (its backend was terminated) after the block was
+            written. ``CHECK_FAILED``: reading the WAL position or the
+            standbys failed, or such a cut-off ``COMMIT`` could not be
+            checked; the cause is chained.
         seq: The checkpoint block.
         lsn: The WAL position the standbys had to reach; empty when reading
             it failed.
@@ -161,30 +165,90 @@ def export_checkpoint(
         ReplicationError: ``require_replicated``, and the synchronous
             standbys did not confirm the block, or checking them failed;
             any error after the commit is one, with ``seq`` and ``lsn``.
+            Also, whatever ``require_replicated``, when the connection is
+            lost during the ``COMMIT`` (a terminated backend that waited for
+            a synchronous standby): ``NOT_REPLICATED`` with ``seq`` and
+            ``lsn`` when the block is written, ``CHECK_FAILED`` with ``seq``
+            alone when that cannot be read. A ``COMMIT`` that wrote nothing
+            raises its own error.
     """
     block = block_table(tables)
     _pg.check_transactional(connection, "export_checkpoint")
     _check_idle(connection, "export_checkpoint")
-    with connection.begin():
-        _lock(connection, block)
-        head = sealed_horizon(connection, block)
-        last = last_block(connection, block)
-        if head is None or last is None:
-            raise _no_genesis(block)
-        chain, xid_to = head
-        incarnation = current_window(connection, block).incarnation
-        seq = int(last.seq) + 1
-        body = checkpoint_body(chain, seq, xid_to)
-        digest = insert_block(
-            connection, block, seq, "checkpoint", bytes(last.block_hash), body, signer
-        )
-        sealed_at = connection.execute(
-            select(block.c.sealed_at).where(block.c.seq == seq)
-        ).scalar_one()
+    committing = False
+    try:
+        with connection.begin():
+            _lock(connection, block)
+            head = sealed_horizon(connection, block)
+            last = last_block(connection, block)
+            if head is None or last is None:
+                raise _no_genesis(block)
+            chain, xid_to = head
+            incarnation = current_window(connection, block).incarnation
+            seq = int(last.seq) + 1
+            body = checkpoint_body(chain, seq, xid_to)
+            digest = insert_block(
+                connection,
+                block,
+                seq,
+                "checkpoint",
+                bytes(last.block_hash),
+                body,
+                signer,
+            )
+            sealed_at = connection.execute(
+                select(block.c.sealed_at).where(block.c.seq == seq)
+            ).scalar_one()
+            committing = True  # only the COMMIT is left
+    except OperationalError as exc:
+        if not committing:
+            raise
+        problem = _cut_commit(connection, block, seq, digest)
+        if problem is None:
+            raise
+        raise problem from exc
     if require_replicated:
         wait_replicated(connection, seq, replication_timeout)
     checkpoint = Checkpoint(chain, seq, digest, xid_to, sealed_at, incarnation)
     return checkpoint if signer is None else checkpoint.signed([signer])
+
+
+def _cut_commit(
+    connection: Connection, block: Table, seq: int, digest: bytes
+) -> ReplicationError | None:
+    """What a ``COMMIT`` that lost its connection left: ``None`` if nothing.
+
+    With ``synchronous_commit`` on, the ``COMMIT`` of the checkpoint block
+    waits for the synchronous standbys; a backend terminated while it waits
+    has written the block locally, and the client sees only a lost
+    connection. The connection reconnects for the check.
+    """
+    try:
+        connection.rollback()
+        with connection.begin():
+            lsn = str(connection.execute(_INSERT_LSN).scalar())
+            written = connection.execute(
+                select(block.c.block_hash).where(block.c.seq == seq)
+            ).scalar()
+    except Exception:
+        return ReplicationError(
+            "CHECK_FAILED",
+            f"the connection was lost during the COMMIT of the checkpoint block "
+            f"{seq}, and reading whether it was written failed: it may be "
+            "written, and is not confirmed",
+            seq=seq,
+            lsn="",
+        )
+    if written is None or bytes(written) != digest:
+        return None
+    return ReplicationError(
+        "NOT_REPLICATED",
+        f"the COMMIT of the checkpoint block {seq} lost its connection, likely "
+        "while it waited for the synchronous standbys (synchronous_commit); "
+        f"the block is written, not confirmed at {lsn}",
+        seq=seq,
+        lsn=lsn,
+    )
 
 
 _SYNC_RULE = re.compile(

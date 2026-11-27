@@ -6,11 +6,14 @@ no test passes for nothing.
 
 from __future__ import annotations
 
+import os
+import threading
+import time
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
-from sqlalchemy import Engine, delete, select, text
+from sqlalchemy import Engine, create_engine, delete, select, text
 from sqlalchemy import event as sa_event
 
 from audit_trail import AuditEvent, Severity, event, migrations
@@ -240,6 +243,107 @@ def test_an_error_after_the_commit_is_a_replication_error(
     after = blocks(env)
     assert len(after) == before + 1
     assert (info.value.seq, bool(info.value.lsn)) == (after[-1].seq, True)
+
+
+@pytest.fixture(scope="module")
+def sync_url(engine: Engine) -> Iterator[str]:
+    """A server whose one synchronous standby never connects.
+
+    Skipped without Docker, except in CI (``AUDIT_TEST_EXPECT_PG`` set).
+    """
+    try:
+        from testcontainers.community.postgres import PostgresContainer
+    except ImportError:  # pragma: no cover
+        cannot_run("testcontainers is not installed")
+    with engine.connect() as conn:
+        version = int(conn.execute(text("SHOW server_version_num")).scalar_one())
+    try:
+        container = PostgresContainer(f"postgres:{version // 10000}", driver="psycopg")
+        container.start()
+    except Exception as exc:  # no Docker
+        cannot_run(f"cannot start a container: {exc}")
+    try:
+        url = container.get_connection_url()
+        # Set after the start: the image's init would wait for the standby.
+        setup = create_engine(url, isolation_level="AUTOCOMMIT")
+        with setup.connect() as conn:
+            conn.execute(text("ALTER SYSTEM SET synchronous_standby_names = 'nobody'"))
+            conn.execute(text("SELECT pg_reload_conf()"))
+        setup.dispose()
+        yield url
+    finally:
+        container.stop()
+
+
+def cannot_run(reason: str) -> NoReturn:
+    if os.environ.get("AUDIT_TEST_EXPECT_PG"):
+        pytest.fail(reason)
+    pytest.skip(reason)
+
+
+def terminate_when_waiting(local: Engine) -> threading.Thread:
+    """Terminate the backend that waits for a synchronous standby."""
+
+    def run() -> None:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            with local.connect() as conn:
+                pids = conn.execute(
+                    text(
+                        "SELECT pid FROM pg_stat_activity WHERE wait_event = 'SyncRep'"
+                    )
+                ).scalars()
+                if any(
+                    conn.execute(
+                        text("SELECT pg_terminate_backend(:p)"), {"p": p}
+                    ).scalar()
+                    for p in pids
+                ):
+                    return
+            time.sleep(0.05)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread
+
+
+def test_a_cut_off_synchronous_commit_is_a_replication_error(
+    sync_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The setup commits locally; the checkpoint COMMIT waits for the standby,
+    # until its backend is terminated: the client loses the connection.
+    local = create_engine(
+        sync_url, connect_args={"options": "-c synchronous_commit=local"}
+    )
+    waiting = create_engine(sync_url)
+    built = make_env(
+        local, "audit", events=[AnchorEvent], severities=Severity, integrity=Integrity()
+    )
+    try:
+        with local.begin() as conn:
+            migrations.write_genesis(conn, built.trail.tables)
+        write(built, 1)
+        seal(built)
+        killer = terminate_when_waiting(local)
+        with waiting.connect() as conn, pytest.raises(ReplicationError) as info:
+            export_checkpoint(conn, built.trail.tables)
+        killer.join()
+        assert info.value.reason == "NOT_REPLICATED"
+        assert info.value.lsn
+        last = blocks(built)[-1]
+        assert (last.kind, last.seq) == ("checkpoint", info.value.seq)
+        # When the position cannot be read either: the seq alone.
+        monkeypatch.setattr(_anchor, "_INSERT_LSN", text("SELECT no_such_function()"))
+        killer = terminate_when_waiting(local)
+        with waiting.connect() as conn, pytest.raises(ReplicationError) as info:
+            export_checkpoint(conn, built.trail.tables)
+        killer.join()
+        assert (info.value.reason, info.value.lsn) == ("CHECK_FAILED", "")
+        assert info.value.seq == last.seq + 1
+    finally:
+        built.trail.dispose()
+        waiting.dispose()
+        local.dispose()
 
 
 # -- forks without an id window (PITR) -------------------------------------------------
