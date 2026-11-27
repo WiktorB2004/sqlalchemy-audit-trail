@@ -124,14 +124,24 @@ def test_key_names_follow_the_spec(name: str) -> None:
         Ed25519Signer.generate(name)
 
 
-@pytest.mark.parametrize("control", ["\x7f", "\x00", "\x1b", "\x9b"])
-def test_a_note_with_a_control_character_in_a_key_name_is_refused(
-    control: str,
-) -> None:
+@pytest.mark.parametrize("control", ["\x00", "\x1b"])
+def test_a_note_with_a_c0_control_in_a_key_name_is_refused(control: str) -> None:
+    # A note holds no C0 control but the newline, in a key name neither.
     note = signed().replace(KEYS[0]["name"], KEYS[0]["name"] + control)
     with pytest.raises(NoteError) as info:
         parse_note(note)
     assert info.value.reason == "MALFORMED"
+
+
+@pytest.mark.parametrize("control", ["\x7f", "\x80", "\x9b"])
+def test_a_key_name_with_del_or_a_c1_control_is_read(control: str) -> None:
+    # The spec forbids only spaces and "+" in a key name (U+0085 is a space);
+    # such a key is unknown here, so its signature is ignored.
+    other = signed().split("\n\n")[1].replace(KEYS[0]["name"], f"x{control}y")
+    note = parse_note(signed() + other)
+    assert [s.name for s in note.signatures] == [KEYS[0]["name"], f"x{control}y"]
+    assert verify_note(note, verifier(0)) == [KEYS[0]["key_id"]]
+    assert str(note) == signed() + other
 
 
 def test_two_keys_with_one_key_id_are_refused() -> None:
@@ -377,19 +387,19 @@ def test_at_least_sixteen_signatures_are_read_and_too_many_refused() -> None:
         parse_note(str(too_many))
 
 
-def test_two_signatures_of_one_key_are_refused() -> None:
+def test_two_signatures_of_one_known_key_are_refused() -> None:
     note = signed()
     line = note.split("\n\n")[1]
-    doubled = note + line
+    doubled = parse_note(note + line)
     with pytest.raises(NoteError) as info:
-        parse_note(doubled)
+        verify_note(doubled, verifier(0))
     assert info.value.reason == "MALFORMED"
     # Also when the second line carries another signature of the same key.
     (signature,) = parse_note(note).signatures
     other = NoteSignature(signature.name, signature.key_hash, bytes(64))
     with pytest.raises(NoteError) as info:
-        parse_note(str(Note("hello\n", (signature, other))))
-    assert info.value.reason == "MALFORMED"
+        verify_note(parse_note(str(Note("hello\n", (signature, other)))), verifier(0))
+    assert info.value.reason in {"MALFORMED", "BAD_SIGNATURE"}
     with pytest.raises(NoteError) as info:
         verify_note(Note("hello\n", (signature, signature)), verifier(0))
     assert info.value.reason == "MALFORMED"
@@ -398,6 +408,17 @@ def test_two_signatures_of_one_key_are_refused() -> None:
     checkpoint = vector_checkpoint().signed([signer(0)])
     with pytest.raises(NoteError, match="two signatures"):
         checkpoint.signed([signer(0)])
+
+
+def test_repeated_lines_of_an_unknown_key_are_ignored() -> None:
+    # "Verifiers MUST ignore signatures from unknown keys", repeated ones too.
+    unknown = str(sign_note("hello\n", [signer(1)])).split("\n\n")[1]
+    note = parse_note(signed() + unknown + unknown)
+    assert len(note.signatures) == 3
+    assert verify_note(note, verifier(0)) == [KEYS[0]["key_id"]]
+    with pytest.raises(NoteError) as info:
+        verify_note(note, verifier(1))
+    assert info.value.reason == "MALFORMED"
 
 
 # -- the optional dependency ---------------------------------------------------

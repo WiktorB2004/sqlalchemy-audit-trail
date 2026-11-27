@@ -89,8 +89,12 @@ def note_key_hash(name: str, signature_type: int, public_key: bytes) -> bytes:
 
 
 def make_key_id(name: str, key_hash: bytes) -> str:
-    """``<key name>+<key hash as 8 hex digits>``."""
-    check_key_name(name)
+    """``<key name>+<key hash as 8 hex digits>``.
+
+    Takes any name a note may carry (``check_note_key_name``), so the key of
+    every parsed signature line has an id.
+    """
+    check_note_key_name(name)
     if len(key_hash) != 4:
         raise ValueError("a key hash is 4 bytes")
     return f"{name}+{key_hash.hex()}"
@@ -116,12 +120,27 @@ def split_key_id(key_id: str) -> tuple[str, bytes]:
     return name, bytes.fromhex(digits)
 
 
-def check_key_name(name: str) -> None:
+def check_note_key_name(name: str) -> None:
     """Refuse a key name that c2sp.org/signed-note does not allow.
 
-    The spec forbids Unicode spaces and ``+``; control characters (DEL and
-    the C0 and C1 ranges) are refused too, so a name cannot hide in a log
-    or a terminal.
+    The spec forbids only Unicode spaces and ``+``. A note holds no C0
+    control character anyway; DEL and C1 controls are allowed, so a note
+    signed by such a key still parses (``check_key_name`` is for keys made
+    here).
+
+    Raises:
+        ValueError: Empty, or with a Unicode space or a ``+``.
+    """
+    if not name or "+" in name or any(c.isspace() for c in name):
+        raise ValueError(f"key name {name!r} must be non-empty, without spaces or '+'")
+
+
+def check_key_name(name: str) -> None:
+    """Refuse a key name for a key made or loaded here.
+
+    Stricter than the spec (``check_note_key_name``): control characters
+    (DEL and the C0 and C1 ranges) are refused too, so a name of our own
+    cannot hide in a log or a terminal.
 
     Raises:
         ValueError: Empty, or with a Unicode space, a control character or
