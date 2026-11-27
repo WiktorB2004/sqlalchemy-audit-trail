@@ -92,8 +92,10 @@ class ReplicationError(Exception):
         reason: ``NO_SYNC_STANDBY``: ``synchronous_standby_names`` is empty,
             or ``pg_stat_replication`` lists fewer standbys with
             ``sync_state`` ``sync`` (``FIRST n``) or ``quorum`` (``ANY n``)
-            than it asks for, for longer than ``NO_STANDBY_GRACE`` (or the
-            role cannot see them: reading the view needs ``pg_monitor``).
+            than it asks for, for longer than a grace of two seconds
+            (capped by ``replication_timeout``), or the role cannot see them
+            (reading the view needs ``pg_monitor``). An empty setting raises
+            at once.
             ``NOT_REPLICATED``: they are listed, but not as many as it asks
             for flushed the block's WAL within the timeout; or the block's
             ``COMMIT``, waiting for them under ``synchronous_commit``, was
