@@ -60,8 +60,9 @@ from sqlalchemy.exc import NoReferenceError
 from audit_trail._compaction import ActivityData, ActivityRow, FieldChange, compact_rows
 from audit_trail.checks import _registry_of
 from audit_trail.diff import REDACTED, UNKNOWN, field_policy, options_of
+from audit_trail.integrity import _schema as integrity_schema
 from audit_trail.serialization import JSONValue
-from audit_trail.tables import AuditTables, audit_connection
+from audit_trail.tables import AuditTables, audit_connection, build_tables
 
 if TYPE_CHECKING:
     from sqlalchemy import ColumnClause, Connection, Table
@@ -1494,44 +1495,23 @@ def _referenced_ids(change: FieldChange) -> list[str] | None:
     return ids
 
 
-_ACTIVITY_COLUMNS: tuple[str, ...] = (
-    "id",
-    "transaction_id",
-    "verb",
-    "severity",
-    "object_type",
-    "object_id",
-    "object_label",
-    "target_type",
-    "target_id",
-    "actor_id",
-    "scope_id",
-    "correlation_id",
-    "created_at",
-    "data",
-)
+def _entry_columns(table: Table) -> tuple[str, ...]:
+    return tuple(
+        column.name
+        for column in table.columns
+        if column.name not in integrity_schema.INTEGRITY_COLUMNS
+    )
+
+
+_ACTIVITY_COLUMNS = _entry_columns(build_tables().activity)
 """The ``audit_activity`` columns an ``ActivityRow`` is read from.
 
-Reads list them instead of selecting the table, so they never return the
-integrity columns (salts among them) and work on tables without them.
+Every column but the integrity ones. Reads list them instead of selecting
+the table, so they never return the integrity columns (salts among them)
+and work on tables without them.
 """
 
-_HEADER_COLUMNS: tuple[str, ...] = (
-    "id",
-    "issued_at",
-    "actor_type",
-    "actor_id",
-    "actor_label",
-    "remote_addr",
-    "user_agent",
-    "method",
-    "path",
-    "channel",
-    "auth_method",
-    "request_id",
-    "correlation_id",
-    "meta",
-)
+_HEADER_COLUMNS = _entry_columns(build_tables().transaction)
 """The ``audit_transaction`` columns a ``TransactionHeader`` is read from."""
 
 

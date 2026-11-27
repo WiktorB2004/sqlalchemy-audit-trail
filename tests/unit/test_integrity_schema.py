@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -11,10 +12,10 @@ from sqlalchemy.dialects.postgresql.base import PGDialect
 from sqlalchemy.schema import CreateTable
 
 from audit_trail import migrations
-from audit_trail._compaction import ActivityData
+from audit_trail._compaction import ActivityData, ActivityRow
 from audit_trail.integrity import _schema
 from audit_trail.integrity._types import Xid8
-from audit_trail.query import _ACTIVITY_COLUMNS, _HEADER_COLUMNS
+from audit_trail.query import _ACTIVITY_COLUMNS, _HEADER_COLUMNS, TransactionHeader
 from audit_trail.tables import build_tables
 from audit_trail.writer import Entry, TransactionRow, activity_rows
 
@@ -152,16 +153,15 @@ def test_xid8_binds_text_then_casts() -> None:
     assert processor(5) == "5"
 
 
-@pytest.mark.parametrize("integrity", [False, True])
-def test_reads_list_every_column_but_the_integrity_ones(integrity: bool) -> None:
-    # A column added to a table later must be added to the read lists too, or
-    # reads silently drop it.
-    tables = build_tables(integrity=integrity)
-    left_out = {_schema.XID, *_schema.SEAL_COLUMNS}
-    for table, read in (
-        (tables.activity, _ACTIVITY_COLUMNS),
-        (tables.transaction, _HEADER_COLUMNS),
-    ):
-        names = [column.name for column in table.columns]
-        assert sorted(read) == sorted(set(names) - left_out)
-        assert len(set(read)) == len(read)
+def test_reads_list_every_column_but_the_integrity_ones() -> None:
+    assert list(_schema.INTEGRITY_COLUMNS) == INTEGRITY_COLUMNS
+    assert list(_ACTIVITY_COLUMNS) == ACTIVITY_COLUMNS
+    assert list(_HEADER_COLUMNS) == TRANSACTION_COLUMNS
+
+
+def test_every_read_column_reaches_the_row() -> None:
+    # The read lists follow the tables, so a column added to a table later is
+    # read; the rows built from the reads must carry it too.
+    assert list(ActivityRow.__annotations__) == list(_ACTIVITY_COLUMNS)
+    fields = {field.name for field in dataclasses.fields(TransactionHeader)}
+    assert set(_HEADER_COLUMNS) <= fields

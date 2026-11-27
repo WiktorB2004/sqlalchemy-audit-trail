@@ -28,6 +28,9 @@ ERASED = "seal_erased"
 SEAL_COLUMNS: tuple[str, ...] = (COMMITMENTS, SALTS, ERASED)
 """The JSONB integrity columns, which every writer row carries."""
 
+INTEGRITY_COLUMNS: tuple[str, ...] = (XID, *SEAL_COLUMNS)
+"""Every integrity column, which reads of entries never select."""
+
 XID_DEFAULT = "pg_current_xact_id()"
 """Default of the ``xid`` column."""
 
