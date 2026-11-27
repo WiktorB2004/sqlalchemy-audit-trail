@@ -16,8 +16,6 @@ So the notes and keys work with the existing note tooling.
 
 from __future__ import annotations
 
-import base64
-import binascii
 from collections.abc import Iterable
 
 try:
@@ -38,6 +36,7 @@ except ImportError as exc:  # pragma: no cover - exercised in a subprocess
         "sqlalchemy-audit-trail[integrity]"
     ) from exc
 
+from audit_trail.integrity._codec import b64, decode_strict
 from audit_trail.integrity._sign import (
     ED25519,
     NOTE_SIGNATURE_TYPES,
@@ -105,12 +104,12 @@ class Ed25519Signer:
     def skey(self) -> str:
         """The signer key as text; keep it secret."""
         seed = self._key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
-        return _SKEY_PREFIX + self.key_id + "+" + _b64(bytes([_TYPE]) + seed)
+        return _SKEY_PREFIX + self.key_id + "+" + b64(bytes([_TYPE]) + seed)
 
     @property
     def vkey(self) -> str:
         """The verifier key as text, for ``Ed25519Verifier``."""
-        return self.key_id + "+" + _b64(bytes([_TYPE]) + self.public_key)
+        return self.key_id + "+" + b64(bytes([_TYPE]) + self.public_key)
 
     def sign(self, message: bytes) -> bytes:
         """The 64-byte RFC 8032 signature of ``message``."""
@@ -169,14 +168,9 @@ def _parts(text: str) -> tuple[str, bytes, bytes]:
         raise ValueError("a key is <name>+<key hash>+<base64 key>")
     name, key_hash = split_key_id(f"{parts[0]}+{parts[1]}")
     encoded = parts[2]
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError):
-        raise ValueError("the key material is not base64") from None
-    if _b64(raw) != encoded or len(raw) != 33 or raw[0] != _TYPE:
+    raw = decode_strict(encoded)
+    if raw is None:
+        raise ValueError("the key material is not base64")
+    if b64(raw) != encoded or len(raw) != 33 or raw[0] != _TYPE:
         raise ValueError("not an Ed25519 key: base64 of 0x01 and 32 bytes")
     return name, key_hash, raw[1:]
-
-
-def _b64(raw: bytes) -> str:
-    return base64.b64encode(raw).decode("ascii")

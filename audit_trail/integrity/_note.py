@@ -31,12 +31,11 @@ back; ``verify_note`` rejects it.
 
 from __future__ import annotations
 
-import base64
-import binascii
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
+from audit_trail.integrity._codec import b64, decode_canonical
 from audit_trail.integrity._sign import (
     SignatureVerifier,
     Signer,
@@ -89,7 +88,7 @@ class NoteSignature:
 
     def line(self) -> str:
         """The signature line, with its newline."""
-        encoded = base64.b64encode(self.key_hash + self.signature).decode("ascii")
+        encoded = b64(self.key_hash + self.signature)
         return f"{DASH} {self.name} {encoded}\n"
 
 
@@ -205,20 +204,10 @@ def _signature(line: str) -> NoteSignature:
         check_key_name(name)
     except ValueError as exc:
         raise NoteError("MALFORMED", str(exc)) from None
-    raw = _canonical_b64(encoded)
+    raw = decode_canonical(encoded)
     if raw is None or len(raw) <= 4:
         raise NoteError("MALFORMED", "a signature is canonical base64 of 4+n bytes")
     return NoteSignature(name, raw[:4], raw[4:])
-
-
-def _canonical_b64(text: str) -> bytes | None:
-    try:
-        raw = base64.b64decode(text, validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    # Non-canonical encodings (nonzero padding bits) decode too; the spec
-    # makes decoders reject them.
-    return raw if base64.b64encode(raw).decode("ascii") == text else None
 
 
 def verify_note(note: Note, verifier: SignatureVerifier) -> list[str]:
