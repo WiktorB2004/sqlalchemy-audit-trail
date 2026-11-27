@@ -29,6 +29,14 @@ XACT_LOCK = "pg_advisory_xact_lock(hashtext(:key))"
 TRY_XACT_LOCK = "pg_try_advisory_xact_lock(hashtext(:key))"
 """SQL that tries the transaction-level advisory lock named by ``:key``."""
 
+SUBSCRIBED = (
+    "EXISTS (SELECT FROM pg_catalog.pg_subscription_rel "
+    "WHERE srrelid = to_regclass(:table))"
+)
+"""SQL that is true when a logical-replication subscription of this database
+writes into the table named by ``:table``, in any state, enabled or not.
+Every role can read ``pg_subscription_rel``."""
+
 
 def sqlstate(exc: DBAPIError) -> str | None:
     """The SQLSTATE of a database error, or ``None`` when the driver gives none.

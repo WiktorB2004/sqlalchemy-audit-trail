@@ -701,9 +701,10 @@ class PartitionManager:
         """Seal finished transactions into the next block of the hash chain.
 
         Runs on a connection of its own, in one ``REPEATABLE READ``
-        transaction. On a standby, or while another sealer runs, it returns
-        without sealing. Run it on a schedule, every minute for example; a
-        missed run only leaves rows unsealed for longer. Private for now.
+        transaction. On a standby, on a logical-replication subscriber of the
+        block table, or while another sealer runs, it returns without
+        sealing. Run it on a schedule, every minute for example; a missed run
+        only leaves rows unsealed for longer. Private for now.
 
         Args:
             max_rows: Soft cap on the rows of the block; one transaction is

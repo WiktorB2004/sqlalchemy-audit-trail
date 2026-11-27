@@ -98,14 +98,16 @@ class SealResult:
         capped: ``max_rows`` cut the block short and finished rows remain
             unsealed; call again.
         skipped: Why nothing was attempted: ``"standby"`` (the server is in
-            recovery) or ``"busy"`` (another sealer holds the lock).
+            recovery), ``"subscriber"`` (a logical-replication subscription
+            writes into the block table, so the publisher seals) or
+            ``"busy"`` (another sealer holds the lock).
     """
 
     blocks: int
     rows: int
     horizon: int | None
     capped: bool = False
-    skipped: Literal["standby", "busy"] | None = None
+    skipped: Literal["standby", "subscriber", "busy"] | None = None
 
 
 @dataclass(frozen=True)
@@ -263,9 +265,9 @@ def seal(
         max_rows: Soft cap on the rows of the block, at least 1.
 
     Returns:
-        What was sealed. On a standby, while another sealer holds the lock,
-        and when another one committed a block this snapshot does not see,
-        nothing is written.
+        What was sealed. On a standby, on a logical-replication subscriber of
+        the block table, while another sealer holds the lock, and when another
+        one committed a block this snapshot does not see, nothing is written.
 
     Raises:
         ValueError: ``max_rows`` is below 1, the tables were built without
@@ -303,13 +305,18 @@ def _seal(
         start = connection.execute(
             text(
                 "SELECT pg_is_in_recovery() AS standby, "
+                f"{_pg.SUBSCRIBED} AS subscriber, "
                 f"{_pg.TRY_XACT_LOCK} AS locked, "
                 "pg_snapshot_xmin(pg_current_snapshot())::text AS horizon"
             ),
-            {"key": _pg.lock_key(block)},
+            {"key": _pg.lock_key(block), "table": _regclass(connection, block)},
         ).one()
         if start.standby:
             return SealResult(0, 0, None, skipped="standby")
+        if start.subscriber:
+            # Its blocks come from the publisher; one of its own would take
+            # the next seq and stop the subscription on a duplicate key.
+            return SealResult(0, 0, None, skipped="subscriber")
         if not start.locked:
             return SealResult(0, 0, None, skipped="busy")
         horizon = int(start.horizon)

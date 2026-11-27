@@ -53,6 +53,8 @@ from audit_trail.migrations import create_sql
 from audit_trail.tables import AuditTables, build_tables
 from audit_trail.writer import insert_transaction, transaction_values
 from tests.db.listener_support import Env, make_env, record_statements
+from tests.db.replication_support import Subscriber, subscribed, wait_for_rows
+from tests.db.replication_support import write as write_replica
 
 # Reflection does not know xid8.
 pytestmark = pytest.mark.filterwarnings("ignore:Did not recognize type 'xid8'")
@@ -900,3 +902,31 @@ def make_env_on(engine: Engine, schema: str) -> Env:
     factory = sessionmaker(engine)
     trail.install(factory)
     return Env(engine, trail, factory)
+
+
+# -- logical replication --------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def subscriber(engine: Engine) -> Iterator[Subscriber]:
+    with subscribed(engine) as databases:
+        yield databases
+
+
+def test_seal_returns_without_sealing_on_a_subscriber(subscriber: Subscriber) -> None:
+    # A row written on the subscriber, as after a cutover that has not yet
+    # dropped the subscription: a block of its own would take the next seq,
+    # and the publisher's next block would stop the subscription.
+    write_replica(subscriber.subscriber_trail, subscriber.subscriber)
+    tables = subscriber.tables
+    manager = PartitionManager(subscriber.subscriber, tables, Severity)
+    assert manager.seal() == SealResult(0, 0, None, skipped="subscriber")
+    with subscriber.subscriber.connect() as conn:
+        seqs = conn.execute(select(_seal.block_table(tables).c.seq)).scalars().all()
+    assert seqs == [1]
+    # The publisher seals, and its block reaches the subscriber.
+    xid = write_replica(subscriber.publisher_trail, subscriber.publisher)
+    wait_for_horizon_past(subscriber.publisher, xid)
+    publisher = PartitionManager(subscriber.publisher, tables, Severity)
+    assert publisher.seal().blocks == 1
+    wait_for_rows(subscriber.subscriber, tables, 2)
