@@ -51,8 +51,6 @@ collected, never only the first. Findings name rows by table, ``id``,
 
 from __future__ import annotations
 
-import base64
-import binascii
 import bisect
 import hmac
 from collections import Counter
@@ -60,7 +58,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Any, TypeGuard
+from typing import Any
 
 from audit_trail.integrity._block import (
     FORMAT_VERSION,
@@ -73,6 +71,7 @@ from audit_trail.integrity._block import (
     transaction_leaf_row,
 )
 from audit_trail.integrity._canonical import CanonicalEncodingError
+from audit_trail.integrity._codec import b64, decode_strict, is_int, parse_rfc3339
 from audit_trail.integrity._commit import (
     ACTIVITY_GROUPS,
     ACTOR_FIELDS,
@@ -466,7 +465,7 @@ def check_waives(value: object) -> frozenset[PinKey]:
             if name in _TEXT_PIN_FIELDS:
                 if not isinstance(field_value, str):
                     raise ValueError(f"ack pin field {name!r} takes text")
-            elif not _is_int(field_value):
+            elif not is_int(field_value):
                 raise ValueError(f"ack pin field {name!r} takes an integer")
         keys.add(_pin_key(item))
     return frozenset(keys)
@@ -570,16 +569,6 @@ def is_erased(table: str, group: str, row: Mapping[str, Any]) -> bool:
     return bool(value == ERASED_VALUE)
 
 
-def _decode(text: object, length: int | None = None) -> bytes | None:
-    if not isinstance(text, str):
-        return None
-    try:
-        raw = base64.b64decode(text, validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    return raw if length is None or len(raw) == length else None
-
-
 def _stamp(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -650,8 +639,8 @@ def _check_group(
 ) -> GroupCheck:
     committed = group in commitments
     if group in salts:
-        salt = _decode(salts[group], 16)
-        expected = _decode(commitments.get(group), 32)
+        salt = decode_strict(salts[group], 16)
+        expected = decode_strict(commitments.get(group), 32)
         if salt is None or expected is None or value is None:
             return GroupCheck(
                 group, FailureKind.COMMITMENT_MISMATCH, False, "salt without a match"
@@ -828,7 +817,7 @@ class Verifier:
             malformed("the kind column does not match the body")
             return None
         if number == 1:
-            if block.kind != "genesis" or not _is_int(body.get("enforce_from")):
+            if block.kind != "genesis" or not is_int(body.get("enforce_from")):
                 malformed("block 1 is not a genesis block")
                 return None
             if not isinstance(body.get("chain"), str):
@@ -850,7 +839,7 @@ class Verifier:
         if kind == "seal":
             xid_from, xid_to = body.get("xid_from"), body.get("xid_to")
             segments = body.get("segments")
-            if not (_is_int(xid_from) and _is_int(xid_to) and xid_from < xid_to):
+            if not (is_int(xid_from) and is_int(xid_to) and xid_from < xid_to):
                 malformed("the seal block has no valid xid range")
                 return
             if xid_from != incarnation.sealed_to:
@@ -877,7 +866,7 @@ class Verifier:
                 malformed("the ack block has no valid failure, scope and pins")
         elif kind == "retire":
             stream, partition = body.get("stream"), body.get("partition")
-            upper = _timestamp(body.get("upper_bound"))
+            upper = parse_rfc3339(body.get("upper_bound"))
             if (
                 not isinstance(stream, str)
                 or not isinstance(partition, str)
@@ -1116,7 +1105,7 @@ class Verifier:
                 "partition": name,
                 "table": state.partition.table,
                 "count": tree.size,
-                "root": _b64(root),
+                "root": b64(root),
             }
             if tree.size != rows:
                 self._fail(
@@ -1141,7 +1130,7 @@ class Verifier:
                         stream=segment.stream,
                         partition=name,
                         count=0,
-                        root=_b64(MerkleTree().root()),
+                        root=b64(MerkleTree().root()),
                     )
 
     # -- schema and scrubs --
@@ -1333,7 +1322,7 @@ def _record_counts(payload: object) -> dict[tuple[str, str], int] | None:
 
     def count(name: str, default: int | None = None) -> int | None:
         value = payload.get(f"stamped_{name}", payload.get(name, default))
-        return value if _is_int(value) and value >= 0 else None
+        return value if is_int(value) and value >= 0 else None
 
     if operation == "scrub":
         activity = count("activity_rows")
@@ -1366,11 +1355,11 @@ def _segments(seq: int, value: object) -> list[ExpectedSegment] | None:
         if not isinstance(item, Mapping):
             return None
         stream, partition, rows = (item.get(k) for k in ("stream", "partition", "rows"))
-        root = _decode(item.get("root"), 32)
+        root = decode_strict(item.get("root"), 32)
         if not (
             isinstance(stream, str)
             and isinstance(partition, str)
-            and _is_int(rows)
+            and is_int(rows)
             and rows > 0
             and root is not None
         ):
@@ -1378,23 +1367,6 @@ def _segments(seq: int, value: object) -> list[ExpectedSegment] | None:
         parsed.append(ExpectedSegment(seq, stream, partition, rows, root))
     keys = [(s.stream, s.partition) for s in parsed]
     return parsed if len(set(keys)) == len(keys) else None
-
-
-def _b64(raw: bytes) -> str:
-    return base64.b64encode(raw).decode("ascii")
-
-
-def _timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.endswith("Z"):
-        return None
-    try:
-        return datetime.fromisoformat(value[:-1] + "+00:00")
-    except ValueError:
-        return None
-
-
-def _is_int(value: object) -> TypeGuard[int]:
-    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def stream_retention(
