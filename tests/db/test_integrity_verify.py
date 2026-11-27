@@ -61,6 +61,8 @@ from audit_trail.integrity._verify_db import (
     verify,
 )
 from tests.db.listener_support import Env, make_env, record_statements
+from tests.db.replication_support import Subscriber, subscribed, wait_for_rows
+from tests.db.replication_support import write as write_replica
 
 pytestmark = pytest.mark.filterwarnings("ignore:Did not recognize type 'xid8'")
 
@@ -1015,3 +1017,25 @@ def write_docs_again(env: Env, models: Models) -> None:
         assert doc is not None
         doc.title = "New"
         session.commit()
+
+
+# -- logical replication --------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def subscriber(engine: Engine) -> Iterator[Subscriber]:
+    with subscribed(engine) as databases:
+        yield databases
+
+
+def test_verify_on_a_subscriber_says_to_verify_on_the_publisher(
+    subscriber: Subscriber,
+) -> None:
+    tables = subscriber.tables
+    write_replica(subscriber.publisher_trail, subscriber.publisher)
+    write_replica(subscriber.subscriber_trail, subscriber.subscriber)
+    assert subscriber.publisher_trail.maintenance.seal().blocks == 1
+    wait_for_rows(subscriber.subscriber, tables, 2)
+    assert verify(subscriber.publisher, tables).status is Status.VALID
+    with pytest.raises(ValueError, match="verify on the publisher"):
+        verify(subscriber.subscriber, tables)

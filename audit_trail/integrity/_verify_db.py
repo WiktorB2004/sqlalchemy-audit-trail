@@ -139,7 +139,10 @@ def verify(
     Raises:
         TypeError: The engine is an ``AsyncEngine``; use ``averify``.
         ValueError: The tables were built without integrity, the chain has
-            no genesis block, or ``chunk_rows`` is below 1.
+            no genesis block, ``chunk_rows`` is below 1, or the database is
+            a logical-replication subscriber of the block table: its rows
+            carry the publisher's transaction ids, so verify on the
+            publisher.
     """
     if not isinstance(engine, Engine):
         raise TypeError("the engine is async; use averify")
@@ -192,6 +195,18 @@ def _verify(
     block. A partition that vanishes during the second run is not retried:
     it is reported as absent, like one dropped before the run.
     """
+    with _read_only(conn):
+        subscribed = conn.execute(
+            text(f"SELECT {_pg.SUBSCRIBED}"), {"table": _pg.regclass(conn, block)}
+        ).scalar_one()
+    if subscribed:
+        # Every replicated row would read as XID_REWIND against this
+        # server's own horizon, and its seal blocks are the publisher's.
+        raise ValueError(
+            f"{block.fullname} is written by a logical-replication "
+            "subscription: verify on the publisher. After a cutover, drop the "
+            "subscription and declare a fork first"
+        )
     try:
         return _run(conn, tables, block, options, retry=True)
     except _Vanished:
