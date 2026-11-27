@@ -370,24 +370,33 @@ def test_a_concurrent_sealer_returns_without_sealing(
     wait_for_horizon_past(env.engine, write(env))
     block = _seal.block_table(env.trail.tables)
     results: list[SealResult] = []
-    with env.engine.connect() as holder:
-        # Lets the first sealer take the advisory lock and read, then makes
-        # it wait at its INSERT with the lock still held.
-        holder.execute(text(f"LOCK TABLE {qualified(block)} IN EXCLUSIVE MODE"))
-        first = threading.Thread(target=lambda: results.append(seal(env)))
-        first.start()
-        try:
-            wait_for_insert_waiting(env.engine, block, first, results)
-            other = create_engine(
-                database_url, connect_args={"options": "-c lock_timeout=5s"}
+    # The first sealer waits at its INSERT without a lock timeout, so it still
+    # holds the advisory lock however long the second sealer takes to start
+    # on a loaded server. Both engines connect before the lock is taken.
+    patient = create_engine(database_url, connect_args={"options": "-c lock_timeout=0"})
+    other = create_engine(database_url, connect_args={"options": "-c lock_timeout=5s"})
+    try:
+        with patient.connect(), other.connect():
+            pass
+        with env.engine.connect() as holder:
+            # Lets the first sealer take the advisory lock and read, then
+            # makes it wait at its INSERT with the lock still held.
+            holder.execute(text(f"LOCK TABLE {qualified(block)} IN EXCLUSIVE MODE"))
+            first = threading.Thread(
+                target=lambda: results.append(
+                    PartitionManager(patient, env.trail.tables, Severity).seal()
+                )
             )
+            first.start()
             try:
+                wait_for_insert_waiting(env.engine, block, first, results)
                 second = PartitionManager(other, env.trail.tables, Severity).seal()
             finally:
-                other.dispose()
-        finally:
-            holder.rollback()
-            first.join(timeout=30)
+                holder.rollback()
+                first.join(timeout=30)
+    finally:
+        patient.dispose()
+        other.dispose()
     assert second == SealResult(0, 0, None, skipped="busy")
     assert results == [SealResult(1, 2, results[0].horizon)]
     assert [b.kind for b in check_chain(env)] == ["genesis", "seal"]
