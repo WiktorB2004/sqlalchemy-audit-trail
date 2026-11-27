@@ -160,9 +160,11 @@ def verify(
             than one is ``TRUNCATED``, another hash at its ``seq`` is
             ``CHAIN_MISMATCH``, and either one explained by a fork block
             after the fork's own prior checkpoint, signed by a key
-            ``verifier`` knows, is a ``FORKED`` note. With ``verifier``, a
-            signed checkpoint must verify by c2sp.org/signed-note rules, or
-            it is ``BAD_SIGNATURE`` / ``UNKNOWN_KEY`` and is not used. The
+            ``verifier`` knows, is a ``FORKED`` note; only a checkpoint
+            taken before the fork (in an earlier incarnation) is explained.
+            With ``verifier``, a signed checkpoint must verify by
+            c2sp.org/signed-note rules, or it is ``BAD_SIGNATURE`` /
+            ``UNKNOWN_KEY`` and is not used. The
             report is ``ANCHORED`` when one matched, and the blocks after
             the newest match are an ``UNANCHORED_TAIL`` note.
         verifier: Checks the signatures of signed blocks and checkpoints.

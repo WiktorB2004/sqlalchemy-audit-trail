@@ -177,6 +177,7 @@ def vector_checkpoint() -> Checkpoint:
         bytes.fromhex(CHECKPOINT["block_hash"]),
         CHECKPOINT["xid_to"],
         datetime(2026, 11, 27, 10, 30, 0, 123456, tzinfo=UTC),
+        CHECKPOINT["incarnation"],
     )
 
 
@@ -192,6 +193,7 @@ def test_checkpoint_text_vector() -> None:
         "block_hash": base64.b64encode(checkpoint.block_hash).decode(),
         "xid_to": CHECKPOINT["xid_to"],
         "sealed_at": CHECKPOINT["sealed_at"],
+        "incarnation": 2,
     }
 
 
@@ -225,6 +227,7 @@ def test_a_checkpoint_round_trips_through_its_note(name: str) -> None:
         CHECKPOINT["xid_to"],
     )
     assert checkpoint.sealed_at == vector_checkpoint().sealed_at
+    assert checkpoint.incarnation == 2
 
 
 def test_key_rotation_on_a_cosigned_checkpoint() -> None:
@@ -277,8 +280,19 @@ def test_a_signature_with_a_known_name_and_another_hash_is_ignored() -> None:
         CHECKPOINT["text"] + "more\n",
         CHECKPOINT["text"].replace('"seq":3', '"seq":"3"'),
         CHECKPOINT["text"].replace('"xid_to"', '"xid"'),
+        CHECKPOINT["text"].replace('"incarnation":2,', ""),
+        CHECKPOINT["text"].replace('"incarnation":2', '"incarnation":0'),
     ],
-    ids=["not canonical", "header", "version", "third line", "type", "field"],
+    ids=[
+        "not canonical",
+        "header",
+        "version",
+        "third line",
+        "type",
+        "field",
+        "no incarnation",
+        "incarnation 0",
+    ],
 )
 def test_a_statement_that_is_not_a_checkpoint_is_refused(text: str) -> None:
     with pytest.raises(NoteError) as info:

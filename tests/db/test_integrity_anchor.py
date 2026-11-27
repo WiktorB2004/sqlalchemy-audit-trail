@@ -268,6 +268,27 @@ def test_a_declared_fork_is_forked(env: Env) -> None:
     assert report.anchor is Anchor.ANCHORED
 
 
+def test_a_checkpoint_after_the_fork_is_not_explained_by_it(env: Env) -> None:
+    good, lost = pitr(env)
+    with env.engine.connect() as conn:
+        fork = declare_fork(
+            conn, env.trail.tables, good, reason="PITR to 03:00", signer=OLD
+        )
+    write(env, 2)
+    seal(env, OLD)
+    after = checkpoint(env)
+    assert Checkpoint.from_note(after).incarnation == fork.incarnation == 2
+    assert Checkpoint.from_note(lost).incarnation == 1
+    write(env, 2)
+    seal(env, OLD)
+    notes = [good, lost, after]
+    assert run(env, checkpoints=notes, verifier=BOTH).failures == []
+    drop_blocks_from(env, Checkpoint.from_note(after).seq)
+    report = run(env, checkpoints=notes, verifier=BOTH)
+    assert failed(report) == {FailureKind.TRUNCATED}
+    assert [f.seq for f in report.failures] == [Checkpoint.from_note(after).seq]
+
+
 def test_an_undeclared_fork_fails(env: Env) -> None:
     good, lost = pitr(env)
     assert failed(run(env, checkpoints=[good, lost])) == {FailureKind.TRUNCATED}

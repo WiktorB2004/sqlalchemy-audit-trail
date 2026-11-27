@@ -26,8 +26,9 @@ back:
 A fork first seals what the old incarnation left unsealed (the closing
 seal), and needs the last good checkpoint, which must still be in the
 chain. ``verify`` reports a fork as a ``FORKED`` note, and given a
-checkpoint taken after the fork's own, explains the divergence only when
-the fork block is signed by a key it knows.
+checkpoint taken after the fork's own but before the fork (in an earlier
+incarnation), explains the divergence only when the fork block is signed by
+a key it knows. A checkpoint taken after the fork is never explained by it.
 """
 
 from __future__ import annotations
@@ -113,8 +114,8 @@ def export_checkpoint(
     Private for now. Takes the sealer's advisory lock (waiting for a running
     sealer) in a ``READ COMMITTED`` transaction of its own, appends a
     ``checkpoint`` block after the last block, and commits. The statement is
-    ``{v, chain, seq, block_hash, xid_to, sealed_at}`` of that block, framed
-    as a C2SP signed note by ``Checkpoint.to_note``.
+    ``{v, chain, seq, block_hash, xid_to, sealed_at, incarnation}`` of that
+    block, framed as a C2SP signed note by ``Checkpoint.to_note``.
 
     With ``require_replicated``, after the commit it reads
     ``pg_current_wal_insert_lsn()``, at or past the block's commit record,
@@ -157,6 +158,7 @@ def export_checkpoint(
         if head is None or last is None:
             raise _no_genesis(block)
         chain, xid_to = head
+        incarnation = _window(connection, block).incarnation
         seq = int(last.seq) + 1
         body = checkpoint_body(chain, seq, xid_to)
         digest = insert_block(
@@ -167,7 +169,7 @@ def export_checkpoint(
         ).scalar_one()
     if require_replicated:
         wait_replicated(connection, seq, replication_timeout)
-    checkpoint = Checkpoint(chain, seq, digest, xid_to, sealed_at)
+    checkpoint = Checkpoint(chain, seq, digest, xid_to, sealed_at, incarnation)
     return checkpoint if signer is None else checkpoint.signed([signer])
 
 

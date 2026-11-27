@@ -44,8 +44,9 @@ What it checks:
   key is ``UNKNOWN_KEY``, one that does not verify ``BAD_SIGNATURE``, and
   with ``require_signatures`` so is an unsigned one.
 - Trusted checkpoints (``_checkpoint``): ``TRUNCATED`` when the chain ends
-  below one, ``CHAIN_MISMATCH`` when its block has another hash, a
-  ``FORKED`` note instead when a signed fork block explains it. With a
+  below one, ``CHAIN_MISMATCH`` when its block has another hash or is of
+  another incarnation, a ``FORKED`` note instead when a signed fork block
+  explains it: one from a later incarnation than the checkpoint's. With a
   signature verifier, a fork block not signed by a key it knows is also a
   ``FORKED_UNSIGNED`` note: it explains no checkpoint. A match
   makes the report ``ANCHORED``; the blocks after the newest match are an
@@ -731,10 +732,12 @@ class _PartitionState:
 
 @dataclass(frozen=True)
 class _Fork:
-    """A valid fork block: its number and its prior checkpoint's."""
+    """A valid fork block: its number, its prior checkpoint's and the
+    incarnation it starts."""
 
     seq: int
     prior_seq: int
+    incarnation: int
 
 
 @dataclass(frozen=True)
@@ -804,8 +807,10 @@ class Verifier:
         """Blocks whose signature verified with a known key."""
         self._checkpoints = tuple(checkpoints)
         self._chain_id: str | None = None
-        # Stored hashes of the blocks the checkpoints name.
+        # Stored hashes of the blocks the checkpoints name, and the
+        # incarnation each block is in.
         self._hashes: dict[int, bytes] = {}
+        self._incarnation_at: dict[int, int] = {}
         # Hashes of the blocks a fork may name as its prior checkpoint.
         self._anchors: dict[int, bytes] = {}
         self._forks: list[_Fork] = []
@@ -852,8 +857,6 @@ class Verifier:
         wanted = {checkpoint.seq for checkpoint in self._checkpoints}
         for number, block in enumerate(blocks, start=1):
             self._last_seq = block.seq
-            if block.seq in wanted:
-                self._hashes[block.seq] = block.block_hash
             expected_prev = ZERO_HASH if previous is None else previous
             if block.prev_hash != expected_prev:
                 self._fail(
@@ -871,20 +874,30 @@ class Verifier:
                 )
             previous = block.block_hash
             self._check_signature(block)
-            body = self._body(block, number, chain)
-            if body is None:
-                continue
-            if number == 1:
-                chain = self._chain_id = str(body["chain"])
-                self.incarnations.append(Incarnation(1, int(body["enforce_from"])))
-                self._anchors[block.seq] = block.block_hash
-                continue
-            if not self.incarnations:
-                # Block 1 was malformed: nothing after it can be read.
-                continue
-            self._read(block, body, self.incarnations[-1])
+            chain = self._read_block(block, number, chain)
+            if block.seq in wanted:
+                self._hashes[block.seq] = block.block_hash
+                # A fork block is the first block of the incarnation it starts.
+                self._incarnation_at[block.seq] = len(self.incarnations)
         if not self.incarnations:
             raise ValueError("the chain has no genesis block")
+
+    def _read_block(
+        self, block: StoredBlock, number: int, chain: str | None
+    ) -> str | None:
+        """Read the body of one block; the chain id, once the genesis gave it."""
+        body = self._body(block, number, chain)
+        if body is None:
+            return chain
+        if number == 1:
+            chain = self._chain_id = str(body["chain"])
+            self.incarnations.append(Incarnation(1, int(body["enforce_from"])))
+            self._anchors[block.seq] = block.block_hash
+            return chain
+        if self.incarnations:
+            # Without them block 1 was malformed: nothing after it is read.
+            self._read(block, body, self.incarnations[-1])
+        return chain
 
     def _check_signature(self, block: StoredBlock) -> None:
         """``UNKNOWN_KEY`` or ``BAD_SIGNATURE`` for a block's signature.
@@ -1077,7 +1090,7 @@ class Verifier:
             )
         self.incarnations.append(started)
         self._anchors[block.seq] = block.block_hash
-        self._forks.append(_Fork(block.seq, prior_seq))
+        self._forks.append(_Fork(block.seq, prior_seq, started.number))
         self._note(
             NoteKind.FORKED,
             f"incarnation {number} starts here: {reason}",
@@ -1654,13 +1667,18 @@ class Verifier:
         verifier given) is not used, nor is an unsigned one when signatures
         are required (``BAD_SIGNATURE``). One that names a block the chain does
         not have is ``TRUNCATED``, one whose block has another hash, or that
-        is of another chain, ``CHAIN_MISMATCH``. A ``TRUNCATED`` or
-        ``CHAIN_MISMATCH`` is a ``FORKED`` note instead when a fork block at
-        or below the checkpoint's ``seq``, whose prior checkpoint is below
-        it, carries a signature that verified: the fork declares that the
-        chain was rebuilt from that prior checkpoint, so the checkpoint
-        names a block of the incarnation it ended. An unsigned fork block
-        explains nothing: anyone who can write the block table can add one.
+        is of another chain, ``CHAIN_MISMATCH``, as is one whose block is
+        in another incarnation than the checkpoint names. A ``TRUNCATED`` or
+        ``CHAIN_MISMATCH`` is a ``FORKED`` note instead when a fork block
+        that starts a later incarnation than the checkpoint's, and whose
+        prior checkpoint is below it, carries a signature that verified:
+        the fork declares that the chain was rebuilt from that prior
+        checkpoint, so the checkpoint names a block of an incarnation the
+        fork ended. A checkpoint taken at or after the fork (of its
+        incarnation or a later one) is never explained: the chain it saw
+        held the fork block already, so a divergence since is a rewrite. An
+        unsigned fork block explains nothing either: anyone who can write
+        the block table can add one.
         """
         matched: list[int] = []
         for checkpoint in self._checkpoints:
@@ -1692,10 +1710,18 @@ class Verifier:
             if stored is not None and hmac.compare_digest(
                 stored, checkpoint.block_hash
             ):
+                if self._incarnation_at.get(checkpoint.seq) != checkpoint.incarnation:
+                    self._fail(
+                        FailureKind.CHAIN_MISMATCH,
+                        f"the checkpoint names incarnation {checkpoint.incarnation}"
+                        ", its block is in another",
+                        **where,
+                    )
+                    continue
                 matched.append(checkpoint.seq)
                 continue
             kind = FailureKind.CHAIN_MISMATCH if stored else FailureKind.TRUNCATED
-            fork = self._fork_explaining(checkpoint.seq)
+            fork = self._fork_explaining(checkpoint)
             if fork is not None:
                 self._note(
                     NoteKind.FORKED,
@@ -1718,10 +1744,18 @@ class Verifier:
             )
         return bool(matched)
 
-    def _fork_explaining(self, seq: int) -> _Fork | None:
-        """A signed fork block that explains a divergence at ``seq``."""
+    def _fork_explaining(self, checkpoint: Checkpoint) -> _Fork | None:
+        """A signed fork block that explains a diverging checkpoint.
+
+        One that starts a later incarnation than the checkpoint was taken
+        in, rebuilt from a prior checkpoint below it.
+        """
         for fork in self._forks:
-            if fork.seq <= seq and fork.prior_seq < seq and fork.seq in self.signed:
+            if (
+                fork.incarnation > checkpoint.incarnation
+                and fork.prior_seq < checkpoint.seq
+                and fork.seq in self.signed
+            ):
                 return fork
         return None
 

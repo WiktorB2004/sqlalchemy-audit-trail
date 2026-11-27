@@ -8,13 +8,15 @@ and ``TRUNCATED``).
 Its text is the library's own statement, two lines:
 
     sqlalchemy-audit-trail/checkpoint/v1
-    {"block_hash":"<base64>","chain":"<uuid>","sealed_at":"<time>",...}
+    {"block_hash":"<base64>","chain":"<uuid>","incarnation":1,...}
 
 the second being the ``canonical`` JSON of ``{v, chain, seq, block_hash,
-xid_to, sealed_at}``. It travels as a C2SP signed note (``_note``), so
-existing note tooling can check the signatures. It is not a C2SP
-tlog-checkpoint: the head is a hash chain, not a Merkle tree over the
-blocks, so there is no tree size and no consistency proof. A checkpoint
+xid_to, sealed_at, incarnation}``. ``incarnation`` is the one the chain was
+in when the checkpoint was taken: a fork explains a checkpoint only from an
+incarnation before its own, never one taken after it. It travels as a C2SP
+signed note (``_note``), so existing note tooling can check the signatures.
+It is not a C2SP tlog-checkpoint: the head is a hash chain, not a Merkle
+tree over the blocks, so there is no tree size and no consistency proof. A checkpoint
 exported without a key is the text alone.
 """
 
@@ -44,7 +46,7 @@ from audit_trail.integrity._sign import SignatureVerifier, Signer
 HEADER = "sqlalchemy-audit-trail/checkpoint/v1"
 """First line of a checkpoint's text."""
 
-_FIELDS = ("block_hash", "chain", "sealed_at", "seq", "v", "xid_to")
+_FIELDS = ("block_hash", "chain", "incarnation", "sealed_at", "seq", "v", "xid_to")
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,8 @@ class Checkpoint:
         block_hash: That block's hash.
         xid_to: The ``xid`` the chain was sealed up to (exclusive) then.
         sealed_at: When the block was written, as the database had it.
+        incarnation: The incarnation of the chain then: 1 before any fork,
+            then the number of the newest fork block's.
         signatures: The note's signature lines; empty when unsigned.
     """
 
@@ -65,6 +69,7 @@ class Checkpoint:
     block_hash: bytes
     xid_to: int
     sealed_at: datetime
+    incarnation: int = 1
     signatures: tuple[NoteSignature, ...] = ()
 
     @property
@@ -78,6 +83,7 @@ class Checkpoint:
                 "block_hash": base64.b64encode(self.block_hash).decode("ascii"),
                 "xid_to": self.xid_to,
                 "sealed_at": rfc3339(self.sealed_at),
+                "incarnation": self.incarnation,
             }
         )
         return f"{HEADER}\n{statement.decode()}\n"
@@ -131,6 +137,7 @@ def _replace_signatures(
         checkpoint.block_hash,
         checkpoint.xid_to,
         checkpoint.sealed_at,
+        checkpoint.incarnation,
         signatures,
     )
 
@@ -154,13 +161,16 @@ def _statement(text: str) -> Checkpoint:
     if fields["v"] != FORMAT_VERSION:
         raise malformed("unknown format version")
     chain, seq, xid_to = fields["chain"], fields["seq"], fields["xid_to"]
-    if not isinstance(chain, str) or not _is_int(seq) or not _is_int(xid_to):
-        raise malformed("chain, seq or xid_to has the wrong type")
+    incarnation = fields["incarnation"]
+    if not isinstance(chain, str) or not all(
+        _is_int(value) for value in (seq, xid_to, incarnation)
+    ):
+        raise malformed("chain, seq, xid_to or incarnation has the wrong type")
     block_hash = _hash(fields["block_hash"])
     sealed_at = _time(fields["sealed_at"])
-    if block_hash is None or sealed_at is None or seq < 1:
-        raise malformed("block_hash, sealed_at or seq is invalid")
-    return Checkpoint(chain, seq, block_hash, xid_to, sealed_at)
+    if block_hash is None or sealed_at is None or seq < 1 or incarnation < 1:
+        raise malformed("block_hash, sealed_at, seq or incarnation is invalid")
+    return Checkpoint(chain, seq, block_hash, xid_to, sealed_at, incarnation)
 
 
 def _hash(value: object) -> bytes | None:

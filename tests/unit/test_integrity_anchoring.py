@@ -63,16 +63,18 @@ def notes(report: VerificationReport) -> set[Any]:
     return {finding.kind for finding in report.notes}
 
 
-def checkpoint_of(chain: Chain, seq: int) -> Checkpoint:
+def checkpoint_of(chain: Chain, seq: int, incarnation: int = 1) -> Checkpoint:
     block = chain.blocks[seq - 1]
     xid_to = int(parse_body(block.body).get("xid_to", 0))
-    return Checkpoint(CHAIN, seq, block.block_hash, xid_to, block.sealed_at)
+    return Checkpoint(
+        CHAIN, seq, block.block_hash, xid_to, block.sealed_at, incarnation
+    )
 
 
-def take_checkpoint(chain: Chain) -> Checkpoint:
+def take_checkpoint(chain: Chain, incarnation: int = 1) -> Checkpoint:
     """Append a checkpoint block and return its checkpoint, as exported."""
     seq = chain.add("checkpoint", checkpoint_body(CHAIN, chain.next, chain.sealed_to))
-    return checkpoint_of(chain, seq)
+    return checkpoint_of(chain, seq, incarnation)
 
 
 # -- block signatures -----------------------------------------------------------
@@ -437,6 +439,85 @@ def test_a_fork_before_the_checkpoints_prior_explains_nothing(
     wrong = dataclasses.replace(good, block_hash=bytes(32))
     report = check(chain, rows, [], checkpoints=[wrong], signatures=BOTH)
     assert failures(report) == {FailureKind.CHAIN_MISMATCH}
+
+
+def seal_to(chain: Chain, seq: int) -> None:
+    """Empty seal blocks until the next block is ``seq``."""
+    while chain.next < seq:
+        chain.seal(chain.sealed_to + 10)
+
+
+@pytest.fixture
+def forked_at_10() -> tuple[Chain, Checkpoint, Checkpoint]:
+    """A chain with a signed fork at seq 10, and a checkpoint at 40 after it.
+
+    Returns the chain, the fork's prior checkpoint (seq 5) and the one at 40,
+    taken in incarnation 2.
+    """
+    chain = Chain()
+    seal_to(chain, 5)
+    prior = take_checkpoint(chain)
+    seal_to(chain, 10)
+    fork = declare_fork(chain, prior, chain.sealed_to)
+    sign(chain, OLD, fork)
+    assert fork == 10
+    seal_to(chain, 40)
+    after = take_checkpoint(chain, incarnation=2)
+    assert after.seq == 40
+    seal_to(chain, 45)
+    return chain, prior, after
+
+
+def test_a_checkpoint_after_a_fork_is_not_explained_by_it(
+    forked_at_10: tuple[Chain, Checkpoint, Checkpoint],
+) -> None:
+    chain, prior, after = forked_at_10
+    options: dict[str, Any] = {"signatures": BOTH, "checkpoints": [prior, after]}
+    report = check(chain, [], [], **options)
+    assert report.failures == []
+    assert report.anchor is Anchor.ANCHORED
+    # The tail cut below the checkpoint: the fork at 10 does not explain it.
+    truncated = Chain()
+    truncated.blocks = chain.blocks[:35]
+    report = check(truncated, [], [], **options)
+    assert failures(report) == {FailureKind.TRUNCATED}
+    assert [f.seq for f in report.failures] == [40]
+    # The tail rewritten from seq 20: every hash is consistent, but the
+    # block at 40 is another.
+    rewritten = Chain()
+    rewritten.blocks = chain.blocks[:19]
+    rewritten.sealed_to = int(parse_body(chain.blocks[18].body)["xid_to"])
+    seal_to(rewritten, 41)
+    rewritten.seal(rewritten.sealed_to + 3)
+    report = check(rewritten, [], [], **options)
+    assert failures(report) == {FailureKind.CHAIN_MISMATCH}
+    assert [f.seq for f in report.failures] == [40]
+    assert not any("explained" in n.detail for n in report.notes)
+
+
+def test_a_checkpoint_lost_with_the_old_incarnation_is_explained(
+    forked_at_10: tuple[Chain, Checkpoint, Checkpoint],
+) -> None:
+    chain, prior, _after = forked_at_10
+    # Taken in incarnation 1 before the restore, at a seq above the fork's.
+    lost = dataclasses.replace(prior, seq=30, block_hash=bytes(32))
+    report = check(chain, [], [], signatures=BOTH, checkpoints=[prior, lost])
+    assert report.failures == []
+    assert any("CHAIN_MISMATCH explained" in n.detail for n in report.notes)
+    # One between the prior checkpoint and the fork is explained too.
+    between = dataclasses.replace(lost, seq=8)
+    report = check(chain, [], [], signatures=BOTH, checkpoints=[between])
+    assert report.failures == []
+
+
+def test_a_checkpoint_naming_another_incarnation_is_a_chain_mismatch(
+    forked_at_10: tuple[Chain, Checkpoint, Checkpoint],
+) -> None:
+    chain, _prior, after = forked_at_10
+    relabelled = dataclasses.replace(after, incarnation=1)
+    report = check(chain, [], [], signatures=BOTH, checkpoints=[relabelled])
+    assert failures(report) == {FailureKind.CHAIN_MISMATCH}
+    assert report.anchor is Anchor.UNANCHORED
 
 
 @pytest.mark.parametrize(
