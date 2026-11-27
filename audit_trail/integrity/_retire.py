@@ -25,6 +25,11 @@ A crash between 2 and 3 leaves a partition present with a retire block,
 which verifies clean; one between the detach and the drop leaves a
 detached or pending table, which ``verify`` reports as
 ``DETACHED_PARTITION`` until it is dropped.
+
+A table left detached that way, or by a drop refused with ``55P03`` or
+another error, is dropped by the next call once it has expired: when
+``check_orphan`` finds a valid retire block for it and ``check_detached``
+passes. Without one, it is kept and reported as ``not_retired``.
 """
 
 from __future__ import annotations
@@ -65,7 +70,9 @@ from audit_trail.integrity._block import (
     parse_body,
     parse_segments,
     retire_body,
+    retire_coverage,
 )
+from audit_trail.integrity._codec import rfc3339
 from audit_trail.integrity._seal import (
     _sealed_to,
     block_table,
@@ -206,17 +213,22 @@ class Retirer:
 
     # -- before the first detach --
 
-    def prepare(self, expired: Iterable[_Child]) -> None:
+    def prepare(
+        self, expired: Iterable[_Child], *, detached: Iterable[_Child] = ()
+    ) -> None:
         """Seal, read the chain and verify the expired partitions.
 
         Every step runs in transactions of its own, ended before it returns,
         so none of them holds a snapshot while a partition is detached.
+        ``detached`` are expired partitions already detached, which
+        ``verify`` reports as such; only its other failures keep them.
 
         Raises:
             SealRefusedError: The chain has no genesis block, or the
                 transaction ids were rewound; nothing was dropped.
         """
-        children = list(expired)
+        orphans = list(detached)
+        children = [*expired, *orphans]
         self._wanted = {child.name for child in children}
         while seal(self.conn, self._tables).capped:
             pass
@@ -225,7 +237,10 @@ class Retirer:
             return
         options = _Options(None, None, DEFAULT_CHUNK_ROWS, frozenset(self._wanted))
         report = _verify(self.conn, self._tables, self._block, options)
+        # A pending detach is what this call finishes; an orphan, what it
+        # drops.
         pending = {child.name for child in children if child.pending}
+        pending |= {child.name for child in orphans}
         for finding in report.failures:
             if finding.partition is None:
                 # The chain itself is broken: a retire block would extend it.
@@ -235,7 +250,6 @@ class Retirer:
                     finding.kind is FailureKind.DETACHED_PARTITION
                     and finding.partition in pending
                 ):
-                    # The pending detach is what this call finishes.
                     continue
                 targets = {finding.partition}
             else:
@@ -288,12 +302,7 @@ class Retirer:
                 )
             self._scan(conn)
             seq = int(last.seq) + 1
-            table = TRANSACTION if target.values is None else ACTIVITY
-            streams = (
-                [TRANSACTION_STREAM]
-                if target.values is None
-                else [activity_stream(value) for value in sorted(target.values)]
-            )
+            table, streams = _table_streams(target)
             assert child.upper is not None  # only expired partitions retire
             body = retire_body(
                 chain,
@@ -342,6 +351,25 @@ class Retirer:
             return self._skip(
                 SkippedPartition(
                     child.display, reason, str(exc.orig).strip().splitlines()[0]
+                )
+            )
+        return True
+
+    def check_orphan(self, target: _RetentionTarget, child: _Child) -> bool:
+        """Whether the detached ``child`` has a valid retire block.
+
+        Valid is what ``verify`` accepts: the block names the partition, the
+        table and streams of ``target`` and the bound of ``child``, and
+        covers exactly the segments of the partition sealed before it.
+        """
+        retired = self._retired.get(child.name)
+        if retired is None or not _covers(retired, target, child, self._sealed):
+            return self._skip(
+                SkippedPartition(
+                    child.display,
+                    "not_retired",
+                    "it is detached without a valid retire block; it is left "
+                    "in place, for verify to report",
                 )
             )
         return True
@@ -463,6 +491,42 @@ class Retirer:
                 )
             if len(rows) < _SCAN_CHUNK:
                 return
+
+
+def _table_streams(target: _RetentionTarget) -> tuple[str, list[str]]:
+    """The table and the streams of the partitions of ``target``."""
+    if target.values is None:
+        return TRANSACTION, [TRANSACTION_STREAM]
+    return ACTIVITY, [activity_stream(value) for value in sorted(target.values)]
+
+
+def _covers(
+    retired: _RetireBlock,
+    target: _RetentionTarget,
+    child: _Child,
+    sealed: dict[str, dict[tuple[int, str], SealedSegment]],
+) -> bool:
+    """Whether ``retired`` is a valid retire block of ``child``."""
+    try:
+        body = parse_body(retired.body)
+    except (UnicodeDecodeError, ValueError):
+        return False
+    table, streams = _table_streams(target)
+    if child.upper is None or (
+        body.get("kind"),
+        body.get("partition"),
+        body.get("table"),
+        body.get("streams"),
+        body.get("upper_bound"),
+    ) != ("retire", child.name, table, sorted(streams), rfc3339(child.upper)):
+        return False
+    before = [
+        segment
+        for (seq, _stream), segment in sealed.get(child.name, {}).items()
+        if seq < retired.seq
+    ]
+    coverage = retire_coverage(before)
+    return {name: body.get(name) for name in coverage} == coverage
 
 
 @dataclass(frozen=True)

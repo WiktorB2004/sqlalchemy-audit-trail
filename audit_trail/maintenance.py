@@ -156,6 +156,7 @@ SkipReason = Literal[
     "lock_not_available",
     "detach_pending",
     "changed_after_retire",
+    "not_retired",
 ]
 """Why ``drop_expired`` kept an expired partition, with integrity."""
 
@@ -176,6 +177,8 @@ class SkippedPartition:
             the same parent is pending (SQLSTATE ``55000``).
             ``changed_after_retire``: after its retire block, rows reached it
             that the block does not cover; it is left detached.
+            ``not_retired``: it is detached, but no valid retire block
+            covers it; it is left in place.
         detail: A sentence for people.
     """
 
@@ -435,7 +438,10 @@ def drop_expired(
     pending), is kept and reported in ``skipped`` instead of failing the
     call; no partition is dropped without a retire block. The backend is
     also checked before each retire block, so behind a transaction-mode
-    pooler none is written. Before the chain is started (the block table is
+    pooler none is written. An expired partition left detached by an
+    earlier call (its drop refused, or the call stopped after the detach) is
+    dropped when its retire block is valid and still covers it; without one
+    it is kept and reported. Before the chain is started (the block table is
     empty: ``write_genesis`` has not run), nothing has been sealed, and the
     call drops as without integrity.
     Otherwise the call holds a second connection from the pool of
@@ -1029,10 +1035,12 @@ def _drop(
             )
         ]
         partitioned: set[int] = set()
+        severity_parents: list[_Child] = []
         for child in _children(conn, activity_oid):
             values = child.list_values()
             partitioned |= values
             if child.relkind == "p":
+                severity_parents.append(child)
                 targets.append(
                     _RetentionTarget(
                         child.qualified,
@@ -1070,13 +1078,20 @@ def _drop(
             with Retirer(
                 conn, tables, verify_before_drop=verify_before_drop
             ) as retirer:
+                orphans = _expired_orphans(conn, tables, targets, severity_parents, now)
                 retirer.prepare(
-                    child
-                    for target in targets
-                    for child in _children(conn, target.oid)
-                    if _is_expired(child, target, now)
+                    (
+                        child
+                        for target in targets
+                        for child in _children(conn, target.oid)
+                        if _is_expired(child, target, now)
+                    ),
+                    detached=[child for _target, child in orphans],
                 )
                 dropped = DroppedPartitions()
+                for target, child in orphans:
+                    if _drop_orphan(session, target, child, retirer):
+                        dropped.append(child.display)
                 for target in targets:
                     dropped += _drop_months(session, target, now, retirer)
                 dropped.skipped = retirer.skipped
@@ -1193,6 +1208,70 @@ def _retire_and_drop(
     if not retirer.ddl(conn, f"DROP TABLE {child.qualified}", child):
         return False
     logger.info("dropped expired partition %s", child.display)
+    return True
+
+
+def _expired_orphans(
+    conn: Connection,
+    tables: AuditTables,
+    targets: list[_RetentionTarget],
+    severity_parents: list[_Child],
+    now: datetime,
+) -> list[tuple[_RetentionTarget, _Child]]:
+    """Detached partitions past the retention of the parent they left.
+
+    The tables ``health`` lists as orphaned, such as one left detached by a
+    drop refused with ``55P03`` or a crash between the detach and the drop.
+    Their bound is read from their name, their parent from its prefix; one
+    whose parent is gone is left alone.
+    """
+    shown = _shown_schemas(conn, tables)
+    parents = {(shown.transaction, tables.transaction.name): targets[0]}
+    for parent in severity_parents:
+        target = next((t for t in targets if t.oid == parent.oid), None)
+        if target is not None:
+            parents[(parent.schema, parent.name)] = target
+    found: list[tuple[_RetentionTarget, _Child]] = []
+    for display in _orphans(conn, tables, severity_parents):
+        schema, _, name = display.rpartition(".")
+        match = _ORPHAN_MONTH.match(name)
+        if match is None:
+            continue
+        target = parents.get((schema, match.group(1)))
+        if target is None:
+            continue
+        lower, upper = month_bounds(date(int(match.group(2)), int(match.group(3)), 1))
+        child = _Child(
+            _oid(conn, qualified_name(schema, name)),
+            schema,
+            name,
+            "r",
+            "",
+            True,
+            lower,
+            upper,
+            False,
+        )
+        if _is_expired(child, target, now):
+            found.append((target, child))
+    return found
+
+
+_ORPHAN_MONTH = re.compile(r"^(.+)_p(\d{4})_(\d{2})$")
+
+
+def _drop_orphan(
+    session: _Session, target: _RetentionTarget, child: _Child, retirer: Retirer
+) -> bool:
+    """Drop a detached, expired partition covered by its retire block."""
+    if not retirer.check_orphan(target, child):
+        return False
+    if not retirer.check_detached(child):
+        return False
+    session.check()
+    if not retirer.ddl(session.conn, f"DROP TABLE {child.qualified}", child):
+        return False
+    logger.info("dropped expired detached partition %s", child.display)
     return True
 
 

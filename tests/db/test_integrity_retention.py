@@ -24,11 +24,12 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from audit_trail import migrations
 from audit_trail.integrity import _retire, _seal
-from audit_trail.integrity._block import parse_body, retire_body
+from audit_trail.integrity._block import block_hash, parse_body, retire_body
 from audit_trail.integrity._commit import (
     activity_groups,
     seal_columns,
@@ -430,6 +431,168 @@ def test_a_crash_between_detach_and_drop_is_reported(
     assert [(f.kind, f.partition) for f in report.failures] == [
         (FailureKind.DETACHED_PARTITION, name)
     ]
+
+    # The next call drops the detached table under its retire block.
+    monkeypatch.undo()
+    blocks = block_count(engine, tables)
+    dropped = drop(engine, tables)
+    assert dropped == expired(schema)
+    assert dropped.skipped == []
+    assert not exists(engine, schema, name)
+    assert block_count(engine, tables) == blocks + 3
+    assert run(engine, tables).failures == []
+
+
+# -- detached partitions left by an earlier call ------------------------------------
+
+
+def before_drop(monkeypatch: pytest.MonkeyPatch, name: str, action: Any) -> None:
+    """Run ``action(engine)`` just before ``drop_expired`` drops ``name``."""
+    ddl = _retire.Retirer.ddl
+
+    def patched(self: _retire.Retirer, conn: Connection, sql: str, child: Any) -> bool:
+        if sql.startswith("DROP TABLE") and child.name == name:
+            action()
+        return ddl(self, conn, sql, child)
+
+    monkeypatch.setattr(_retire.Retirer, "ddl", patched)
+
+
+def test_a_detached_table_kept_by_a_lock_is_dropped_next_time(
+    engine: Engine,
+    tables: AuditTables,
+    schema: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write(engine, tables)
+    name = "audit_transaction_p2026_06"
+    with engine.connect() as locker:
+
+        def lock() -> None:
+            # Detached already; the drop waits for this lock and times out.
+            locker.execute(text(f'LOCK TABLE "{schema}"."{name}" IN ACCESS SHARE MODE'))
+
+        before_drop(monkeypatch, name, lock)
+        first = drop(engine, tables, lock_timeout="500ms")
+        locker.rollback()
+    assert [(s.partition, s.reason) for s in first.skipped] == [
+        (f"{schema}.{name}", "lock_not_available")
+    ]
+    assert name not in attached(engine, schema)
+    assert exists(engine, schema, name)
+
+    monkeypatch.undo()
+    blocks = block_count(engine, tables)
+    second = drop(engine, tables)
+    assert second == [f"{schema}.{name}"]
+    assert second.skipped == []
+    assert not exists(engine, schema, name)
+    # Its retire block was written by the first call.
+    assert block_count(engine, tables) == blocks
+    assert run(engine, tables).failures == []
+
+
+def test_a_detached_table_kept_by_a_failed_drop_is_dropped_next_time(
+    engine: Engine,
+    tables: AuditTables,
+    schema: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write(engine, tables)
+    name = "audit_transaction_p2026_06"
+    view = f'"{schema}"."depends_on_june"'
+
+    def depend() -> None:
+        with engine.begin() as conn:
+            conn.execute(
+                text(f'CREATE VIEW {view} AS SELECT * FROM "{schema}"."{name}"')
+            )
+
+    before_drop(monkeypatch, name, depend)
+    with pytest.raises(DBAPIError, match="depends_on_june"):
+        drop(engine, tables)
+    assert name not in attached(engine, schema)
+    assert exists(engine, schema, name)
+
+    monkeypatch.undo()
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP VIEW {view}"))
+    dropped = drop(engine, tables)
+    assert dropped == expired(schema)
+    assert dropped.skipped == []
+    assert not exists(engine, schema, name)
+    assert run(engine, tables).failures == []
+
+
+def test_a_detached_table_without_a_retire_block_is_kept(
+    engine: Engine, tables: AuditTables, schema: str
+) -> None:
+    write(engine, tables)
+    name = "audit_transaction_p2026_06"
+    with engine.begin() as conn:
+        # Detached by hand: no retire block covers it.
+        conn.execute(
+            text(
+                f'ALTER TABLE "{schema}"."audit_transaction" '
+                f'DETACH PARTITION "{schema}"."{name}"'
+            )
+        )
+    dropped = drop(engine, tables)
+    assert [(s.partition, s.reason) for s in dropped.skipped] == [
+        (f"{schema}.{name}", "not_retired")
+    ]
+    assert dropped == [n for n in expired(schema) if not n.endswith(name)]
+    assert exists(engine, schema, name)
+    assert name not in retire_blocks(engine, tables)
+
+
+def test_a_detached_table_under_a_forged_retire_block_is_kept(
+    engine: Engine, tables: AuditTables, schema: str
+) -> None:
+    write(engine, tables)
+    name = "audit_transaction_p2026_06"
+    with engine.connect() as conn:
+        assert _seal.seal(conn, tables).blocks == 1
+    block = _seal.block_table(tables)
+    with engine.begin() as conn:
+        last = _seal.last_block(conn, block)
+        chain = _seal._sealed_to(conn, block)
+        assert chain is not None
+        seq = int(last.seq) + 1
+        # It claims the partition held nothing; the chain sealed a row of it.
+        body = retire_body(
+            chain[0],
+            seq,
+            table="transaction",
+            partition=name,
+            streams=["transaction"],
+            upper_bound=datetime(2026, 7, 1, tzinfo=UTC),
+            retention=30 * 86400,
+            segments=[],
+        )
+        prev = bytes(last.block_hash)
+        conn.execute(
+            insert(block).values(
+                seq=seq,
+                kind="retire",
+                body=body,
+                prev_hash=prev,
+                block_hash=block_hash(prev, body),
+                retired_partition=name,
+            )
+        )
+        conn.execute(
+            text(
+                f'ALTER TABLE "{schema}"."audit_transaction" '
+                f'DETACH PARTITION "{schema}"."{name}"'
+            )
+        )
+    # Without the verify, which would refuse the whole chain.
+    dropped = drop(engine, tables, verify_before_drop=False)
+    assert [(s.partition, s.reason) for s in dropped.skipped] == [
+        (f"{schema}.{name}", "not_retired")
+    ]
+    assert exists(engine, schema, name)
 
 
 # -- what keeps a partition -----------------------------------------------------------
