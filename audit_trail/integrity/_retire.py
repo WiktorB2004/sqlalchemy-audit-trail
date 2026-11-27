@@ -78,6 +78,7 @@ from audit_trail.integrity._seal import (
     last_block,
     seal,
     sealed_horizon,
+    snapshot_horizon,
 )
 from audit_trail.integrity._types import Xid8
 from audit_trail.integrity._verify import ACTIVITY, TRANSACTION, FailureKind
@@ -225,7 +226,11 @@ class Retirer:
         orphans = list(detached)
         children = [*expired, *orphans]
         self._wanted = {child.name for child in children}
-        while seal(self.conn, self._tables).capped:
+        # Only up to the horizon of now: writers that outpace the sealer
+        # would keep a loop to the moving horizon capped forever.
+        with self.conn.begin():
+            up_to = snapshot_horizon(self.conn)
+        while seal(self.conn, self._tables, up_to=up_to).capped:
             pass
         self._scan()
         if not self._verify_before_drop or not children:

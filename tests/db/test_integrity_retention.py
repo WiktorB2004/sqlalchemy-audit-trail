@@ -686,6 +686,37 @@ def test_rows_after_the_retire_block_keep_the_detached_table(
     }
 
 
+def test_the_catch_up_seal_ends_while_writers_outpace_it(
+    engine: Engine,
+    tables: AuditTables,
+    schema: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for _ in range(3):
+        write(engine, tables)
+    real_seal = _seal.seal
+    calls = 0
+
+    def seal_one_while_writing(
+        conn: Connection, sealed: AuditTables, **options: Any
+    ) -> _seal.SealResult:
+        # A transaction commits before every call, which seals one: a loop to
+        # the moving horizon would never find the backlog smaller.
+        nonlocal calls
+        calls += 1
+        if calls > 20:
+            raise AssertionError("the catch-up seal does not end")
+        write(engine, tables, NOW)
+        return real_seal(conn, sealed, max_rows=1, **options)
+
+    monkeypatch.setattr(_retire, "seal", seal_one_while_writing)
+    assert drop(engine, tables) == expired(schema)
+    # One call per June transaction; none for the rows written meanwhile.
+    assert calls == 3
+    monkeypatch.undo()
+    assert run(engine, tables).failures == []
+
+
 # -- the chain must be started --------------------------------------------------------
 
 
